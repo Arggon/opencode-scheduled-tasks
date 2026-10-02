@@ -87,6 +87,26 @@ console.log(`[harness] prompts admitted: ${prompts.length}`)
 console.log(`[harness] storage keys: ${[...store.keys()].join(", ") || "(none)"}`)
 console.log(`[harness] stored state: ${JSON.stringify([...store.values()])}`)
 
+// The scheduled path (not the on-demand path) must record run history.
+const history = store.get("scheduled-tasks/history/dogfood-smoke")
+console.log(`[harness] recorded history: ${JSON.stringify(history)}`)
+if (!Array.isArray(history) || history.length === 0) {
+  console.error("[harness] FAIL: a scheduled run recorded no history")
+  process.exit(1)
+}
+const latest = history[history.length - 1] as Record<string, unknown>
+for (const field of ["dueAt", "startedAt", "outcome", "model"]) {
+  if (latest[field] === undefined) {
+    console.error(`[harness] FAIL: history entry is missing "${field}"`)
+    process.exit(1)
+  }
+}
+if (latest["outcome"] !== "ok") {
+  console.error(`[harness] FAIL: history outcome is ${String(latest["outcome"])}, expected ok`)
+  process.exit(1)
+}
+console.log(`[harness] history ok: outcome=${String(latest["outcome"])} model=${String(latest["model"])}`)
+
 ;(cleanup as () => void)?.()
 rmSync(dir, { recursive: true, force: true })
 
@@ -94,5 +114,5 @@ if (prompts.length === 0) {
   console.error("[harness] FAIL: no prompt was admitted; the loop never fired")
   process.exit(1)
 }
-console.log("[harness] PASS: the scheduler admitted a scheduled prompt on a real clock")
+console.log("[harness] PASS: the scheduler admitted a scheduled prompt on a real clock and recorded it")
 process.exit(0)

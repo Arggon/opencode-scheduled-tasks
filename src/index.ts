@@ -564,6 +564,27 @@ export type JobDefinition = {
   misfire: MisfirePolicy
   maxCatchUp: number
   runTimeoutMs: number
+  /**
+   * `reuse` (default) keeps one session per job so runs build on prior context, the way
+   * `opencode run -s` does. `fresh` starts a new session per run for stateless work.
+   */
+  session: SessionMode
+}
+
+/** Whether a job reuses one session across runs or starts a fresh one each time. */
+export type SessionMode = "reuse" | "fresh"
+
+/** One recorded run. A job keeps a bounded ring of these. */
+export type HistoryEntry = {
+  /** The occurrence this run satisfied. */
+  dueAt: number
+  startedAt: number
+  outcome: RunStatus
+  /** Resolved model, so an expensive run is attributable after the fact. */
+  model: string
+  /** Session the run used; omitted when none was available. */
+  sessionID?: string
+  error?: string
 }
 
 const JOB_ID_PATTERN = /^[a-z0-9][a-z0-9._-]*$/
@@ -729,6 +750,13 @@ export function validateJob(raw: unknown, index: number): { job: JobDefinition }
   // kept working unchanged. When both are present the explicit `runTimeout` wins.
   const duration = parseDuration(record.runTimeout)
   if (duration !== undefined && "reason" in duration) return { reason: `job "${id}": ${duration.reason}` }
+  // An unrecognised `session` is refused rather than defaulted: silently choosing "reuse"
+  // for a job that meant "fresh" would accumulate context nobody asked for.
+  const sessionMode = asString(record.session)
+  if (sessionMode !== undefined && sessionMode !== "reuse" && sessionMode !== "fresh") {
+    return { reason: `job "${id}": session must be "reuse" or "fresh", got "${sessionMode}"` }
+  }
+
   const runTimeoutMs =
     duration !== undefined && "ms" in duration
       ? duration.ms
@@ -748,6 +776,7 @@ export function validateJob(raw: unknown, index: number): { job: JobDefinition }
       ...(model !== undefined && "model" in model ? { model: model.model } : {}),
       enabled: record.enabled !== false,
       misfire,
+      session: sessionMode === "fresh" ? "fresh" : "reuse",
       maxCatchUp: boundedInt(record.maxCatchUp, DEFAULT_MAX_CATCH_UP, 1, 50),
       runTimeoutMs: clampedRunTimeoutMs,
     },
@@ -986,6 +1015,32 @@ export function normalizeState(value: unknown): JobState {
 
 function isRunStatus(value: unknown): value is RunStatus {
   return value === "ok" || value === "failed" || value === "timeout" || value === "skipped"
+}
+
+/** How many past runs a job keeps. Bounded on purpose (spec 002 § Run history). */
+export const DEFAULT_HISTORY_LIMIT = 10
+
+/** Hard ceiling on the retained history, whatever a caller asks for. */
+export const MAX_HISTORY_LIMIT = 50
+
+/** Longest error string retained per run. */
+const HISTORY_ERROR_MAX = 300
+
+/**
+ * Append one run to a job's history, evicting oldest-first at the limit.
+ *
+ * Pure and exported so the eviction rule is testable without a clock or a session.
+ */
+export function pushHistory(
+  history: readonly HistoryEntry[],
+  entry: HistoryEntry,
+  limit = DEFAULT_HISTORY_LIMIT,
+): HistoryEntry[] {
+  const bounded = Math.max(1, Math.min(MAX_HISTORY_LIMIT, Math.trunc(limit)))
+  const errored = entry.error === undefined ? {} : { error: clip(entry.error, HISTORY_ERROR_MAX) }
+  const next = [...history, { ...entry, ...errored }]
+  // Evict oldest-first: the newest run is the one a reader wants.
+  return next.length > bounded ? next.slice(next.length - bounded) : next
 }
 
 /** An in-flight lease older than its own timeout is abandoned, not hung. */
@@ -1283,8 +1338,10 @@ type SchedulerState = {
   jobs: JobDefinition[]
   specs: Map<string, CronSpec>
   states: JobStateMap
-  /** Session id per job, so runs accumulate context the way `opencode run -s` does. */
+  /** Session id per reused job, so runs accumulate context the way `opencode run -s` does. */
   sessions: Map<string, string>
+  /** Bounded per-job run history, oldest-first. */
+  history: Map<string, HistoryEntry[]>
   inFlight: Set<string>
   fileError?: string
   invalid: InvalidJob[]
@@ -1313,6 +1370,16 @@ const RUN_OUTPUT = {
 const FORMAT_OUTPUT = {
   type: "object",
   properties: { reference: { type: "string" } },
+}
+
+const HISTORY_OUTPUT = {
+  type: "object",
+  properties: {
+    id: { type: "string" },
+    session: { type: "string" },
+    runs: { type: "array" },
+    limit: { type: "number" },
+  },
 }
 
 /** Read, validate and parse the job file; never throws. */
@@ -1351,9 +1418,18 @@ function reloadJobs(ctx: PluginContext, directory: string, state: SchedulerState
 }
 
 /** Resolve (creating on first use) the persistent session a job runs in. */
+/**
+ * The session a job's next run should use.
+ *
+ * `fresh` creates a new session every call and never caches one; `reuse` caches the job's
+ * first session so runs accumulate context. A `fresh` job therefore leaves nothing behind in
+ * the session map.
+ */
 async function sessionFor(ctx: PluginContext, state: SchedulerState, job: JobDefinition): Promise<string | undefined> {
-  const existing = state.sessions.get(job.id)
-  if (existing !== undefined) return existing
+  if (job.session !== "fresh") {
+    const existing = state.sessions.get(job.id)
+    if (existing !== undefined) return existing
+  }
   if (typeof ctx.session?.create !== "function") {
     logOnce("no-session-create", "ctx.session.create is unavailable; runs cannot be dispatched")
     return undefined
@@ -1362,7 +1438,7 @@ async function sessionFor(ctx: PluginContext, state: SchedulerState, job: JobDef
     const created = await ctx.session.create({ title: `scheduled: ${job.id}` })
     const id = sessionIdOf(created)
     if (id === undefined) return undefined
-    state.sessions.set(job.id, id)
+    if (job.session !== "fresh") state.sessions.set(job.id, id)
     return id
   } catch (error) {
     logOnce(`session-create-${job.id}`, `session create failed (${error instanceof Error ? error.message : String(error)})`)
@@ -1377,8 +1453,45 @@ async function loadStates(ctx: PluginContext, state: SchedulerState): Promise<vo
   }
 }
 
+/** Reload every job's run history at setup. */
+async function loadAllHistory(ctx: PluginContext, state: SchedulerState): Promise<void> {
+  for (const job of state.jobs) {
+    state.history.set(job.id, await loadHistory(ctx, job.id))
+  }
+}
+
 async function saveState(ctx: PluginContext, state: SchedulerState, jobId: string): Promise<void> {
   await storageSet(ctx, `${STORAGE_PREFIX}${jobId}`, state.states[jobId])
+}
+
+const HISTORY_PREFIX = `${STORAGE_PREFIX}history/`
+
+/** Read one job's history, tolerating absent or corrupt storage (spec 002 § Persistence). */
+async function loadHistory(ctx: PluginContext, jobId: string): Promise<HistoryEntry[]> {
+  const stored = await storageGet(ctx, `${HISTORY_PREFIX}${jobId}`)
+  if (!Array.isArray(stored)) return []
+  const entries: HistoryEntry[] = []
+  for (const raw of stored) {
+    if (raw === null || typeof raw !== "object") continue
+    const record = raw as Record<string, unknown>
+    if (typeof record.dueAt !== "number" || typeof record.startedAt !== "number") continue
+    if (!isRunStatus(record.outcome) || typeof record.model !== "string") continue
+    entries.push({
+      dueAt: record.dueAt,
+      startedAt: record.startedAt,
+      outcome: record.outcome,
+      model: record.model,
+      ...(asString(record.sessionID) !== undefined ? { sessionID: asString(record.sessionID) as string } : {}),
+      ...(asString(record.error) !== undefined ? { error: asString(record.error) as string } : {}),
+    })
+  }
+  // Bounded on read as well as on write, so a hand-edited or oversized record cannot
+  // grow the in-memory buffer either.
+  return entries.slice(-MAX_HISTORY_LIMIT)
+}
+
+async function saveHistory(ctx: PluginContext, state: SchedulerState, jobId: string): Promise<void> {
+  await storageSet(ctx, `${HISTORY_PREFIX}${jobId}`, state.history.get(jobId) ?? [])
 }
 
 /**
@@ -1408,25 +1521,38 @@ async function applyJobTarget(ctx: PluginContext, job: JobDefinition, sessionID:
  * A run never throws out of here: every failure is recorded on the job's state, which is
  * what keeps invariant 3 (never breaks a session) true for the scheduling path too.
  */
-async function runJob(ctx: PluginContext, state: SchedulerState, job: JobDefinition): Promise<void> {
+async function runJob(
+  ctx: PluginContext,
+  state: SchedulerState,
+  job: JobDefinition,
+  dueAt: number,
+): Promise<void> {
   const now = Date.now()
   const record = state.states[job.id] ?? { version: STATE_VERSION }
   record.leaseUntil = now + job.runTimeoutMs
 
+  // Collected in the `finally` so a thrown run still lands in the history.
+  let outcome: RunStatus = "failed"
+  let model = "unknown"
+  let sessionID: string | undefined
+
   try {
     if (typeof ctx.session?.prompt !== "function") {
       logOnce("no-prompt", "ctx.session.prompt is unavailable; the scheduler is inert")
+      record.lastError = "ctx.session.prompt is unavailable"
       return
     }
-    const sessionID = await sessionFor(ctx, state, job)
+    sessionID = await sessionFor(ctx, state, job)
     if (sessionID === undefined) {
       record.lastStatus = "failed"
       record.lastError = "no session available for this job"
       return
     }
-    const model = await applyJobTarget(ctx, job, sessionID)
+    model = await applyJobTarget(ctx, job, sessionID)
 
-    logLine(`running ${job.id} (schedule "${job.schedule}" ${job.timezone}, model ${model})`)
+    logLine(
+      `running ${job.id} (schedule "${job.schedule}" ${job.timezone}, model ${model}, session ${job.session})`,
+    )
 
     // `prompt` admits the turn; the run itself is bounded by the lease the tick refreshes.
     await ctx.session.prompt({
@@ -1435,6 +1561,7 @@ async function runJob(ctx: PluginContext, state: SchedulerState, job: JobDefinit
       // Queue, so a run cannot interleave with a human typing into the same session.
       delivery: "queue",
     })
+    outcome = "ok"
     record.lastStatus = "ok"
     record.lastError = undefined
   } catch (error) {
@@ -1443,6 +1570,18 @@ async function runJob(ctx: PluginContext, state: SchedulerState, job: JobDefinit
     logLine(`job ${job.id} failed: ${record.lastError}`)
   } finally {
     record.leaseUntil = undefined
+    state.history.set(
+      job.id,
+      pushHistory(state.history.get(job.id) ?? [], {
+        dueAt,
+        startedAt: now,
+        outcome,
+        model,
+        ...(sessionID !== undefined ? { sessionID } : {}),
+        ...(record.lastError !== undefined ? { error: record.lastError } : {}),
+      }),
+    )
+    await saveHistory(ctx, state, job.id)
     await saveState(ctx, state, job.id)
   }
 }
@@ -1492,7 +1631,7 @@ async function tick(ctx: PluginContext, state: SchedulerState, lease: Lease, max
 
   for (const decision of decisions) {
     state.inFlight.add(decision.job.id)
-    void runJob(ctx, state, decision.job)
+    void runJob(ctx, state, decision.job, decision.occurrence.dueAt)
       .catch((error: unknown) => {
         logOnce(`run-${decision.job.id}`, `run failed (${error instanceof Error ? error.message : String(error)})`)
       })
@@ -1520,6 +1659,7 @@ function buildTools(ctx: PluginContext, state: SchedulerState, lease: Lease, tic
               timezone: job.timezone,
               enabled: job.enabled,
               misfire: job.misfire,
+              session: job.session,
               runTimeoutMs: job.runTimeoutMs,
               agent: job.agent ?? null,
               model:
@@ -1540,6 +1680,45 @@ function buildTools(ctx: PluginContext, state: SchedulerState, lease: Lease, tic
           tickMs,
         },
       }),
+    },
+    {
+      name: "history",
+      description:
+        "Return one job's recent runs, newest first: due and start instants, outcome, resolved model, and any error.",
+      input: {
+        type: "object",
+        properties: {
+          id: { type: "string", description: "Job id, as reported by schedules_list." },
+          limit: { type: "number", description: "Max runs to return (capped at 50)." },
+        },
+        required: ["id"],
+        additionalProperties: false,
+      },
+      output: HISTORY_OUTPUT,
+      options: { namespace: TOOL_NAMESPACE, codemode: true },
+      execute: async (input) => {
+        const id = asString(input.id)
+        if (id === undefined) return { output: { error: "id is required" } }
+        const job = state.jobs.find((entry) => entry.id === id)
+        // An unknown id is a typed failure naming the id, never an empty success: "no runs
+        // yet" and "no such job" are different answers and must not look alike.
+        if (job === undefined) {
+          return { output: { error: `no job with id "${id}"`, ids: state.jobs.map((e) => e.id) } }
+        }
+        const limit = boundedInt(input.limit, DEFAULT_HISTORY_LIMIT, 1, MAX_HISTORY_LIMIT)
+        const runs = [...(state.history.get(id) ?? [])]
+          .slice(-limit)
+          .reverse()
+          .map((entry) => ({
+            dueAt: new Date(entry.dueAt).toISOString(),
+            startedAt: new Date(entry.startedAt).toISOString(),
+            outcome: entry.outcome,
+            model: entry.model,
+            ...(entry.sessionID !== undefined ? { sessionID: entry.sessionID } : {}),
+            ...(entry.error !== undefined ? { error: entry.error } : {}),
+          }))
+        return { output: { id, session: job.session, runs, limit } }
+      },
     },
     {
       name: "format",
@@ -1620,6 +1799,7 @@ const definition: PluginDefinition = {
       specs: new Map(),
       states: {},
       sessions: new Map(),
+      history: new Map(),
       inFlight: new Set(),
       invalid: [],
       storageAvailable: typeof ctx.storage?.get === "function",
@@ -1649,6 +1829,7 @@ const definition: PluginDefinition = {
     // has no schedules would be wrong in every such project.
     reloadJobs(ctx, directory, state)
     await loadStates(ctx, state)
+    await loadAllHistory(ctx, state)
 
     const hasWork = state.jobs.some((job) => job.enabled)
 

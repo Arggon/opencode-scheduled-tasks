@@ -101,6 +101,9 @@ named reason rather than becoming a job that silently never fires.
 
 - **`schedules_list`** — pure read. Per job: schedule, timezone, `nextRun`, `lastRun`,
   `lastStatus`, `lastError`, plus whether another instance holds the lease.
+- **`schedules_history`** — one job's recent runs, newest first: due and start instants,
+  outcome, resolved model, and any error. An unknown id returns a typed error naming it,
+  never an empty list.
 - **`schedules_format`** — return the job-file reference: both config surfaces, the precedence
   rule, and the fields that carry a cost or a permission consequence. Read it before
   authoring a job rather than guessing.
@@ -152,6 +155,14 @@ captured into OpenCode's own log file:
 
 Set `OPENCODE_SCHEDULED_TASKS_DATA_DIR` to relocate that directory (containers, read-only
 homes, test runs).
+
+## Run history
+
+Each job keeps a bounded ring of its last 10 runs — due instant, start, outcome, resolved
+model, and a bounded error string. Read it with `schedules_history`. The ring evicts
+oldest-first and is capped at 50 however it is configured, so history cannot grow without
+bound. It survives a restart, and an absent or corrupt record is dropped rather than
+crashing the load.
 
 ## One writer per machine
 
@@ -213,7 +224,7 @@ Ideas adopted from it, and credited where they appear:
 | Duration strings with a bare number meaning seconds | the `runTimeout` field |
 | Per-task permission rules, and the unattended-`ask` warnings | ADR 0005, spec 002 |
 | One-off tasks and in-session loops | ADR 0006, spec 002 |
-| Opt-in session reuse rather than always reusing | spec 002 § Session mode |
+| Opt-in session reuse rather than always reusing | the `session` field |
 | Per-task agent/model selection | job fields, spec 001 |
 
 Where we deliberately diverge, the ADR says so and says why: we keep the JSON array
