@@ -1,13 +1,15 @@
 ---
 type: bug
-status: todo
+status: in_progress
 id: bug-schedules-run-not-bounded-capped-or-leased
 title: "schedules_run claims concurrency, timeout and lease rules and honours none of the three"
+assignee: arggon
 parent: run-control-permissions-session-mode-history
 labels: []
 priority: p1
 created: "2026-10-02"
 updated: "2026-10-02"
+claimed_at: "2026-10-02T20:59:08.620Z"
 depends_on: [bug-tool-boundary-throws-and-ask-not-recorded]
 ---
 <!--
