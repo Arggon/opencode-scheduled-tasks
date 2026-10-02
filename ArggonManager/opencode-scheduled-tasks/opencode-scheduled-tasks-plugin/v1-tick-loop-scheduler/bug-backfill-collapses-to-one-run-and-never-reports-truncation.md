@@ -4,6 +4,7 @@ status: in_progress
 id: bug-backfill-collapses-to-one-run-and-never-reports-truncation
 title: misfire backfill collapses every missed occurrence into one run and reports truncation nowhere
 assignee: arggon
+branch: fix/bug-backfill-collapses-to-one-run-and-never-reports-truncation
 parent: v1-tick-loop-scheduler
 labels: []
 priority: p1
