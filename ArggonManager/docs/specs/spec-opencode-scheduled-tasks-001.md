@@ -1,9 +1,19 @@
 ---
 spec_id: opencode-scheduled-tasks-001
 title: Cron-style scheduled agent tasks
-status: implemented
+status: proposed
 created: 2026-10-02
 ---
+
+<!-- status: NOT implemented. Reverted from `implemented` by the acceptance audit
+     (task-audit-spec-001-acceptance-boxes), which resolved all 39 boxes as:
+     23 ticked with a named test, 1 amended, 4 FALSE (filed as bugs), 12 true but
+     unpinned by any test. Sixteen boxes are therefore still open, and `implemented`
+     was asserting something the acceptance section had never checked.
+     DOC_STATUSES has no in-progress state, so `proposed` is the only honest value -
+     the same rule that keeps spec 002 at `proposed`. This must be flipped together
+     with plan-opencode-scheduled-tasks-001, or spec analyze reports SPEC-STATUS-DRIFT.
+     Flip both in the PR that closes the last open box. -->
 
 # Spec: Cron-style scheduled agent tasks (opencode-scheduled-tasks-001)
 
