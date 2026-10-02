@@ -20,10 +20,27 @@ depends_on: [task-t2-markdown-task-files, task-t4-per-job-permissions, task-t6-s
 
 ## Context
 
-<!-- Why this task exists. -->
+Credits and documents v2. This task spans all three stories — it is filed under
+config-surface because that is where the work starts.
+
+See plan 002 §T7, spec 002, and ADR 0007.
 
 ## Acceptance
 
-<!-- The real acceptance criteria; tick each box when met. -->
+- [ ] README **Acknowledgements** names `jdormit/opencode-tasks` and its author, and lists the
+      ideas adopted from it.
+- [ ] README documents: markdown authoring and precedence, permission semantics (rule order,
+      unattended `ask`, `external_directory`), session mode, one-offs, loops, history.
+- [ ] `opencode-tasks` and its author are also named in spec 002 and cited inline in ADRs
+      0004/0005/0006.
+- [ ] A **v1 job file with no markdown directory behaves identically** — the upgrade is
+      additive, asserted by a test rather than claimed.
+- [ ] README's documented commands are executed verbatim by the dogfood run.
+- [ ] Package metadata notes the lineage.
+
+
 
 ## Notes
+
+Plan 002, spec 002 and the cited ADRs are the authority; this body is the
+done-gate checklist (ADR 0015).

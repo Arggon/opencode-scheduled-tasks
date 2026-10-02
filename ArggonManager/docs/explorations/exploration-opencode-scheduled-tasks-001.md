@@ -1,11 +1,11 @@
 ---
-exploration_id: 001
+exploration_id: opencode-scheduled-tasks-001
 title: Cron-style scheduled agent tasks for OpenCode V2
 status: complete
 created: 2026-10-02
 ---
 
-# Project exploration: Cron-style scheduled agent tasks for OpenCode V2 (001)
+# Project exploration: Cron-style scheduled agent tasks for OpenCode V2 (opencode-scheduled-tasks-001)
 
 Greenfield record (the six-phase protocol, `.agents/skills/arggon-cli/references/exploration.md`
 — ADR 0017). Decisions land in ADRs 0001–0003; hunted edge cases leave this doc as spec

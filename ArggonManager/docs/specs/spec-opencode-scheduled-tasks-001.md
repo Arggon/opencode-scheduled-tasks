@@ -1,11 +1,11 @@
 ---
-spec_id: 001
+spec_id: opencode-scheduled-tasks-001
 title: Cron-style scheduled agent tasks
-status: proposed
+status: implemented
 created: 2026-10-02
 ---
 
-# Spec: Cron-style scheduled agent tasks (001)
+# Spec: Cron-style scheduled agent tasks (opencode-scheduled-tasks-001)
 
 ## Purpose
 

@@ -19,10 +19,26 @@ updated: "2026-10-02"
 
 ## Context
 
-<!-- Why this task exists. -->
+Compound duration parser accepting `30s`, `5m`, `2h`, `1d` and compounds like `1h30m`;
+plain numbers mean seconds. Wired as `runTimeout` on both config surfaces while the existing
+`runTimeoutMs` keeps working. Adds `schedules_format`.
+
+See plan 002 §T1 and spec 002 § "Durations".
 
 ## Acceptance
 
-<!-- The real acceptance criteria; tick each box when met. -->
+- [ ] A table-driven test pins every accepted duration form and every rejection.
+- [ ] A malformed or non-positive duration is refused with a named reason, never silently
+      defaulted.
+- [ ] `runTimeoutMs` behaves exactly as in v1 (additive, non-breaking).
+- [ ] `schedules_format` returns the job-file reference, naming **both** config surfaces and the
+      markdown-wins precedence rule.
+- [ ] `schedules_format` documents the per-job `model` field, so an agent cannot author a job
+      that silently inherits a paid model.
+
+
 
 ## Notes
+
+Plan 002, spec 002 and the cited ADRs are the authority; this body is the
+done-gate checklist (ADR 0015).

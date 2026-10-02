@@ -1,12 +1,12 @@
 ---
-plan_id: 001
+plan_id: opencode-scheduled-tasks-001
 title: Plan for Cron-style scheduled agent tasks
 spec: ArggonManager/docs/specs/spec-opencode-scheduled-tasks-001.md
-status: proposed
+status: implemented
 created: 2026-10-02
 ---
 
-# Plan: Cron-style scheduled agent tasks (001)
+# Plan: Cron-style scheduled agent tasks (opencode-scheduled-tasks-001)
 
 Derived from `ArggonManager/docs/specs/spec-opencode-scheduled-tasks-001.md`. Each task
 carries a verifiable acceptance criterion and links back to the spec. Waves are

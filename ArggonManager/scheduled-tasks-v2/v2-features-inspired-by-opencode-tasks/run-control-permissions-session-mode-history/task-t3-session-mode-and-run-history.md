@@ -20,10 +20,22 @@ depends_on: [task-t1-durations-and-format-tool]
 
 ## Context
 
-<!-- Why this task exists. -->
+`session: reuse|fresh` and a bounded per-job run-history ring buffer with a `schedules_history`
+tool. See plan 002 §T3 and spec 002 § "Session mode" / "Run history".
 
 ## Acceptance
 
-<!-- The real acceptance criteria; tick each box when met. -->
+- [ ] `reuse` (default) preserves v1 behaviour; `fresh` creates a new session per run.
+- [ ] A `session` value other than `reuse`/`fresh` is refused with a named reason.
+- [ ] Resolved mode appears in `schedules_list` and in the `running` log line.
+- [ ] History is capped and evicts oldest-first; it can never grow unbounded.
+- [ ] Each entry records due instant, start, outcome, resolved model and a bounded error string.
+- [ ] `schedules_history` returns newest-first; an unknown id returns a typed error naming it,
+      not an empty success.
+
+
 
 ## Notes
+
+Plan 002, spec 002 and the cited ADRs are the authority; this body is the
+done-gate checklist (ADR 0015).

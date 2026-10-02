@@ -20,10 +20,24 @@ depends_on: [task-t3-session-mode-and-run-history]
 
 ## Context
 
-<!-- Why this task exists. -->
+`schedules_schedule` / `schedules_cancel` for absolute-instant, single-run tasks under their own
+storage namespace. Implements ADR 0006, which narrows ADR 0001 to recurring jobs only.
+
+See plan 002 §T5 and spec 002 § "One-off tasks".
 
 ## Acceptance
 
-<!-- The real acceptance criteria; tick each box when met. -->
+- [ ] A one-off fires exactly once at its instant and is then gone.
+- [ ] A one-off **never** appears in or mutates a job file (ADR 0006 guarantee).
+- [ ] A past instant is refused, or run within a small documented grace window — never silently
+      treated as "due now".
+- [ ] Cancelling an unknown or already-completed id returns a typed error naming the id.
+- [ ] Completed one-offs survive only inside run history, then are discarded.
+- [ ] Per-project cap (default 50) is enforced and **reported** when reached.
+
+
 
 ## Notes
+
+Plan 002, spec 002 and the cited ADRs are the authority; this body is the
+done-gate checklist (ADR 0015).
