@@ -4,6 +4,7 @@ status: in_progress
 id: task-tick-drain-order-oneoffs-before-loops
 title: Drain order lets a recurring loop starve a one-off at the concurrency cap
 assignee: arggon
+branch: fix/task-tick-drain-order-oneoffs-before-loops
 parent: ephemeral-tasks-one-offs-and-session-loops
 labels: []
 priority: p2
