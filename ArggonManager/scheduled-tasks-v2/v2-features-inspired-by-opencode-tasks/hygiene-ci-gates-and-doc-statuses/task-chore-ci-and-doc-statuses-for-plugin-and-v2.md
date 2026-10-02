@@ -1,12 +1,14 @@
 ---
 type: task
-status: todo
+status: in_progress
 id: task-chore-ci-and-doc-statuses-for-plugin-and-v2
 title: "No CI runs the plugin's tests; v2 docs statuses were never flipped"
+assignee: arggon
 parent: hygiene-ci-gates-and-doc-statuses
 labels: []
 created: "2026-10-02"
 updated: "2026-10-02"
+claimed_at: "2026-10-02T15:56:32.879Z"
 ---
 <!--
   Placement (v0): ArggonManager/scheduled-tasks-v2/v2-features-inspired-by-opencode-tasks/hygiene-ci-gates-and-doc-statuses/task-chore-ci-and-doc-statuses-for-plugin-and-v2.md
