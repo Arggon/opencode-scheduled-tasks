@@ -1,6 +1,6 @@
 ---
 type: story
-status: todo
+status: done
 id: ephemeral-tasks-one-offs-and-session-loops
 title: "Ephemeral tasks: one-offs and session loops"
 parent: v2-features-inspired-by-opencode-tasks

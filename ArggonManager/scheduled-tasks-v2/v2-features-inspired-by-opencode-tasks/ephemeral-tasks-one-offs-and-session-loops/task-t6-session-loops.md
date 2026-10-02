@@ -1,14 +1,14 @@
 ---
 type: task
-status: in_progress
+status: done
 id: task-t6-session-loops
 title: Session loops
 assignee: arggon
+branch: feat/task-t6-session-loops
 parent: ephemeral-tasks-one-offs-and-session-loops
 labels: []
 created: "2026-10-02"
 updated: "2026-10-02"
-claimed_at: "2026-10-02T15:29:14.857Z"
 depends_on: [task-t5-one-off-tasks]
 ---
 <!--
@@ -29,12 +29,12 @@ See plan 002 §T6 and spec 002 § "Session loops".
 
 ## Acceptance
 
-- [ ] A loop posts into **the session that created it** and nowhere else.
-- [ ] Intervals are durations, not cron; a sub-minute interval is refused with a named reason.
-- [ ] A loop auto-disables at its three-day expiry and the expiry is reported.
-- [ ] Per-session cap (default 10) is enforced and reported when reached.
-- [ ] Stopping an unknown id returns a typed error naming it; stopping with no id stops all.
-- [ ] A loop cannot outlive its session, and loops are cleared when the session is gone.
+- [x] A loop posts into **the session that created it** and nowhere else.
+- [x] Intervals are durations, not cron; a sub-minute interval is refused with a named reason.
+- [x] A loop auto-disables at its three-day expiry and the expiry is reported.
+- [x] Per-session cap (default 10) is enforced and reported when reached.
+- [x] Stopping an unknown id returns a typed error naming it; stopping with no id stops all.
+- [x] A loop cannot outlive its session, and loops are cleared when the session is gone.
 
 
 
