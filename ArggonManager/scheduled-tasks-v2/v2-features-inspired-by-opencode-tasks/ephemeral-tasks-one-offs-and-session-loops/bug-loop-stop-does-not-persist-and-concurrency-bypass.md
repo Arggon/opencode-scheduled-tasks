@@ -4,6 +4,7 @@ status: in_progress
 id: bug-loop-stop-does-not-persist-and-concurrency-bypass
 title: "stop_loop does not persist, and loops bypass the concurrency cap"
 assignee: arggon
+branch: fix/bug-loop-stop-does-not-persist-and-concurrency-bypass
 parent: ephemeral-tasks-one-offs-and-session-loops
 labels: []
 created: "2026-10-02"
