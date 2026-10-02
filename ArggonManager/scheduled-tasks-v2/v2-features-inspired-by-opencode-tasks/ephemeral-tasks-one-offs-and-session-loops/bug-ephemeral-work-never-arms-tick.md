@@ -4,6 +4,7 @@ status: in_progress
 id: bug-ephemeral-work-never-arms-tick
 title: Ephemeral work never arms the tick loop
 assignee: arggon
+branch: fix/bug-ephemeral-work-never-arms-tick
 parent: ephemeral-tasks-one-offs-and-session-loops
 labels: []
 created: "2026-10-02"
