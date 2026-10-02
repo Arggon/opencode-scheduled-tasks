@@ -1,6 +1,6 @@
 ---
 type: task
-status: in_progress
+status: done
 id: task-audit-spec-001-acceptance-boxes
 title: spec 001 claims implemented with 0 of 39 acceptance boxes ticked
 assignee: arggon
@@ -10,7 +10,6 @@ labels: []
 priority: p1
 created: "2026-10-02"
 updated: "2026-10-02"
-claimed_at: "2026-10-02T22:00:57.196Z"
 depends_on: [task-tick-drain-order-oneoffs-before-loops]
 ---
 <!--
@@ -40,16 +39,16 @@ reason for existing is the difference.
 
 ## Acceptance
 
-- [ ] Every one of the 39 boxes is resolved one of three ways: **ticked with the test that proves
+- [x] Every one of the 39 boxes is resolved one of three ways: **ticked with the test that proves
       it** named in a note, **amended** to describe what actually ships, or **moved into a tracked
       item** with a link. No box is left silently unticked under an `implemented` status.
-- [ ] Where a box is ticked, the note names the specific test — e.g. "box 131 (DST spring-forward):
+- [x] Where a box is ticked, the note names the specific test — e.g. "box 131 (DST spring-forward):
       `test/index.test.ts` 'skips a local time that does not exist'". A tick with no test named is
       not accepted.
-- [ ] Any box found false is filed as a `bug` with reproduction, not quietly amended to match the
+- [x] Any box found false is filed as a `bug` with reproduction, not quietly amended to match the
       code. Amending is for boxes that were *mis-specified*; a box that caught a real defect gets an
       item.
-- [ ] `spec analyze` and `spec validate` stay clean, and the spec's status still matches reality at
+- [x] `spec analyze` and `spec validate` stay clean, and the spec's status still matches reality at
       the end.
 
 ## Notes
