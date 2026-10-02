@@ -63,20 +63,20 @@ comes to rely on a bound that is not there.
 
 ## Acceptance
 
-- [ ] A manual trigger goes through the same bound as a scheduled run: `boundRun`, with
+- [x] A manual trigger goes through the same bound as a scheduled run: `boundRun`, with
       `runTimeoutMs`, `ctx.session.interrupt` on overrun, and a recorded `timeout` outcome.
-- [ ] It participates in the concurrency cap — admitted only when the shared budget allows, and it
+- [x] It participates in the concurrency cap — admitted only when the shared budget allows, and it
       registers for the duration so a scheduled run cannot start alongside it and blow the cap.
-- [ ] Its history lands in the same ring a scheduled run writes, with `startedAt` at dispatch.
-- [ ] Either it takes a lease, or the ADR/spec position on manual triggers is written down
+- [x] Its history lands in the same ring a scheduled run writes, with `startedAt` at dispatch.
+- [x] Either it takes a lease, or the ADR/spec position on manual triggers is written down
       explicitly and the description stops claiming it. Decide deliberately; do not leave the
       sentence as-is.
-- [ ] **The description matches the code.** If any part of "the same concurrency, timeout and lease
+- [x] **The description matches the code.** If any part of "the same concurrency, timeout and lease
       rules" cannot be delivered, the sentence is corrected — and the correction is stated in the
       report rather than left implicit.
-- [ ] Tests cover: a hung manual trigger bounded at `runTimeoutMs`; the cap refusing a second
+- [x] Tests cover: a hung manual trigger bounded at `runTimeoutMs`; the cap refusing a second
       admission; and a description assertion or comment tying the sentence to the behaviour.
-- [ ] Mutation-check the cap and the bound.
+- [x] Mutation-check the cap and the bound.
 
 ## Notes
 
