@@ -1,0 +1,5 @@
+# arggon:generated template="gitignore"
+# Worktree runtime environment written by `arggon start --worktree`
+# (spec worktree-env-contract-016): per-worktree identity and state/cache
+# dirs. Machine state — never commit it.
+.arggon.env

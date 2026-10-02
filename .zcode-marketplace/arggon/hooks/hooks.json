@@ -1,0 +1,45 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Agent|Bash|Write|Edit|mcp__arggon__.*",
+        "hooks": [
+          {
+            "type": "process",
+            "command": "node",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/gate.mjs", "pre"],
+            "timeoutMs": 10000,
+            "statusMessage": "arggon gate"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Agent",
+        "hooks": [
+          {
+            "type": "process",
+            "command": "node",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/gate.mjs", "post"],
+            "timeoutMs": 10000,
+            "statusMessage": "arggon gate"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "process",
+            "command": "node",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/gate.mjs", "stop"],
+            "timeoutMs": 10000,
+            "statusMessage": "arggon gate"
+          }
+        ]
+      }
+    ]
+  }
+}

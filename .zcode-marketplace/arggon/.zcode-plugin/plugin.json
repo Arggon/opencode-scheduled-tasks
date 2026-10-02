@@ -1,0 +1,16 @@
+{
+  "name": "arggon",
+  "version": "0.1.0",
+  "description": "ArggonManager native seam: the arggon MCP tools (tracker + worktree lifecycle), /arggon commands, coordinator/worker/reviewer agents, and the hook gates (global git gates; reviewer dispatch backstop). Requires the arggon CLI on PATH (npm i -g arggon-manager) — the MCP server is `arggon mcp`.",
+  "author": { "name": "Arggon" },
+  "license": "MIT",
+  "commands": "commands",
+  "agents": "agents",
+  "hooks": "hooks/hooks.json",
+  "mcpServers": {
+    "arggon": {
+      "command": "arggon",
+      "args": ["mcp"]
+    }
+  }
+}

@@ -1,0 +1,79 @@
+# arggon:generated template="github/workflows/arggon.yml"
+# ArggonManager tracker CI — headless: no model, no MCP client, no OpenCode.
+#
+# The packaged `arggon` bin does all of it: `init` bootstraps/upgrades the
+# generated docs idempotently (never overwriting adopter files), `validate`
+# gates the tracker, `doctor`/`list --json` print diagnostics. The full recipe
+# (install variants, released one-liner, local reproduction) lives in
+# ArggonManager/docs/ci.md.
+name: arggon
+
+on:
+  # Cheap (~30-60 s) but deliberately scoped: the drift gate below compares the
+  # committed seam against what the pinned `ARGGON_VERSION` generates, so the
+  # job must not run on every topic-branch push or tracker auto-commit (adjust
+  # the branch list to YOUR default branch(es); pull requests always run it so
+  # a stale seam is caught before merge). The runner's own file is excluded
+  # from the comparison (see the drift-gate step): a self-bootstrapping
+  # workflow cannot be gated against the pinned version, because its own
+  # template change only reaches a release after merge.
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  # The bin installs from the registry, pinned to a release
+  # (task-ci-recipe-published-one-liner): no GitHub clone, works from private
+  # or forked remotes alike. The pin moves only in the release runbook's
+  # post-release follow-up (step 6), so the drift gate compares against a
+  # fixed seam instead of a moving one.
+  ARGGON_VERSION: "0.4.0"
+
+jobs:
+  tasks-validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install the headless arggon bin (no model, no MCP)
+        run: npm install -g "arggon-manager@$ARGGON_VERSION"
+
+      - name: Bootstrap the tracker (idempotent; never overwrites adopter files)
+        run: arggon init --no-commit
+
+      - name: Committed seam is current (drift gate; no-op until initialized)
+        run: |
+          # The gate applies once an arggon-managed tree is committed: it keys
+          # off a committed provenance marker (any generated file), not the
+          # state file alone — so a repo that commits the generated docs
+          # without committing `*.convention.yml` still gets the check. A fresh
+          # clone has no committed marker, and this run's own untracked output
+          # must not fail CI.
+          if ! git grep -q --fixed-strings "arggon:generated" -- . 2>/dev/null; then
+            echo "no committed arggon seam yet — run 'arggon init' locally and commit the generated docs"
+            exit 0
+          fi
+          # `init` refreshes the per-doc generatedAt bookkeeping on every run,
+          # so the state file is excluded. The runner's own file is excluded
+          # too: it bootstraps itself (its template change only reaches the
+          # pinned ref after merge, so gating it would make every trigger edit
+          # fail its own PR) and its step bodies are exercised verbatim by
+          # `cli/src/headless-ci.test.ts`. Every other generated file must be
+          # byte-identical to what the pinned version generates.
+          dirty=$(git status --porcelain -- . ':(exclude)ArggonManager/.convention.yml' ':(exclude)tasks/.convention.yml' ':(exclude).github/workflows/arggon.yml')
+          if [ -n "$dirty" ]; then
+            echo "the committed arggon seam predates the pinned ref — run 'arggon init' and commit:"
+            echo "$dirty"
+            exit 1
+          fi
+
+      - name: Validate the tracker
+        run: arggon validate --json
+
+      - name: Diagnostics (report-only)
+        run: |
+          arggon doctor --json
+          arggon list --json

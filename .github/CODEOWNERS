@@ -1,0 +1,12 @@
+<!-- arggon:generated template="github/CODEOWNERS" -->
+# CODEOWNERS — https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+# Reviewers requested automatically when a PR touches matching paths.
+# Uncomment and replace with real owners for opencode-scheduled-tasks; an invalid owner silently disables the rule.
+
+# Global default owner — every file not matched below.
+# *       @your-org/maintainers
+
+# Examples:
+# /cli/         @your-org/cli-team
+# /ArggonManager/docs/  @your-org/docs-team
+# /.github/     @your-org/platform-team
