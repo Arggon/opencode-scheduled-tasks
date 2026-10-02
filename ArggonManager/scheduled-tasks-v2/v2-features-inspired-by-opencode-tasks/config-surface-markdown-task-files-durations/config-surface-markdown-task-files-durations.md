@@ -1,12 +1,14 @@
 ---
 type: story
-status: todo
+status: in_progress
 id: config-surface-markdown-task-files-durations
 title: "Config surface: markdown task files, durations"
+assignee: arggon
 parent: v2-features-inspired-by-opencode-tasks
 labels: []
 created: "2026-10-02"
 updated: "2026-10-02"
+claimed_at: "2026-10-02T17:38:49.478Z"
 ---
 <!--
   Placement (v0): ArggonManager/scheduled-tasks-v2/v2-features-inspired-by-opencode-tasks/config-surface-markdown-task-files-durations/config-surface-markdown-task-files-durations.md (story index; required).
