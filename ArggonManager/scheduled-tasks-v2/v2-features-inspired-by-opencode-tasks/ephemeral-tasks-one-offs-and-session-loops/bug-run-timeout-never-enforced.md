@@ -170,3 +170,108 @@ bound — a loop has no `runTimeout` field and `every` is a cadence, not a bound
 ### handoff 2026-10-02 @ses_f024cc54dffeq7BUIFZMa6JqAU (session: ses_f024cc54dffeq7BUIFZMa6JqAU) — next: Coordinator: review commit 9386375, then let T7 close acceptance box 5 (README) using the two corrections spelled out on the item.
 - branch: fix/bug-run-timeout-never-enforced
 - open questions: Box 7 left unticked: the lease-renewal half is not black-box observable (M4/M5/M6/M7 all green). Also: `schedules_run` still awaits `ctx.session.prompt` unbounded and never enters `inFlight` — separa…
+
+### 2026-10-02 @ses_f024cc54dffeq7BUIFZMa6JqAU
+## Evidence for review — commit `9386375`, branch `fix/bug-run-timeout-never-enforced`
+
+### 1. Does a cancel primitive exist on this host? Yes — and I probed it, rather than reading a type
+
+A throwaway probe plugin was loaded into a **real `opencode run` (v2.0.22)** and wrote the surface it
+was actually handed to a file. Result:
+
+```
+PROBE_SESSION=["command","compact","context","create","generate","get","hook","interrupt","move",
+               "prompt","remove","switchAgent","switchModel","synthetic","update","wait"]
+PROBE interrupt({}) threw=Missing key at ["sessionID"]
+PROBE interrupt(missing session) resolved={"interrupted":false}
+PROBE interrupt(bad type) threw=Expected string at ["sessionID"]
+```
+
+So `ctx.session.interrupt` exists, takes `{ sessionID }`, and resolves `{ interrupted: boolean }` — a
+`false` is an **answer**, not a failure, which is why `stopRun` treats only an explicit `false` as a
+refusal. Still feature-detected at every call, like `ctx.storage.remove`. The probe was deleted
+afterwards; `git status` shows only the three intended paths.
+
+**This probe corrected a claim in this item's Context section.** The cross-process writer lease is a
+lockfile heartbeated at the top of every `tick`, and runs are dispatched with `void`, so a hung run
+cannot stall the heartbeat. The lease that really did expire mid-run was the per-job
+`record.leaseUntil`. The "Known gap" paragraph in the README inherits that error and must be
+corrected, not just deleted.
+
+### 2. Gates (all run from the worktree)
+
+```
+npx tsc --noEmit            clean
+npx vitest run              Tests  200 passed (200)   # was 191
+npx tsx harness/smoke.ts    [harness] PASS
+arggon validate             ok (0 warning(s), convention v5)
+arggon spec analyze         clean (2 spec(s) scanned)
+```
+
+Ten consecutive full `vitest run` were green. I found and fixed one flake on the way (an assertion on
+`lastStatus` that depended on where in the minute the test started); the run-bound boundary is now
+crossed by predicate, not by a guessed number of milliseconds.
+
+### 3. Mutation results — every one, including the ones that caught nothing
+
+| # | Mutation | Caught by |
+|---|---|---|
+| M1 | `boundRun` always reports `settled` (the bound never binds) | 5 tests |
+| M2 | `runJob` records the timeout but never returns (run stays outstanding) | 3 tests |
+| M3 | `stopRun` deleted — the session is never interrupted | 1 test (`…to match /interrupted/`) |
+| M9 | loop path left unbounded (`postLoop` returns immediately) | 3 tests (2 pre-existing) |
+| M10 | one-off path left unbounded | 1 test |
+| M8 | `leaseRenewalMs` returns the whole window (renewal no longer fits inside it) | 1 test |
+| **M4** | **lease renewal deleted outright** | **nothing** |
+| **M5** | **clock-independent `inFlight` signal dropped** | **nothing** |
+| **M6** | **both of the above** | **nothing** |
+| **M7** | **renewed window cut to a quarter of the bound** | **nothing** |
+
+M1–M3 are the load-bearing ones and all fail *fast* (~15ms), not by hanging — the repro advances an
+injected clock, because `runTimeoutMs` is floored at one minute and a wall-clock test of this would
+have to run for a minute to fail.
+
+### 4. The four green mutations are a finding, not an oversight — this is why box 7 is unticked
+
+Once the bound is enforced, **the bound timer is always due before the lease can expire, and is
+delivered first**, so `leaseUntil` cannot read expired under a legitimately live run in any state the
+scheduler can reach. The lease renewal and the `inFlight` join are therefore provably redundant for
+every reachable state, and no test can separate them without manufacturing an unreachable one.
+
+I wrote the double-fire test anyway. **It reproduced** with both signals removed — two `slow run`
+prompts and two `running slow` lines, confirmed from a dump of the plugin's own log — but the
+boundary it depends on is zero-width (the tick period divides `runTimeoutMs`, so the tick and the
+bound come due at the same instant), and **the same mutation passed it on some runs and failed it on
+others.** Shipping a test whose green depends on timer-registration order would be worse than no
+test, so I deleted it and wrote down the reason in the test file rather than leaving a gap unexplained.
+
+What *is* pinned: `leaseRenewalMs`'s schedule rule, `isRunOutstanding`'s disjunction, a
+lease-live-for-the-whole-run regression guard, and the two cross-process claims (lockfile heartbeat
+advances while hung; foreign holder keeps a second instance inert).
+
+### 5. Decisions the brief asked me to make explicitly
+
+- **Cancel primitive:** feature-detected, used when present, and the record distinguishes
+  `interrupted` from `abandoned — ctx.session.interrupt is unavailable`. A host without it is still
+  bounded, and says so.
+- **Lease renewal vs run liveness:** tied to **run liveness**, not the tick heartbeat. The tick
+  heartbeat is ADR 0003's *cross-process* mechanism and cannot see runs; tying `leaseUntil` to it
+  would leave the field answering "did a tick happen" and cost a storage write per in-flight job per
+  tick.
+- **The asymmetry:** a timeout that fires late is recoverable (the record is slightly pessimistic, the
+  next occurrence is unaffected); a lease that expires under a live run is not (two runs of one
+  occurrence is a fact the history can no longer explain). So the run bound wins on *reporting* and
+  liveness wins on *suppression*. Stated in the comment on `isRunOutstanding`.
+- **Timeout record:** `outcome: "timeout"` (the previously dead `RunStatus` member), plus
+  `lastStatus: "timeout"` on the job state and a one-line log naming the job and the bound.
+
+### 6. Scope notes — things I found and did *not* fix
+
+- `schedules_run` (the on-demand tool) still awaits `ctx.session.prompt` **unbounded**, and never adds
+  to `inFlight`. So a hung on-demand run does not consume the concurrency cap — but the tool call
+  itself never returns. Same class of defect, different surface and different blast radius; bounding it
+  changes the tool's `admitted` contract, so it deserves its own item rather than a quiet extension
+  of this diff.
+- `postLoop` is bounded by `DEFAULT_RUN_TIMEOUT_MS`: `SessionLoop` has no `runTimeout` field and
+  `every` is a cadence, not a bound. Inventing a field the tool does not expose felt worse than using
+  the default, but it is a choice a reviewer may want to revisit.
