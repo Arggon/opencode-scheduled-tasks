@@ -3457,81 +3457,59 @@ async function tick(ctx: PluginContext, state: SchedulerState, lease: Lease, max
   }
 
   // One slot counter for the whole tick, so the three drains below share a single budget:
-  // recurring decisions, loop posts and one-offs each consume from it. Reading it only in the
+  // recurring decisions, one-off tasks and loop posts each consume from it. Reading it only in the
   // job loop is what let 3 due loops post in one tick under `maxConcurrentRuns: 1`.
-  let claimed = state.inFlight.size + decisions.length
-
-  // Loops fire only into the session that owns them, and never outlive that session.
-  for (const [sessionID, loops] of state.loops) {
-    if (loops.length === 0) continue
-    const surviving: SessionLoop[] = []
-    let dirty = false
-    for (const loop of loops) {
-      if (loop.expiresAt <= now) {
-        logLine(`loop ${loop.id} expired after ${loopLifetime(loop)} and was disabled`)
-        // Persisted, not just dropped from memory: an expiry that survives in memory but not
-        // in storage comes back whole after a restart, which is how a stopped loop kept
-        // posting.
-        dirty = true
-        continue
-      }
-      surviving.push(loop)
-      if (loop.nextRunAt > now) continue
-
-      // A due loop is a billable model request into someone's live session — a *tighter*
-      // requirement than a background job, not a looser one — so it goes through the same
-      // admission as everything else. The occurrence is consumed either way; the difference
-      // is recorded, never queued, exactly like a due one-off below.
-      const dueAt = loop.nextRunAt
-      // Re-arm first: a crash must not double-post on the next tick.
-      loop.nextRunAt = now + loop.intervalMs
-      dirty = true
-
-      if (claimed >= maxConcurrent) {
-        logLine(`skipping loop ${loop.id}: concurrency cap reached (${claimed}/${maxConcurrent})`)
-        await recordLoopRun(
-          ctx,
-          state,
-          loop,
-          sessionID,
-          dueAt,
-          "skipped",
-          "session default",
-          `no free run slot: concurrency cap ${maxConcurrent} reached`,
-        )
-        continue
-      }
-
-      claimed += 1
-      // In flight for the rest of the tick, exactly as a job run is: a second loop due in the
-      // same session must see the slot taken rather than double-posting into one session.
-      state.inFlight.add(loop.id)
-      void postLoop(ctx, state, loop, sessionID, dueAt)
-        .catch((error: unknown) => {
-          logOnce(`loop-${loop.id}`, `post failed (${error instanceof Error ? error.message : String(error)})`)
-        })
-        .finally(() => {
-          state.inFlight.delete(loop.id)
-        })
-    }
-    if (dirty) {
-      state.loops.set(sessionID, surviving)
-      // `nextRunAt` moves on every post, so this write is what stops a loop from replaying
-      // the same occurrence after a restart.
-      await saveLoops(ctx, sessionID, surviving)
-    }
+  //
+  // Seeded **once**, here, and spent from by all three drains — none of them re-reads the live
+  // `state.inFlight.size`. That is what makes the reordering below safe: a drain finds the budget
+  // already spent whether or not the run that spent it has settled by the time it looks, so moving
+  // a drain earlier cannot hand the same slot out a second time.
+  const inFlightBeforeTick = state.inFlight.size
+  let claimed = inFlightBeforeTick + decisions.length
+  // *Who* spent it, because "the cap is full" is not an answer a person staring at a starved loop
+  // can use. Now that one-offs drain first, a refused loop has almost always lost the slot to a
+  // **one-off** — and a line naming only the cap would read as though another loop had outranked
+  // it, which is the opposite of the rule this tick exists to enforce. The two halves of the seed
+  // are named separately: a run still going is not the same claim as an occurrence admitted above
+  // and dispatched at the end of this tick.
+  let oneOffClaimed = 0
+  let loopClaimed = 0
+  const budgetSpentBy = (): string => {
+    const parts: string[] = []
+    if (inFlightBeforeTick > 0) parts.push(`${inFlightBeforeTick} run(s) still in flight`)
+    if (decisions.length > 0) parts.push(`${decisions.length} recurring job occurrence(s) decided this tick`)
+    if (oneOffClaimed > 0) parts.push(`${oneOffClaimed} one-off task(s) earlier this tick`)
+    if (loopClaimed > 0) parts.push(`${loopClaimed} loop post(s) earlier this tick`)
+    return parts.join(", ")
   }
 
-  // One-offs are drained after recurring jobs so a one-off never starves a schedule.
+  // **One-offs drain before loops** — specific beats recurring. Coordinator decision, recorded on
+  // `task-tick-drain-order-oneoffs-before-loops`; it is settled and not re-opened per tick.
+  //
+  // The two ephemeral kinds lose the slot to each other very differently. A loop is an indefinite,
+  // repeating request: it is owed another occurrence a minute later anyway, so a due loop that
+  // finds no free slot loses one turn and keeps its loop. A one-off that finds no slot is *spent
+  // and recorded as `skipped`* — permanently, by design, which is what keeps the backlog bounded —
+  // so a user who asked for a specific task at a specific time would lose it to a recurring
+  // request, silently. The loop is the cheap thing to disappoint; the one-off is not.
+  //
+  // ADR 0006 points the same way: recurring *jobs* stay file-only and ephemeral work is the
+  // exception to file-only, so within the ephemeral drains the least-repeating intent — the
+  // user-stated instant — should win the scarce slot.
+  //
+  // Recurring *jobs* still decide first, above, unchanged: a job is a standing cron instruction and
+  // neither ephemeral drain may starve it. Only the order *between* the two ephemeral kinds moved.
   const due = state.oneOffs.filter((task) => task.dueAt <= now)
   if (due.length > 0) {
-    // The same shared budget the loop drain spent from: a tick that already spent its slots
-    // on jobs and loop posts has none left, and recomputing `state.inFlight.size` here would
-    // hand out a second full budget in the same tick.
+    // The same shared budget the loop drain spends from below: a tick that already spent its slots
+    // on jobs has none left, and recomputing `state.inFlight.size` here would hand out a second
+    // full budget in the same tick. It is this drain's turn to spend first, so `claimed` still
+    // holds only the seed the job loop left.
     const free = Math.max(0, maxConcurrent - claimed)
     const admitted = due.slice(0, free)
     const skipped = due.slice(free)
     claimed += admitted.length
+    oneOffClaimed += admitted.length
 
     if (skipped.length > 0) {
       // **Skipped and recorded, never queued** (spec 001 § concurrency, ADR 0002) — the same
@@ -3577,6 +3555,77 @@ async function tick(ctx: PluginContext, state: SchedulerState, lease: Lease, max
         .finally(() => {
           state.dispatching.delete(task.id)
         })
+    }
+  }
+
+  // Loops fire only into the session that owns them, and never outlive that session. They drain
+  // *after* the one-offs above — see the ordering rule recorded there — so a due loop that finds
+  // the budget gone knows it lost the slot to something more specific than itself, and says so.
+  for (const [sessionID, loops] of state.loops) {
+    if (loops.length === 0) continue
+    const surviving: SessionLoop[] = []
+    let dirty = false
+    for (const loop of loops) {
+      if (loop.expiresAt <= now) {
+        logLine(`loop ${loop.id} expired after ${loopLifetime(loop)} and was disabled`)
+        // Persisted, not just dropped from memory: an expiry that survives in memory but not
+        // in storage comes back whole after a restart, which is how a stopped loop kept
+        // posting.
+        dirty = true
+        continue
+      }
+      surviving.push(loop)
+      if (loop.nextRunAt > now) continue
+
+      // A due loop is a billable model request into someone's live session — a *tighter*
+      // requirement than a background job, not a looser one — so it goes through the same
+      // admission as everything else. The occurrence is consumed either way; the difference
+      // is recorded, never queued, exactly like a due one-off above — which, unlike this
+      // drain, spends the tick's slot first.
+      const dueAt = loop.nextRunAt
+      // Re-arm first: a crash must not double-post on the next tick.
+      loop.nextRunAt = now + loop.intervalMs
+      dirty = true
+
+      if (claimed >= maxConcurrent) {
+        // Name who took the slot, not just the cap. After the reordering above the common cause is
+        // a pending one-off, and "concurrency cap reached" alone would leave the reader believing
+        // this loop lost to another loop — the exact inverse of the rule the tick enforces.
+        const spentBy = budgetSpentBy()
+        logLine(
+          `skipping loop ${loop.id}: concurrency cap reached (${claimed}/${maxConcurrent}); the slot went to ${spentBy}`,
+        )
+        await recordLoopRun(
+          ctx,
+          state,
+          loop,
+          sessionID,
+          dueAt,
+          "skipped",
+          "session default",
+          `no free run slot: concurrency cap ${maxConcurrent} reached, spent on ${spentBy}`,
+        )
+        continue
+      }
+
+      claimed += 1
+      loopClaimed += 1
+      // In flight for the rest of the tick, exactly as a job run is: a second loop due in the
+      // same session must see the slot taken rather than double-posting into one session.
+      state.inFlight.add(loop.id)
+      void postLoop(ctx, state, loop, sessionID, dueAt)
+        .catch((error: unknown) => {
+          logOnce(`loop-${loop.id}`, `post failed (${error instanceof Error ? error.message : String(error)})`)
+        })
+        .finally(() => {
+          state.inFlight.delete(loop.id)
+        })
+    }
+    if (dirty) {
+      state.loops.set(sessionID, surviving)
+      // `nextRunAt` moves on every post, so this write is what stops a loop from replaying
+      // the same occurrence after a restart.
+      await saveLoops(ctx, sessionID, surviving)
     }
   }
 
