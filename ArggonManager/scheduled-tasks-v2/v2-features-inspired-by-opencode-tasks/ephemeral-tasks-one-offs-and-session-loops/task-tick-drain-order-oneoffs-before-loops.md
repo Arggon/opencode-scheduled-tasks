@@ -8,6 +8,7 @@ labels: []
 priority: p2
 created: "2026-10-02"
 updated: "2026-10-02"
+depends_on: [bug-tool-boundary-throws-and-ask-not-recorded]
 ---
 <!--
   Placement (v0): ArggonManager/scheduled-tasks-v2/v2-features-inspired-by-opencode-tasks/ephemeral-tasks-one-offs-and-session-loops/task-tick-drain-order-oneoffs-before-loops.md
