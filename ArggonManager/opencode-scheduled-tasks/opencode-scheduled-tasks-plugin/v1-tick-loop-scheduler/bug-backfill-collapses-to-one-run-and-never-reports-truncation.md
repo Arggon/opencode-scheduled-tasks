@@ -140,3 +140,7 @@ runs is what a user who explicitly opted into catch-up asked for. What the ADR l
 Cost observation for whoever re-opens it: a `maxCatchUp: 50` job now spends up to 50 billable runs where it
 previously spent 1 — but only if the user set 50, and only `backfill`, which is opt-in per job and is
 `skip`'s default sibling. That is the trade the ADR made deliberately; I would not reopen it on that basis.
+
+### handoff 2026-10-02 @ses_f013665f9ffely2FIi15oCRuFJ (session: ses_f013665f9ffely2FIi15oCRuFJ) — next: Coordinator: review + merge, then tick spec 001 box 120; tell bug-tick-cost-grows-with-sleep-not-with-jobs that the MAX_BACKLOG_SCAN walk is now load-bearing, so its fix must cheapen the count, not r…
+- branch: fix/bug-backfill-collapses-to-one-run-and-never-reports-truncation
+- open questions: Is deferred-not-spent right for a backfill replay, or should a full budget still spend it? Spec 001 box 120 left unticked (spec owned by T7); skip-policy truncation reporting is a scope judgement to …
