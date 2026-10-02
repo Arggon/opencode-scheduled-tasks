@@ -1,13 +1,15 @@
 ---
 type: bug
-status: todo
+status: in_progress
 id: bug-backfill-collapses-to-one-run-and-never-reports-truncation
 title: misfire backfill collapses every missed occurrence into one run and reports truncation nowhere
+assignee: arggon
 parent: v1-tick-loop-scheduler
 labels: []
 priority: p1
 created: "2026-10-02"
 updated: "2026-10-02"
+claimed_at: "2026-10-02T22:42:34.046Z"
 ---
 <!--
   Placement (v0): ArggonManager/opencode-scheduled-tasks/opencode-scheduled-tasks-plugin/v1-tick-loop-scheduler/bug-backfill-collapses-to-one-run-and-never-reports-truncation.md
