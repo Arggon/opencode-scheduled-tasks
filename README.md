@@ -103,6 +103,9 @@ named reason rather than becoming a job that silently never fires.
 
 - **`schedules_list`** — pure read. Per job: schedule, timezone, `nextRun`, `lastRun`,
   `lastStatus`, `lastError`, plus whether another instance holds the lease.
+- **`schedules_schedule`** — schedule a one-off prompt for a time (`dueAt` epoch ms, or
+  `dueIn` like `"2h"`). Runtime-only and ephemeral.
+- **`schedules_cancel`** — cancel a pending one-off by id.
 - **`schedules_history`** — one job's recent runs, newest first: due and start instants,
   outcome, resolved model, and any error. An unknown id returns a typed error naming it,
   never an empty list.
@@ -157,6 +160,28 @@ captured into OpenCode's own log file:
 
 Set `OPENCODE_SCHEDULED_TASKS_DATA_DIR` to relocate that directory (containers, read-only
 homes, test runs).
+
+## One-off tasks
+
+Sometimes the work is not recurring. `schedules_schedule` takes a prompt and a time — either
+an absolute `dueAt` (epoch ms) or a relative `dueIn` (`"2h"`):
+
+```
+schedules_schedule({ prompt: "Run the migration check", dueIn: "2h" })
+schedules_cancel({ id: "oneoff_ab12cd34" })
+```
+
+One-offs are **runtime-only and ephemeral**. They are never written to a job file, and they
+can never become recurring jobs — promoting one is an explicit act of editing the job file,
+so a reviewer sees it. That is the point: the job file stays a reviewed artifact instead of
+accumulating dead one-off history.
+
+- A time slightly in the past (within 5 minutes) still runs, on the next tick. Much older is
+  refused rather than silently executed.
+- Each one-off gets a fresh session and the **same permission discipline** as a scheduled job,
+  so it is not a loophole around the rules above.
+- A completed one-off survives only in `schedules_history`, then is discarded.
+- At most 50 pending per project; reaching the cap is reported, not silently enforced.
 
 ## Run history
 
@@ -275,7 +300,7 @@ Ideas adopted from it, and credited where they appear:
 | --- | --- |
 | Duration strings with a bare number meaning seconds | the `runTimeout` field |
 | Per-task permission rules, and the unattended-`ask` / rule-order warnings | ADR 0005, spec 002 |
-| One-off tasks and in-session loops | ADR 0006, spec 002 |
+| One-off tasks (and, in v2, in-session loops) | ADR 0006, spec 002 |
 | Opt-in session reuse rather than always reusing | the `session` field |
 | Per-task agent/model selection | job fields, spec 001 |
 
