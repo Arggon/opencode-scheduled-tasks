@@ -1,13 +1,15 @@
 ---
 type: task
-status: todo
+status: in_progress
 id: task-tick-drain-order-oneoffs-before-loops
 title: Drain order lets a recurring loop starve a one-off at the concurrency cap
+assignee: arggon
 parent: ephemeral-tasks-one-offs-and-session-loops
 labels: []
 priority: p2
 created: "2026-10-02"
 updated: "2026-10-02"
+claimed_at: "2026-10-02T21:46:29.738Z"
 depends_on: [bug-schedules-run-not-bounded-capped-or-leased]
 ---
 <!--
