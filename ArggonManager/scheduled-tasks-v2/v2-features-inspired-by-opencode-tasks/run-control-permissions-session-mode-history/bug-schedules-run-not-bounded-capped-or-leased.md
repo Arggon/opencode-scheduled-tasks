@@ -135,3 +135,7 @@ the *scheduler-observable* lease behaviour is pinned (M6 catches a leaked lease;
 `openRunLease` unit test pins take/renew/release/idempotence), but "the manual path calls
 `openRunLease`" is a code fact, not a behavioural one. Flagging it rather than adding a test that
 would have to manufacture an unreachable state to go red.
+
+### handoff 2026-10-02 @ses_f0195142fffea0T5V01mum916y (session: ses_f0195142fffea0T5V01mum916y) — next: Code-review the branch (7 boxes should now all be true), then merge. Open question: README line 116 still says "obeying the same concurrency, timeout and lease rules" with no detail — T7 owns docs; t…
+- branch: fix/bug-schedules-run-not-bounded-capped-or-leased
+- open questions: M5 gap: dropping openRunLease from the tool path fails no test (redundant with inFlight by design). Is code-review acceptance of that OK, or should I add a structural assertion?
