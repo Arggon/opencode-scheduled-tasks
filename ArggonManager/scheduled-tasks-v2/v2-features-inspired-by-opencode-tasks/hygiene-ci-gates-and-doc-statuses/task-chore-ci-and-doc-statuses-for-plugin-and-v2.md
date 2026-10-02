@@ -169,3 +169,7 @@ Log samples were regenerated from `src/index.ts:2010`, which emits
    would likely surface type errors against the fake `ctx`, which is out of my scope.
 6. **`bug-tool-boundary-throws-and-ask-not-recorded`** sits under
    `run-control-permissions-session-mode-history` but names `schedules_run`. Not mine to move.
+
+### handoff 2026-10-02 @ses_f02aa69caffekIqM24LV3k4JbW (session: ses_f02aa69caffekIqM24LV3k4JbW) — next: Code-review commit 41b5b0d, then push and open the PR; item is done on merge (coordinator flips status).
+- branch: main
+- open questions: README collides with task-t7 — sequence them; spec 002 implemented overstates markdown union (task-t2 still todo); config-surface story is todo not done
