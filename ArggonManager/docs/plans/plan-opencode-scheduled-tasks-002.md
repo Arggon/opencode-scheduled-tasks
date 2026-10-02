@@ -2,7 +2,7 @@
 plan_id: opencode-scheduled-tasks-002
 title: Plan for v2 — markdown task files, run control, ephemeral tasks
 spec: ArggonManager/docs/specs/spec-opencode-scheduled-tasks-002.md
-status: proposed
+status: implemented
 created: 2026-10-02
 ---
 

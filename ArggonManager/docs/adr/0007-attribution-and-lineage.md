@@ -1,7 +1,7 @@
 ---
 id: 0007
 title: Attribution and design lineage
-status: Proposed
+status: Accepted
 date: 2026-10-02
 deciders: arggon
 ---

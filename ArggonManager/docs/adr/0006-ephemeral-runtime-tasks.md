@@ -1,7 +1,7 @@
 ---
 id: 0006
 title: Ephemeral runtime tasks — one-offs and session loops
-status: Proposed
+status: Accepted
 date: 2026-10-02
 deciders: arggon
 ---

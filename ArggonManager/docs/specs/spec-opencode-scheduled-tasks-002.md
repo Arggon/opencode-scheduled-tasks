@@ -1,7 +1,7 @@
 ---
 spec_id: opencode-scheduled-tasks-002
 title: v2 — markdown task files, run control, ephemeral tasks
-status: proposed
+status: implemented
 created: 2026-10-02
 ---
 

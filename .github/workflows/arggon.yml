@@ -6,12 +6,18 @@
 # gates the tracker, `doctor`/`list --json` print diagnostics. The full recipe
 # (install variants, released one-liner, local reproduction) lives in
 # ArggonManager/docs/ci.md.
+#
+# LOCAL DIVERGENCE (not from the template): the `plugin-check` job at the bottom
+# is this repo's own addition and gates the plugin. `arggon init` skips this
+# file rather than overwriting it (the drift gate below excludes it too), so keep
+# the job when you re-run init — or move it to its own workflow if you ever
+# prefer the generated file to stay pristine.
 name: arggon
 
 on:
-  # Cheap (~30-60 s) but deliberately scoped: the drift gate below compares the
-  # committed seam against what the pinned `ARGGON_VERSION` generates, so the
-  # job must not run on every topic-branch push or tracker auto-commit (adjust
+  # Cheap (~30-60 s) but deliberately scoped: the drift gate in `tasks-validate`
+  # compares the committed seam against what the pinned `ARGGON_VERSION` generates, so
+  # that job must not run on every topic-branch push or tracker auto-commit (adjust
   # the branch list to YOUR default branch(es); pull requests always run it so
   # a stale seam is caught before merge). The runner's own file is excluded
   # from the comparison (see the drift-gate step): a self-bootstrapping
@@ -28,6 +34,15 @@ env:
   # post-release follow-up (step 6), so the drift gate compares against a
   # fixed seam instead of a moving one.
   ARGGON_VERSION: "0.4.0"
+
+concurrency:
+  # Both jobs here are hermetic (no model, no MCP, no network, no machine
+  # state), so a run that a newer push has superseded is pure waste — cancel it.
+  # `head_ref` is empty on a branch push and the PR source branch on a
+  # pull_request, so pushes to one branch collapse onto each other instead of
+  # queueing behind each other.
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   tasks-validate:
@@ -77,3 +92,41 @@ jobs:
         run: |
           arggon doctor --json
           arggon list --json
+
+  # Local divergence from the template — see the header note. This is the gate the
+  # plugin never had: nothing ran `npm run check` on a push, so a red test could
+  # merge. It is deliberately independent of `tasks-validate` (no `needs:`), because
+  # the two gates need disjoint installs: the tracker gate is a global binary, this
+  # one is the repository's own devDependencies.
+  plugin-check:
+    name: plugin check
+    runs-on: ubuntu-latest
+    # A generous ceiling, not an estimate: the harness waits for the next minute
+    # boundary, so a cold run is minutes, not seconds.
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          # The repo's own floor: @types/node is ^22 and vitest 4 declares
+          # `^20 || ^22 || >=24`. Do not bump this without bumping those.
+          node-version: 22
+          # Keyed on package-lock.json; only useful because the install below is `npm ci`.
+          cache: npm
+
+      - name: Install
+        run: npm ci
+
+      - name: Typecheck + unit tests
+        run: npm run check
+
+      # The one check the injected-clock unit tests cannot make: that the tick
+      # loop, the storage round-trip and the prompt actually happen together over
+      # wall-clock time. It is deterministic (its wait window is derived from the
+      # clock to reach the next minute boundary) and hermetic — a temp directory,
+      # a fake context, no network and no real session — so it is safe to gate on.
+      - name: Real-clock harness
+        # ~70s of work; 5 minutes is a hard stop rather than an estimate, so a
+        # regression that hangs the loop fails the build instead of billing it.
+        timeout-minutes: 5
+        run: npx tsx harness/smoke.ts

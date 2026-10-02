@@ -1,7 +1,7 @@
 ---
 id: 0003
 title: Cross-process writer lock
-status: Proposed
+status: Accepted
 date: 2026-10-02
 deciders: arggon
 ---

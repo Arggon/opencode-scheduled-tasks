@@ -73,7 +73,7 @@ The plugin can be installed globally, but it reads
 install serves every repo, each with its own schedules. A project with no job file loads the
 plugin, logs `no enabled jobs`, arms no timer, and takes no writer lease.
 
-## Job reference## Job reference
+## Job reference
 
 | Field | Default | Meaning |
 | --- | --- | --- |
@@ -114,6 +114,10 @@ named reason rather than becoming a job that silently never fires.
   authoring a job rather than guessing.
 - **`schedules_run`** — trigger one job now, obeying the same concurrency, timeout and lease
   rules. Returns the admitted inbox id.
+- **`schedules_start_loop`** — post a prompt into *this* session every N (`"5m"`, `"2h"`), up to
+  ten loops per session. See [Session loops](#session-loops).
+- **`schedules_stop_loop`** — stop one loop in this session by id, or every loop in this session
+  when `id` is omitted.
 
 Neither mutates the job set: **jobs are defined by the file**, so every change is reviewable
 in a pull request.
@@ -123,17 +127,26 @@ in a pull request.
 Every run is a real model request, so the scheduler is deliberately conservative:
 
 - **Name a `model` on every job.** Without one a job inherits the session default, which for
-  unattended recurring work is very often a *paid* model. The resolved model is echoed in
-  every `running` line precisely so this is visible rather than assumed:
+  unattended recurring work is very often a *paid* model. The resolved model **and** the
+  resolved session mode are echoed in every `running` line precisely so this is visible
+  rather than assumed:
 
   ```
-  scheduled-tasks: running nightly-audit (schedule "0 3 * * *" Europe/Madrid, model opencode/space-bunny-free)
+  scheduled-tasks: running nightly-audit (schedule "0 3 * * *" Europe/Madrid, model opencode/space-bunny-free, session reuse)
   ```
 
   The plugin never picks a model for you — that would be wrong for other users — but it will
   always tell you which one it used.
 
-
+- **One-offs and loops cost money too.** They are not a free path around the bounds above:
+  each admission is a real request. `schedules_schedule` takes an optional `model` and is
+  admitted through the same concurrency cap as a job. `schedules_start_loop` takes **no**
+  `model` of its own, because a loop posts into the live session that started it and so
+  spends whatever model, agent and permissions that session already has. A loop re-posts
+  every interval until it expires, so a 5m interval left at the default three-day TTL is
+  roughly 860 requests — stop it with `schedules_stop_loop` rather than waiting it out.
+  Both are visible in `schedules_list`: pending one-offs with their due instant, loops with
+  their owner session and next fire time.
 - A sleeping laptop that misses eight occurrences of `* * * * *` fires **once**, not eight
   times (`misfire: "skip"`). `backfill` replays up to `maxCatchUp`, oldest first, and reports
   the dropped remainder rather than swallowing it.
@@ -154,8 +167,10 @@ captured into OpenCode's own log file:
 ```
 
 ```
-2026-10-02T13:13:07.564Z scheduled-tasks: running dogfood-smoke (schedule "* * * * *" Europe/Madrid)
-2026-10-02T13:14:07.573Z scheduled-tasks: running dogfood-smoke (schedule "* * * * *" Europe/Madrid)
+2026-10-02T13:13:07.564Z scheduled-tasks: running dogfood-smoke (schedule "* * * * *" Europe/Madrid, model session default, session reuse)
+2026-10-02T13:14:07.573Z scheduled-tasks: running dogfood-smoke (schedule "* * * * *" Europe/Madrid, model session default, session reuse)
+2026-10-02T13:14:11.002Z scheduled-tasks: started loop loop_ab12cd34 every 5m in session ses_9f21
+2026-10-02T13:16:09.887Z scheduled-tasks: loop loop_ab12cd34 posting into its own session (every 5m)
 ```
 
 Set `OPENCODE_SCHEDULED_TASKS_DATA_DIR` to relocate that directory (containers, read-only
@@ -282,6 +297,14 @@ A job executes with the target session's existing agent, model and **permissions
 plugin grants no additional authority and implements no sandbox: a job can do exactly what
 that repo's own OpenCode `permissions` config already allows. Gate schedules there, and keep
 job prompts in version control so changes are reviewed.
+
+The runtime tools break the "reviewed artifact" half of that, so they need a different
+reading. A one-off runs in a **fresh** session, so it inherits nothing — except that its prompt
+never appeared in a pull request either. A loop is worse on both counts: it posts into **the
+live session that started it**, so it spends that session's authority while that session may
+also be carrying an interactive conversation and whatever context the user has put into it.
+Nothing about the loop's prompt was ever in version control. Treat a loop prompt as code,
+because on every tick it gets to act with a person's session.
 
 ## Non-goals
 

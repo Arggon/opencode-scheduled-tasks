@@ -1,7 +1,7 @@
 ---
 id: 0005
 title: Per-job permission rules
-status: Proposed
+status: Accepted
 date: 2026-10-02
 deciders: arggon
 ---
