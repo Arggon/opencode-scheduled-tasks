@@ -84,6 +84,7 @@ plugin, logs `no enabled jobs`, arms no timer, and takes no writer lease.
 | `agent` | session default | Agent to switch to before dispatching. |
 | `model` | session default | `provider/model` for this job's runs. **Set it.** |
 | `enabled` | `true` | Set `false` to park a job without deleting it. |
+| `session` | `reuse` | `reuse` keeps one session per job so runs build on prior context; `fresh` starts a new session per run, for stateless work. |
 | `misfire` | `"skip"` | `skip` collapses a backlog to one run; `backfill` replays up to `maxCatchUp`. |
 | `maxCatchUp` | `5` | Replay ceiling for `backfill`. |
 | `runTimeout` | `15m` | Duration: `30s`, `5m`, `2h`, `1h30m`, `1d`. A bare number means seconds (see Acknowledgements). |
