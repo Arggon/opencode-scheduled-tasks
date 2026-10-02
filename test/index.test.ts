@@ -13,6 +13,8 @@ import plugin, {
   acquireLease,
   dayMatches,
   isLeaseLive,
+  isRunOutstanding,
+  leaseRenewalMs,
   loadJobs,
   loadMarkdownJobs,
   mergeJobSources,
@@ -3482,4 +3484,614 @@ describe("arming the tick — ephemeral work is work (bug-ephemeral-work-never-a
       20_000,
     )
   })
+})
+
+// ===========================================================================
+// A run is bounded (bug-run-timeout-never-enforced)
+// ===========================================================================
+
+describe("runTimeout bounds a run (bug-run-timeout-never-enforced)", () => {
+  let dir: string
+  let restoreEnv: string | undefined
+  let consoleLines: string[] = []
+  let realConsoleError: typeof console.error
+  const outstanding: Array<() => void> = []
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "st-timeout-"))
+    mkdirSync(join(dir, ".opencode"), { recursive: true })
+    restoreEnv = process.env[DATA_DIR_ENV]
+    process.env[DATA_DIR_ENV] = join(dir, "state")
+    realConsoleError = console.error
+    consoleLines = []
+    console.error = (...args: unknown[]): void => void consoleLines.push(args.map(String).join(" "))
+  })
+
+  afterEach(() => {
+    for (const dispose of outstanding.splice(0).reverse()) {
+      try {
+        dispose()
+      } catch {
+        // A failing teardown must not mask the assertion that ran before it.
+      }
+    }
+    console.error = realConsoleError
+    if (restoreEnv === undefined) delete process.env[DATA_DIR_ENV]
+    else process.env[DATA_DIR_ENV] = restoreEnv
+    rmSync(dir, { recursive: true, force: true })
+  })
+
+  type HungHarness = {
+    prompts: Record<string, unknown>[]
+    /** Every `ctx.session.interrupt` call the plugin made. */
+    interrupts: Record<string, unknown>[]
+    store: Map<string, unknown>
+    history: (id: string) => Array<Record<string, unknown>> | undefined
+    jobState: (id: string) => Record<string, unknown> | undefined
+    list: () => Promise<Record<string, unknown>>
+    release: () => void
+  }
+
+  /**
+   * A context whose one named prompt never resolves.
+   *
+   * The prompt that hangs is named rather than global, because "a hung run must not starve the
+   * others" is only observable if the others actually run. `interrupt: false` withholds the
+   * cancel primitive, which is the host the honest `abandoned` outcome exists for.
+   */
+  async function hungRun(
+    options: {
+      jobs?: unknown[]
+      seed?: Record<string, unknown>
+      pluginOptions?: Record<string, unknown>
+      projectID?: string
+      /** The one prompt text that never resolves; every other prompt resolves at once. */
+      hangPrompt?: string
+      /** Withhold `session.interrupt`, as a host without the primitive would. */
+      interrupt?: boolean
+      /** Offer `ctx.storage.scan`, the host's only way loops are discovered (verified on 2.0.22). */
+      scan?: boolean
+    } = {},
+  ): Promise<HungHarness> {
+    const store = new Map<string, unknown>(Object.entries(options.seed ?? {}))
+    if (options.jobs !== undefined) {
+      writeFileSync(
+        join(dir, ".opencode", "schedules.json"),
+        JSON.stringify({ version: 1, jobs: options.jobs }),
+      )
+    }
+    const prompts: Record<string, unknown>[] = []
+    const interrupts: Record<string, unknown>[] = []
+    let openTheGate: () => void = () => {}
+    const gate = new Promise<void>((resolve) => void (openTheGate = resolve))
+    const tools: Array<Record<string, unknown>> = []
+    const ctx: Record<string, unknown> = {
+      ...(options.pluginOptions === undefined ? {} : { options: options.pluginOptions }),
+      location: { directory: dir, project: { id: options.projectID ?? "timeout" } },
+      storage: {
+        get: async (key: string) => store.get(key),
+        set: async (key: string, value: unknown) => void store.set(key, value),
+        remove: async (key: string) => void store.delete(key),
+        // Mirrors the host surface verified on 2.0.22: `{ entries: [{ key, value }], next? }`,
+        // keys already relative to the plugin's own namespace, `next` absent on the last page.
+        ...(options.scan === true
+          ? {
+              scan: async (input: { prefix?: string; after?: string; limit?: number }) => {
+                const keys = [...store.keys()].filter((key) => key.startsWith(input.prefix ?? "")).sort()
+                const start = input.after === undefined ? 0 : Math.max(0, keys.indexOf(input.after) + 1)
+                const limit = input.limit ?? 100
+                const page = keys.slice(start, start + limit)
+                const entries = page.map((key) => ({ key, value: store.get(key) }))
+                const consumed = start + page.length
+                return consumed < keys.length ? { entries, next: page[page.length - 1]! } : { entries }
+              },
+            }
+          : {}),
+      },
+      session: {
+        create: async () => ({ id: "ses_hung" }),
+        prompt: async (input: Record<string, unknown>) => {
+          prompts.push(input)
+          if (options.hangPrompt !== undefined && input.text === options.hangPrompt) await gate
+          return { id: `inbox_${prompts.length}` }
+        },
+        ...(options.interrupt === false
+          ? {}
+          : {
+              // Mirrors the host surface verified on 2.0.22: it resolves `{ interrupted }`, so a
+              // `false` is an answer rather than a failure.
+              interrupt: async (input: Record<string, unknown>) => {
+                interrupts.push(input)
+                return { interrupted: true }
+              },
+            }),
+      },
+      tool: {
+        transform: async (cb: (editor: { add?: (t: unknown) => void }) => void) => {
+          cb({ add: (t) => void tools.push(t as Record<string, unknown>) })
+          return { dispose() {} }
+        },
+      },
+    }
+    const resolved = await plugin.setup(ctx as never)
+    outstanding.push(() => {
+      ;(resolved as () => void)?.()
+      // Never leave a hung prompt pending: a test that ends mid-run must not strand the
+      // dispatch promise into the next test.
+      openTheGate()
+    })
+    return {
+      prompts,
+      interrupts,
+      store,
+      history: (id) => store.get(`scheduled-tasks/history/${id}`) as Array<Record<string, unknown>> | undefined,
+      jobState: (id) => store.get(`scheduled-tasks/${id}`) as Record<string, unknown> | undefined,
+      list: async () => {
+        const tool = tools.find((entry) => entry.name === "list") as
+          | { execute: (input: Record<string, unknown>) => Promise<{ output: Record<string, unknown> }> }
+          | undefined
+        if (tool === undefined) throw new Error("the list tool was not registered")
+        return (await tool.execute({})).output
+      },
+      release: openTheGate,
+    }
+  }
+
+  /** A `* * * * *` job that is already due at `start`, so one tick decides it. */
+  const dueJob = (id: string, prompt: string, over: Record<string, unknown> = {}): Record<string, unknown> => ({
+    id,
+    schedule: "* * * * *",
+    timezone: "UTC",
+    prompt,
+    ...over,
+  })
+
+  const seeded = (start: number, ...ids: string[]): Record<string, unknown> =>
+    Object.fromEntries(ids.map((id) => [`scheduled-tasks/${id}`, { version: STATE_VERSION, lastRun: start - 5 * MINUTE_MS }]))
+
+  const countOf = (harness: HungHarness, text: string): number =>
+    harness.prompts.filter((entry) => entry.text === text).length
+
+  /**
+   * Advance the injected clock until `predicate` holds, or give up after `budgetMs`.
+   *
+   * The fake-timer stand-in for `waitFor`, and needed because these tests assert on wall-clock
+   * consequences whose exact tick depends on where in the minute the run started — advancing a
+   * guessed number of milliseconds is how a test passes on one run and fails on the next.
+   */
+  async function advanceUntil(predicate: () => boolean, budgetMs: number, stepMs = MIN_TICK_MS): Promise<boolean> {
+    for (let elapsed = 0; elapsed <= budgetMs; elapsed += stepMs) {
+      if (predicate()) return true
+      await vi.advanceTimersByTimeAsync(stepMs)
+    }
+    return predicate()
+  }
+
+  it("renews an in-flight run's lease inside the window, so it cannot expire between renewals", () => {
+    // The schedule rule, pinned on its own. Two renewals have to fit inside one window, or a
+    // lease can lapse while its run is still demonstrably going — which is the double-fire.
+    for (const runTimeoutMs of [MINUTE_MS, 5 * MINUTE_MS, 15 * MINUTE_MS, 60 * MINUTE_MS, 24 * 60 * MINUTE_MS]) {
+      expect(leaseRenewalMs(runTimeoutMs)).toBeGreaterThan(0)
+      expect(leaseRenewalMs(runTimeoutMs) * 2).toBeLessThanOrEqual(runTimeoutMs)
+    }
+    // And it tracks the bound rather than being a fixed period, so a 1m job and a 1h job renew
+    // at comparable fractions of themselves.
+    expect(leaseRenewalMs(4 * MINUTE_MS)).toBe(4 * leaseRenewalMs(MINUTE_MS))
+    expect(leaseRenewalMs(MINUTE_MS)).toBe(30_000)
+  })
+
+  it("holds a run outstanding on either signal, because neither one can be trusted alone", () => {
+    // The composed rule, pinned without a clock. `leaseUntil` is a comparison against `now`, so
+    // it reads expired after any stall longer than its window even though the run is provably
+    // still going; `inFlight` membership is a fact about this process and cannot be stale. The
+    // rule is their disjunction: either one alone keeps the job from being admitted twice.
+    const live = { version: STATE_VERSION, leaseUntil: 1_000 }
+    const dead = { version: STATE_VERSION, leaseUntil: 10 }
+    expect(isRunOutstanding(live, true, 5_000)).toBe(true)
+    expect(isRunOutstanding(dead, true, 5_000)).toBe(true)
+    expect(isRunOutstanding(live, false, 500)).toBe(true)
+    expect(isRunOutstanding(dead, false, 5_000)).toBe(false)
+    expect(isRunOutstanding({ version: STATE_VERSION }, false, 5_000)).toBe(false)
+  })
+
+  it(
+    "bounds a prompt that never resolves, records timeout and frees the slot",
+    async () => {
+      // The original scenario: a run that never returns. `runTimeout` is floored at one minute,
+      // so this runs on an injected clock — `advanceTimersByTimeAsync` delivers the bound timer,
+      // which is what makes this test *fail* rather than hang when the bound is absent.
+      vi.useFakeTimers()
+      try {
+        const start = Date.now()
+        vi.setSystemTime(start)
+        const harness = await hungRun({
+          hangPrompt: "never resolves",
+          jobs: [dueJob("hung", "never resolves", { runTimeout: "1m" })],
+          seed: seeded(start, "hung"),
+          pluginOptions: { tickMs: MIN_TICK_MS, maxConcurrentRuns: 1 },
+        })
+
+        await vi.advanceTimersByTimeAsync(0)
+        expect(harness.prompts).toHaveLength(1)
+        expect(harness.prompts[0]).toMatchObject({ text: "never resolves", sessionID: "ses_hung", delivery: "queue" })
+
+        // Short of the bound: nothing recorded, nothing stopped, and the slot is still held.
+        await vi.advanceTimersByTimeAsync(MINUTE_MS - MIN_TICK_MS)
+        expect(harness.history("hung")).toBeUndefined()
+        expect(harness.interrupts).toEqual([])
+        // Still running, and still only one prompt: no tick in the window admitted a second run.
+        // (`lastStatus` is *not* asserted here. Whether an intervening tick happened to cross a
+        // minute boundary — and so spent an occurrence as `skipped` — depends on where in the
+        // minute this test starts, so asserting it made this test fail roughly one run in ten.
+        // The skip bookkeeping has its own tests, with the clock pinned.)
+        expect((await harness.list()).jobs).toMatchObject([{ id: "hung", running: true }])
+        expect(countOf(harness, "never resolves")).toBe(1)
+
+        // The bound. Pre-fix nothing is delivered here and every assertion below fails.
+        //
+        // Advanced by predicate rather than by a fixed amount, on purpose: the tick at exactly
+        // `start + runTimeoutMs` and the bound timer at the same instant can be delivered in
+        // either order, and the order decides whether that tick sees the slot already freed (so
+        // the job owes a *fresh* occurrence a minute later) or still held. Both are correct; only
+        // the record of *this* run is being asserted here.
+        expect(await advanceUntil(() => (harness.history("hung") ?? []).length > 0, 2 * MIN_TICK_MS)).toBe(true)
+
+        // Recorded with the `RunStatus` member that no code path ever produced before.
+        expect(harness.history("hung")![0]).toMatchObject({
+          outcome: "timeout",
+          sessionID: "ses_hung",
+          model: "session default",
+        })
+        expect(String(harness.history("hung")![0]!.error)).toMatch(/exceeded runTimeout 1m/)
+        // …and it says the session was *stopped*, which is the claim `interrupt` backs.
+        expect(String(harness.history("hung")![0]!.error)).toMatch(/interrupted/)
+        expect(harness.interrupts).toEqual([{ sessionID: "ses_hung" }])
+        expect(harness.jobState("hung")).toMatchObject({ lastStatus: "timeout" })
+
+        // The slot is free again, which is what stops one hung run from latching
+        // `maxConcurrentRuns` for the life of the process.
+        expect((await harness.list()).jobs).toMatchObject([{ id: "hung", running: false }])
+        // The log says it, once, naming the job.
+        expect(consoleLines.filter((line) => /hung/.test(line) && /timed out/.test(line))).toHaveLength(1)
+      } finally {
+        vi.useRealTimers()
+      }
+    },
+    20_000,
+  )
+
+  it(
+    "says it abandoned the run when the host offers no way to interrupt it",
+    async () => {
+      // Honesty over convenience: with no cancel primitive the await is abandoned, not stopped,
+      // and a record that claimed otherwise would be the lie this whole fix exists to remove.
+      vi.useFakeTimers()
+      try {
+        const start = Date.now()
+        vi.setSystemTime(start)
+        const harness = await hungRun({
+          hangPrompt: "never resolves",
+          interrupt: false,
+          jobs: [dueJob("hung", "never resolves", { runTimeout: "1m" })],
+          seed: seeded(start, "hung"),
+          pluginOptions: { tickMs: MIN_TICK_MS, maxConcurrentRuns: 1 },
+        })
+
+        await vi.advanceTimersByTimeAsync(0)
+        expect(
+          await advanceUntil(() => (harness.history("hung") ?? []).length > 0, MINUTE_MS + MIN_TICK_MS),
+        ).toBe(true)
+
+        const entry = harness.history("hung")![0]!
+        expect(entry).toMatchObject({ outcome: "timeout" })
+        expect(String(entry.error)).toMatch(/abandoned/)
+        expect(String(entry.error)).toMatch(/interrupt is unavailable/)
+        expect(String(entry.error)).not.toMatch(/was interrupted/)
+        // Bounded all the same: the slot is released without a cancel primitive existing.
+        expect((await harness.list()).jobs).toMatchObject([{ id: "hung", running: false }])
+      } finally {
+        vi.useRealTimers()
+      }
+    },
+    20_000,
+  )
+
+  it(
+    "releases the shared per-tick budget when a run times out, so the next job still runs",
+    async () => {
+      // One slot. `hung` takes it and never returns; `other` is due every minute. Pre-fix the
+      // hung id stays in `inFlight` forever, so `claimed` is spent for the life of the process
+      // and `other` is skipped on every tick from here on — starvation, not a timeout.
+      //
+      // `hung` is `@daily` on purpose. A hung run that is *also* due every minute would take the
+      // slot straight back on its next occurrence and starve `other` for a reason that has
+      // nothing to do with the budget being released.
+      vi.useFakeTimers()
+      try {
+        const start = Date.now()
+        vi.setSystemTime(start)
+        const harness = await hungRun({
+          hangPrompt: "never resolves",
+          jobs: [
+            dueJob("hung", "never resolves", { schedule: "@daily", timezone: "UTC", runTimeout: "1m" }),
+            dueJob("other", "quick run"),
+          ],
+          seed: {
+            // Two days back, so the last midnight is always inside the window whatever time of
+            // day this test happens to run at (`@daily` fires at 00:00, so a shorter window can
+            // miss it entirely and the job would never be due).
+            "scheduled-tasks/hung": { version: STATE_VERSION, lastRun: start - 48 * 60 * MINUTE_MS },
+            "scheduled-tasks/other": { version: STATE_VERSION, lastRun: start - 5 * MINUTE_MS },
+          },
+          pluginOptions: { tickMs: MIN_TICK_MS, maxConcurrentRuns: 1 },
+        })
+
+        await vi.advanceTimersByTimeAsync(0)
+        expect(countOf(harness, "never resolves")).toBe(1)
+        // The occurrence was spent and recorded, not queued (ADR 0002). A recurring job records
+        // a skip on its state rather than in history, so that is where the claim is checked.
+        expect(harness.jobState("other")).toMatchObject({ lastStatus: "skipped" })
+        expect(consoleLines.filter((line) => line.includes("skipping other"))).toEqual([
+          expect.stringContaining("concurrency cap reached (1/1)"),
+        ])
+
+        // Past the bound, and then on until `other` owes a fresh occurrence. Two minutes of
+        // budget covers it whatever the minute offset: `other` can only become due again on the
+        // next minute boundary after the tick that last skipped it.
+        expect(await advanceUntil(() => countOf(harness, "quick run") > 0, 3 * MINUTE_MS)).toBe(true)
+        expect(harness.history("hung")).toMatchObject([{ outcome: "timeout" }])
+        expect(harness.jobState("other")).toMatchObject({ lastStatus: "ok" })
+        expect(harness.history("other")).toMatchObject([{ outcome: "ok", sessionID: "ses_hung" }])
+        // The hung job was not re-fired in the meantime, so the slot was released rather than
+        // handed from one stuck run straight to the next.
+        expect(countOf(harness, "never resolves")).toBe(1)
+      } finally {
+        vi.useRealTimers()
+      }
+    },
+    20_000,
+  )
+
+  it(
+    "keeps the in-flight lease live for the whole run, so no tick re-admits the job",
+    async () => {
+      // The lease half, in the form the acceptance names: "the lease is not reclaimed while a
+      // run is in flight". `maxConcurrentRuns: 2` with a single job is the sharp version — one
+      // run holds one of two slots, so the concurrency cap provably cannot be what refuses the
+      // next occurrence. The only thing that can is the lease, and if it were ever read expired
+      // the job would be admitted a second time into a session whose first prompt has not
+      // returned. That is the double-fire ADR 0003 exists to prevent, so this test fails loudly
+      // if the lease is ever short of the run's remaining life.
+      vi.useFakeTimers()
+      try {
+        // Park the clock 45s into a minute and give the run a three-minute bound, so the run
+        // spans three minute boundaries at 15s, 75s and 135s. Cron is minute-resolution, so a
+        // due job is re-decided at most once a minute — three boundaries means three genuine
+        // chances to observe the lease, rather than one chance at a lucky offset.
+        const real = Date.now()
+        const start = real - (real % MINUTE_MS) + 45_000
+        vi.setSystemTime(start)
+        const harness = await hungRun({
+          hangPrompt: "slow run",
+          jobs: [dueJob("slow", "slow run", { runTimeout: "3m" })],
+          seed: seeded(start, "slow"),
+          pluginOptions: { tickMs: MIN_TICK_MS, maxConcurrentRuns: 2 },
+        })
+
+        await vi.advanceTimersByTimeAsync(0)
+        expect(countOf(harness, "slow run")).toBe(1)
+
+        // Every tick strictly inside the run, including all three re-decisions.
+        await vi.advanceTimersByTimeAsync(3 * MINUTE_MS - MIN_TICK_MS)
+        expect(countOf(harness, "slow run")).toBe(1)
+
+        const skips = consoleLines.filter((line) => line.includes("skipping slow"))
+        expect(skips).toHaveLength(3)
+        for (const line of skips) expect(line).toContain("previous run still in flight")
+        // No occurrence was quietly spent as `concurrency` on the way past, either.
+        expect(consoleLines.some((line) => line.includes("concurrency cap reached"))).toBe(false)
+      } finally {
+        vi.useRealTimers()
+      }
+    },
+    20_000,
+  )
+
+  it(
+    "bounds a hung loop post too, and gives the tick's shared budget back",
+    async () => {
+      // A loop carries no `runTimeout` — `every` is a cadence, not a bound — so it is bounded by
+      // the default. What matters here is that the bound is the *same* mechanism and that the
+      // slot comes back: `postLoop` is dispatched with `void` from inside the tick and its id
+      // lives in the same `inFlight` set the one-per-tick `claimed` budget is computed from, so a
+      // loop post that never returns would latch the budget exactly like a hung job run.
+      vi.useFakeTimers()
+      try {
+        const start = Date.now()
+        vi.setSystemTime(start)
+        const harness = await hungRun({
+          hangPrompt: "the loop prompt",
+          jobs: [],
+          scan: true,
+          seed: {
+            "scheduled-tasks/loop/ses_abc": [
+              {
+                id: "loop_hung",
+                sessionID: "ses_abc",
+                prompt: "the loop prompt",
+                // A long interval, so the loop does not re-arm and go due again inside the test:
+                // a second due occurrence would be *skipped* (the slot is taken) and would land
+                // in history before the timed-out post does, which is a different claim entirely.
+                intervalMs: 30 * MINUTE_MS,
+                nextRunAt: start - 1_000,
+                expiresAt: start + 60 * MINUTE_MS,
+                createdAt: start - 60_000,
+              },
+            ],
+          },
+          pluginOptions: { tickMs: MIN_TICK_MS, maxConcurrentRuns: 1 },
+        })
+
+        await vi.advanceTimersByTimeAsync(0)
+        expect(countOf(harness, "the loop prompt")).toBe(1)
+        expect(harness.history("loop_hung")).toBeUndefined()
+
+        // The default run bound is 15 minutes; past it the post is bounded and the slot is back.
+        expect(
+          await advanceUntil(() => (harness.history("loop_hung") ?? []).length > 0, 16 * MINUTE_MS),
+        ).toBe(true)
+        const entry = harness.history("loop_hung")![0]!
+        expect(entry).toMatchObject({ outcome: "timeout", sessionID: "ses_abc", model: "session default" })
+        expect(String(entry.error)).toMatch(/exceeded runTimeout 15m/)
+        // Still exactly one post: the hung loop was not re-posted while it held the slot, and it
+        // was not re-posted the moment it gave it up either.
+        expect(countOf(harness, "the loop prompt")).toBe(1)
+      } finally {
+        vi.useRealTimers()
+      }
+    },
+    20_000,
+  )
+
+  it(
+    "bounds a hung one-off and records the timeout, since the tick only records an ok outcome",
+    async () => {
+      // `runOneOff` returns its outcome to the tick, and the tick writes history only for `"ok"`.
+      // So the timeout has to be recorded inside the one-off path or it leaves no trace at all —
+      // which is the same "a bound that does not bind" hole in a different place.
+      vi.useFakeTimers()
+      try {
+        const start = Date.now()
+        vi.setSystemTime(start)
+        const harness = await hungRun({
+          hangPrompt: "the one-off prompt",
+          jobs: [],
+          seed: {
+            "scheduled-tasks/oneoff/pending": [
+              {
+                id: "oneoff_hung",
+                dueAt: start - 1_000,
+                prompt: "the one-off prompt",
+                createdAt: start - 60_000,
+                runTimeoutMs: MINUTE_MS,
+              },
+            ],
+          },
+          pluginOptions: { tickMs: MIN_TICK_MS, maxConcurrentRuns: 1 },
+        })
+
+        await vi.advanceTimersByTimeAsync(0)
+        expect(countOf(harness, "the one-off prompt")).toBe(1)
+
+        expect(
+          await advanceUntil(
+            () => (harness.history("oneoff_hung") ?? []).length > 0,
+            MINUTE_MS + MIN_TICK_MS,
+          ),
+        ).toBe(true)
+        const entry = harness.history("oneoff_hung")![0]!
+        expect(entry).toMatchObject({ outcome: "timeout" })
+        expect(String(entry.error)).toMatch(/exceeded runTimeout 1m/)
+        expect(countOf(harness, "the one-off prompt")).toBe(1)
+        // The pending list is still emptied either way, so a timed-out one-off cannot be
+        // replayed into the next tick's backlog.
+        expect(harness.store.get("scheduled-tasks/oneoff/pending")).toEqual([])
+      } finally {
+        vi.useRealTimers()
+      }
+    },
+    20_000,
+  )
+
+  // ---------------------------------------------------------------------
+  // NOT TESTED HERE, and the reason matters more than the gap.
+  //
+  // The double-fire this item describes — a tick re-admitting a job whose run is still going, so
+  // a second prompt enters a busy session — was written, and it reproduced (two `slow run`
+  // prompts, two `running slow` lines) with the in-flight signal and the lease renewal both
+  // removed. It was then deleted because it did not reproduce reliably: it depends on how a
+  // runtime orders a tick interval and a run-bound timer that come due at the *same* instant, and
+  // the same mutation passed it on some runs and failed it on others.
+  //
+  // Two things make it non-deterministic as written, and neither is fixable from the test side:
+  // the boundary is the tick period dividing `runTimeoutMs`, so the double-fire window is exactly
+  // zero-width; and once the bound is enforced the lease cannot expire under a live run *at all*,
+  // because the bound timer is always due first and is delivered first. So the reachable state
+  // is a coin-flip on timer ordering, and a test that depends on a coin-flip is worse than no
+  // test — it would be green for the wrong reason on a good day.
+  //
+  // What is tested instead, and what each of those actually pins:
+  //   - `leaseRenewalMs` — the renewal schedule keeps two renewals inside one window.
+  //   - `isRunOutstanding` — either signal alone holds a run outstanding, so neither mechanism
+  //     has to be correct on its own.
+  //   - "keeps the in-flight lease live for the whole run" — with `maxConcurrentRuns: 2` and a
+  //     single job, the concurrency cap provably cannot refuse anything, so a re-admission there
+  //     would be visible as a second prompt and nothing else.
+  //
+  // Removing the renewal alone (M4), the in-flight join alone (M5), *both* together (M6), or
+  // shortening the renewed window to a quarter of the bound (M7) — none of those fails a single
+  // test. That is not an oversight in the suite; it is the finding. Once the bound is enforced the
+  // bound timer is always due before the lease can expire, so the two in-flight signals are
+  // provably redundant for every state the scheduler can reach, and no test can tell them apart
+  // without manufacturing an unreachable one. They are kept because the redundancy is what makes
+  // a *future* change safe, and because each mechanism's own rule is pinned on its own above —
+  // but the reviewer should know that the double-fire half is defended by construction, not by a
+  // red test.
+  // ---------------------------------------------------------------------
+
+  it("keeps the writer lease alive while a run is hung, and stays inert behind a foreign holder", async () => {
+    // The cross-process half. The writer lease is heartbeated by the *tick*, not by the run, and
+    // a run is dispatched with `void` — so a prompt that never returns does not stall the
+    // heartbeat and the lease cannot go stale under a second instance. Asserted on the lockfile
+    // itself: `leaseHeld` reads the in-memory lease object and cannot see whether `heartbeat()`
+    // actually wrote, which is the same trap as the sibling release tests.
+    const harness = await hungRun({
+      hangPrompt: "never resolves",
+      jobs: [dueJob("hung", "never resolves", { runTimeout: "1m" })],
+      seed: seeded(Date.now(), "hung"),
+      pluginOptions: { tickMs: MIN_TICK_MS, maxConcurrentRuns: 1 },
+    })
+    await waitFor(() => harness.prompts.length > 0, "the hung run to be dispatched", 6_000)
+
+    const path = leasePath(dir, "timeout")
+    const heartbeat = (): number => JSON.parse(readFileSync(path, "utf8")).heartbeat as number
+    expect(existsSync(path)).toBe(true)
+    const first = heartbeat()
+
+    // A whole tick period later the holder is still alive.
+    await new Promise((resolve) => setTimeout(resolve, MIN_TICK_MS + 1_000))
+    expect(heartbeat()).toBeGreaterThan(first)
+    // Still exactly one run outstanding, so the hung prompt was not re-fired either.
+    expect(countOf(harness, "never resolves")).toBe(1)
+
+    // A second instance over a project another server holds must stay inert, and must report the
+    // work rather than pretend it does not exist. Seeded with the in-flight marker a hung run
+    // leaves behind, because the case under test is arbitration *while a run is outstanding*.
+    const foreignPath = leasePath(dir, "timeout-foreign")
+    mkdirSync(join(foreignPath, ".."), { recursive: true })
+    writeFileSync(foreignPath, JSON.stringify({ pid: process.pid + 1, heartbeat: Date.now() }))
+    try {
+      const second = await hungRun({
+        projectID: "timeout-foreign",
+        hangPrompt: "never resolves",
+        jobs: [dueJob("other", "never resolves", { runTimeout: "1m" })],
+        seed: {
+          "scheduled-tasks/other": {
+            version: STATE_VERSION,
+            lastRun: Date.now() - 5 * MINUTE_MS,
+            leaseUntil: Date.now() + 60_000,
+          },
+        },
+        pluginOptions: { tickMs: MIN_TICK_MS, maxConcurrentRuns: 1 },
+      })
+      const listing = await second.list()
+      expect(listing.leaseForeign).toBe(true)
+      expect(listing.leaseHeld).toBe(false)
+      expect((listing.jobs as Array<Record<string, unknown>>)[0]).toMatchObject({ id: "other" })
+      await new Promise((resolve) => setTimeout(resolve, 300))
+      expect(second.prompts).toEqual([])
+    } finally {
+      rmSync(foreignPath, { force: true })
+    }
+  }, 25_000)
 })
