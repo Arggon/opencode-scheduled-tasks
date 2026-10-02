@@ -84,6 +84,7 @@ plugin, logs `no enabled jobs`, arms no timer, and takes no writer lease.
 | `agent` | session default | Agent to switch to before dispatching. |
 | `model` | session default | `provider/model` for this job's runs. **Set it.** |
 | `enabled` | `true` | Set `false` to park a job without deleting it. |
+| `permissions` | session default | Per-job permission rules in OpenCode's own schema. Absent ⇒ session defaults are inherited unchanged. |
 | `session` | `reuse` | `reuse` keeps one session per job so runs build on prior context; `fresh` starts a new session per run, for stateless work. |
 | `misfire` | `"skip"` | `skip` collapses a backlog to one run; `backfill` replays up to `maxCatchUp`. |
 | `maxCatchUp` | `5` | Replay ceiling for `backfill`. |
@@ -165,6 +166,56 @@ oldest-first and is capped at 50 however it is configured, so history cannot gro
 bound. It survives a restart, and an absent or corrupt record is dropped rather than
 crashing the load.
 
+## Unattended permissions
+
+A scheduled run has **nobody to approve a prompt**. Two consequences, both of which have
+caught people out:
+
+- **An `"ask"` is effectively a deny.** Nobody is there to answer it. The plugin reports every
+  `ask` a job declares in `schedules_list` (`askAsDeny`) and logs it on each run, so this is
+  visible rather than a silent timeout.
+- **`external_directory` defaults to `ask`**, so *any* file access outside the job's working
+  directory fails quietly. If a job reads or writes elsewhere, allow it explicitly.
+
+```yaml
+permissions:
+  bash:
+    "*": deny
+    "git diff *": allow
+    "git log *": allow
+  edit: deny
+  external_directory:
+    "/tmp/*": allow
+```
+
+Rules are applied to the session **immediately before** the prompt is admitted, and re-applied
+on every run rather than assumed to persist.
+
+### The last matching rule wins
+
+OpenCode evaluates permission rules **in declaration order and the last match wins** — the
+opposite of most permission systems, which prefer the most specific match. A catch-all
+therefore goes **first**, and specific overrides go **after** it:
+
+```yaml
+# WRONG - "*": deny comes last, so it overrides every rule above it.
+bash:
+  "git *": allow
+  "*": deny
+
+# RIGHT - catch-all first, specifics carve out from it.
+bash:
+  "*": deny
+  "git *": allow
+```
+
+A job that declares no `permissions` is **not** tightened implicitly: it inherits the
+session's rules exactly as before. Silently reducing an existing job's authority would be its
+own surprise.
+
+*(The `ask` and `external_directory` warnings, and the rule-order semantics, come from
+[`opencode-tasks`](https://github.com/jdormit/opencode-tasks) — see Acknowledgements.)*
+
 ## One writer per machine
 
 A plugin loads **once per server process**, so two servers would double-fire every job. The
@@ -223,7 +274,7 @@ Ideas adopted from it, and credited where they appear:
 | Idea | Where it lives here |
 | --- | --- |
 | Duration strings with a bare number meaning seconds | the `runTimeout` field |
-| Per-task permission rules, and the unattended-`ask` warnings | ADR 0005, spec 002 |
+| Per-task permission rules, and the unattended-`ask` / rule-order warnings | ADR 0005, spec 002 |
 | One-off tasks and in-session loops | ADR 0006, spec 002 |
 | Opt-in session reuse rather than always reusing | the `session` field |
 | Per-task agent/model selection | job fields, spec 001 |

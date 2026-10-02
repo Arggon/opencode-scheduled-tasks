@@ -569,6 +569,81 @@ export type JobDefinition = {
    * `opencode run -s` does. `fresh` starts a new session per run for stateless work.
    */
   session: SessionMode
+  /**
+   * Optional per-job permission rules, in OpenCode's own schema. Absent means the session
+   * default is inherited unchanged — there is deliberately no implicit tightening.
+   */
+  permissions?: PermissionSet
+}
+
+/** One permission effect for an action. */
+export type PermissionEffect = "allow" | "ask" | "deny"
+
+/** A permission rule: one effect, or a map of glob `resource` pattern to effect. */
+export type PermissionRule = PermissionEffect | Record<string, PermissionEffect>
+
+/** The job field: an action name mapped to its rule(s) — OpenCode's own shape. */
+export type PermissionSet = Record<string, PermissionRule>
+
+const PERMISSION_EFFECTS: ReadonlySet<string> = new Set(["allow", "ask", "deny"])
+
+/** Bound on how many actions one job may constrain, so a job file cannot go unbounded. */
+export const MAX_PERMISSION_ACTIONS = 32
+
+/**
+ * Validate a job's `permissions`, mirroring OpenCode's own permission schema.
+ *
+ * Frontmatter/job data is untrusted, so this checks shape as well as values: the rule set is
+ * bounded, every effect is one of the three literals, and a glob map's values are effects
+ * rather than nested objects.
+ */
+export function validatePermissions(
+  value: unknown,
+): { permissions: PermissionSet } | { reason: string } {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return { reason: "permissions must be an object keyed by action" }
+  }
+  const entries = Object.entries(value as Record<string, unknown>)
+  if (entries.length > MAX_PERMISSION_ACTIONS) {
+    return { reason: `permissions declares ${entries.length} actions, above the cap of ${MAX_PERMISSION_ACTIONS}` }
+  }
+  const out: PermissionSet = {}
+  for (const [action, rule] of entries) {
+    if (action === "") return { reason: "permission action name is empty" }
+    if (typeof rule === "string") {
+      if (!PERMISSION_EFFECTS.has(rule)) {
+        return { reason: `permission "${action}" has effect "${rule}", expected allow | ask | deny` }
+      }
+      out[action] = rule as PermissionEffect
+      continue
+    }
+    if (rule === null || typeof rule !== "object" || Array.isArray(rule)) {
+      return { reason: `permission "${action}" must be an effect string or a resource map` }
+    }
+    const patterns = Object.entries(rule as Record<string, unknown>)
+    if (patterns.length === 0) return { reason: `permission "${action}" has an empty resource map` }
+    const mapped: Record<string, PermissionEffect> = {}
+    for (const [resource, effect] of patterns) {
+      if (typeof effect !== "string" || !PERMISSION_EFFECTS.has(effect)) {
+        return { reason: `permission "${action}" for "${resource}" has effect "${String(effect)}", expected allow | ask | deny` }
+      }
+      mapped[resource] = effect as PermissionEffect
+    }
+    out[action] = mapped
+  }
+  return { permissions: out }
+}
+
+/** Every `ask` effect anywhere in a rule set, as `action` or `action:resource`. */
+export function collectAsks(rules: PermissionSet): string[] {
+  const asks: string[] = []
+  for (const [action, rule] of Object.entries(rules)) {
+    if (rule === "ask") asks.push(action)
+    else if (typeof rule === "object") {
+      for (const [resource, effect] of Object.entries(rule)) if (effect === "ask") asks.push(`${action}:${resource}`)
+    }
+  }
+  return asks
 }
 
 /** Whether a job reuses one session across runs or starts a fresh one each time. */
@@ -757,6 +832,13 @@ export function validateJob(raw: unknown, index: number): { job: JobDefinition }
     return { reason: `job "${id}": session must be "reuse" or "fresh", got "${sessionMode}"` }
   }
 
+  let permissions: PermissionSet | undefined
+  if (record.permissions !== undefined) {
+    const parsed = validatePermissions(record.permissions)
+    if ("reason" in parsed) return { reason: `job "${id}": ${parsed.reason}` }
+    permissions = parsed.permissions
+  }
+
   const runTimeoutMs =
     duration !== undefined && "ms" in duration
       ? duration.ms
@@ -777,6 +859,7 @@ export function validateJob(raw: unknown, index: number): { job: JobDefinition }
       enabled: record.enabled !== false,
       misfire,
       session: sessionMode === "fresh" ? "fresh" : "reuse",
+      ...(permissions !== undefined ? { permissions } : {}),
       maxCatchUp: boundedInt(record.maxCatchUp, DEFAULT_MAX_CATCH_UP, 1, 50),
       runTimeoutMs: clampedRunTimeoutMs,
     },
@@ -1240,8 +1323,17 @@ type ToolRegistration = {
   execute: (input: Record<string, unknown>, context?: ToolCallContext) => Promise<ToolResult>
 }
 
+/**
+ * The V2 `ctx.permission` surface. `rules` *replaces* a session's permission rules; without
+ * it a job cannot constrain itself, so every caller feature-detects it (ADR 0005).
+ */
+type PermissionContext = {
+  rules?(input: { sessionID: string; permissions: unknown[] }): Promise<unknown>
+}
+
 type PluginContext = {
   options?: Record<string, unknown>
+  permission?: PermissionContext
   location?: { directory?: unknown; project?: { id?: unknown } }
   storage?: StorageContext
   session?: SessionContext
@@ -1512,6 +1604,24 @@ async function applyJobTarget(ctx: PluginContext, job: JobDefinition, sessionID:
       logOnce("no-switch-model", "ctx.session.switchModel is unavailable; the job runs on the session default")
     }
   }
+
+  // Permission rules are applied AFTER agent/model and BEFORE the prompt is admitted, so a
+  // scheduled run is already constrained when its turn starts. Re-applied every run rather
+  // than assumed to persist, because `rules` replaces session state (ADR 0005).
+  const asks = job.permissions === undefined ? [] : collectAsks(job.permissions)
+  if (job.permissions !== undefined) {
+    if (typeof ctx.permission?.rules === "function") {
+      await ctx.permission.rules({ sessionID, permissions: [job.permissions] })
+    } else {
+      logOnce("no-permission-rules", "ctx.permission.rules is unavailable; the job runs with session defaults")
+    }
+    // An "ask" in an unattended run has nobody to answer it, so it is a deny. Reported
+    // rather than left to time out — and the warnings come from opencode-tasks (ADR 0007).
+    if (asks.length > 0) {
+      logLine(`job ${job.id} declares "ask" permissions with nobody to answer them; treated as deny: ${asks.join(", ")}`)
+    }
+  }
+
   return job.model === undefined ? "session default" : `${job.model.providerID}/${job.model.id}`
 }
 
@@ -1660,6 +1770,10 @@ function buildTools(ctx: PluginContext, state: SchedulerState, lease: Lease, tic
               enabled: job.enabled,
               misfire: job.misfire,
               session: job.session,
+              permissions: job.permissions ?? "session default",
+              // Surfaced so a job that will silently deny at runtime is visible up front.
+              askAsDeny:
+                job.permissions === undefined ? [] : collectAsks(job.permissions),
               runTimeoutMs: job.runTimeoutMs,
               agent: job.agent ?? null,
               model:

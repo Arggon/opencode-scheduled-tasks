@@ -24,6 +24,7 @@ import plugin, {
   validateJob,
   wallParts,
   MAX_HISTORY_LIMIT,
+  collectAsks,
   type HistoryEntry,
   type JobDefinition,
   type JobState,
@@ -1125,6 +1126,195 @@ describe("run history (T3)", () => {
       const missing = await exec({ id: "nope" })
       expect(missing.output.error).toMatch(/no job with id "nope"/)
       expect(missing.output.ids).toContain("j")
+    } finally {
+      ;(cleanup as () => void)?.()
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+})
+
+describe("per-job permissions (T4)", () => {
+  const wrap = (job: Record<string, unknown>): unknown => ({ version: 1, jobs: [job] })
+
+  it("accepts an effect string and a resource map, in the host's own shape", () => {
+    const { jobs, invalid } = loadJobs(
+      wrap({
+        id: "j",
+        schedule: "@daily",
+        prompt: "p",
+        permissions: { edit: "deny", bash: { "*": "allow", "git push *": "deny" } },
+      }),
+    )
+    expect(invalid).toEqual([])
+    expect(jobs[0]!.permissions).toEqual({ edit: "deny", bash: { "*": "allow", "git push *": "deny" } })
+  })
+
+  it("leaves permissions absent when the job declares none", () => {
+    expect(loadJobs(wrap({ id: "j", schedule: "@daily", prompt: "p" })).jobs[0]!.permissions).toBeUndefined()
+  })
+
+  it("refuses a malformed permission set, naming the job", () => {
+    for (const bad of [
+      "deny",
+      ["deny"],
+      { edit: "maybe" },
+      { edit: { "*": "perhaps" } },
+      { edit: {} },
+      { edit: { "*": { nested: true } } },
+    ]) {
+      const { jobs, invalid } = loadJobs(wrap({ id: "j", schedule: "@daily", prompt: "p", permissions: bad }))
+      expect(jobs, JSON.stringify(bad)).toHaveLength(0)
+      expect(invalid[0]!.reason).toMatch(/job "j"/)
+    }
+  })
+
+  it("caps the number of actions a job may constrain", () => {
+    const many: Record<string, string> = {}
+    for (let n = 0; n <= 40; n += 1) many[`act${n}`] = "allow"
+    const { invalid } = loadJobs(wrap({ id: "j", schedule: "@daily", prompt: "p", permissions: many }))
+    expect(invalid[0]!.reason).toMatch(/above the cap/)
+  })
+
+  it("finds every ask, at both the action and resource level", () => {
+    expect(collectAsks({ edit: "ask" })).toEqual(["edit"])
+    expect(collectAsks({ bash: { "*": "allow", "git push *": "ask" }, read: "ask" })).toEqual([
+      "bash:git push *",
+      "read",
+    ])
+    expect(collectAsks({ edit: "deny" })).toEqual([])
+  })
+
+  it("applies declared rules before the prompt, and only when declared", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "st-perm-"))
+    mkdirSync(join(dir, ".opencode"), { recursive: true })
+    writeFileSync(
+      join(dir, ".opencode", "schedules.json"),
+      JSON.stringify({
+        version: 1,
+        jobs: [
+          {
+            id: "guarded",
+            schedule: "@daily",
+            prompt: "p",
+            model: "opencode/space-bunny-free",
+            permissions: { edit: "deny", bash: { "*": "allow" } },
+          },
+          { id: "inherit", schedule: "@daily", prompt: "p" },
+        ],
+      }),
+    )
+    const order: string[] = []
+    let added: Array<Record<string, unknown>> = []
+    const ctx = {
+      location: { directory: dir, project: { id: "perm" } },
+      session: {
+        create: async () => ({ id: "ses_1" }),
+        switchModel: async () => void order.push("switchModel"),
+        prompt: async () => void order.push("prompt"),
+      },
+      permission: {
+        rules: async (input: { sessionID: string; permissions: unknown[] }) =>
+          void order.push(`rules:${JSON.stringify(input.permissions)}`),
+      },
+      tool: {
+        transform: async (cb: (e: { add?: (tool: unknown) => void }) => void) => {
+          cb({ add: (tool) => added.push(tool as Record<string, unknown>) })
+          return { dispose: () => {} }
+        },
+      },
+    }
+    const cleanup = await plugin.setup(ctx as never)
+    try {
+      const run = added.find((tool) => tool.name === "run")!
+      const exec = run.execute as (i: Record<string, unknown>) => Promise<{ output: Record<string, unknown> }>
+
+      order.length = 0
+      await exec({ id: "guarded" })
+      // Rules land after model selection and before the turn is admitted.
+      expect(order).toEqual([
+        "switchModel",
+        `rules:${JSON.stringify([{ edit: "deny", bash: { "*": "allow" } }])}`,
+        "prompt",
+      ])
+
+      order.length = 0
+      await exec({ id: "inherit" })
+      // No declared permissions => the session's own rules are left completely alone.
+      expect(order).toEqual(["prompt"])
+    } finally {
+      ;(cleanup as () => void)?.()
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it("degrades to session defaults and logs once when ctx.permission.rules is missing", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "st-perm2-"))
+    mkdirSync(join(dir, ".opencode"), { recursive: true })
+    writeFileSync(
+      join(dir, ".opencode", "schedules.json"),
+      JSON.stringify({
+        version: 1,
+        jobs: [{ id: "j", schedule: "@daily", prompt: "p", permissions: { edit: "deny" } }],
+      }),
+    )
+    let added: Array<Record<string, unknown>> = []
+    const ctx = {
+      location: { directory: dir, project: { id: "perm2" } },
+      session: { create: async () => ({ id: "s" }), prompt: async () => ({ id: "i" }) },
+      tool: {
+        transform: async (cb: (e: { add?: (tool: unknown) => void }) => void) => {
+          cb({ add: (tool) => added.push(tool as Record<string, unknown>) })
+          return { dispose: () => {} }
+        },
+      },
+    }
+    const cleanup = await plugin.setup(ctx as never)
+    try {
+      const run = added.find((tool) => tool.name === "run")!
+      const out = await (run.execute as (i: Record<string, unknown>) => Promise<{ output: Record<string, unknown> }>)({
+        id: "j",
+      })
+      // The run still happens, on session defaults: a missing host capability must not
+      // silently stop the job.
+      expect(out.output.error).toBeUndefined()
+    } finally {
+      ;(cleanup as () => void)?.()
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it("reports declared asks in schedules_list as deny-warnings", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "st-perm3-"))
+    mkdirSync(join(dir, ".opencode"), { recursive: true })
+    writeFileSync(
+      join(dir, ".opencode", "schedules.json"),
+      JSON.stringify({
+        version: 1,
+        jobs: [
+          { id: "asks", schedule: "@daily", prompt: "p", permissions: { edit: "ask", read: "deny" } },
+          { id: "plain", schedule: "@daily", prompt: "p" },
+        ],
+      }),
+    )
+    let added: Array<Record<string, unknown>> = []
+    const ctx = {
+      location: { directory: dir, project: { id: "perm3" } },
+      session: { create: async () => ({ id: "s" }), prompt: async () => ({ id: "i" }) },
+      tool: {
+        transform: async (cb: (e: { add?: (tool: unknown) => void }) => void) => {
+          cb({ add: (tool) => added.push(tool as Record<string, unknown>) })
+          return { dispose: () => {} }
+        },
+      },
+    }
+    const cleanup = await plugin.setup(ctx as never)
+    try {
+      const list = added.find((tool) => tool.name === "list")!
+      const out = await (list.execute as (i: unknown) => Promise<{ output: { jobs: Record<string, unknown>[] } }>)({})
+      const asks = out.output.jobs.find((j) => j.id === "asks")!
+      expect(asks.askAsDeny).toEqual(["edit"])
+      expect(asks.permissions).toEqual({ edit: "ask", read: "deny" })
+      expect(out.output.jobs.find((j) => j.id === "plain")!.permissions).toBe("session default")
     } finally {
       ;(cleanup as () => void)?.()
       rmSync(dir, { recursive: true, force: true })
