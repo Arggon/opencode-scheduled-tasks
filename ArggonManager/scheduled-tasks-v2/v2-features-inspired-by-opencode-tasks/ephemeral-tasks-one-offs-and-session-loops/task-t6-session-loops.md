@@ -7,6 +7,7 @@ parent: ephemeral-tasks-one-offs-and-session-loops
 labels: []
 created: "2026-10-02"
 updated: "2026-10-02"
+depends_on: [task-t5-one-off-tasks]
 ---
 <!--
   Placement (v0): ArggonManager/scheduled-tasks-v2/v2-features-inspired-by-opencode-tasks/ephemeral-tasks-one-offs-and-session-loops/task-t6-session-loops.md
