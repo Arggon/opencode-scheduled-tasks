@@ -56,11 +56,10 @@ A hung run causes two independent failures:
   wrong, and the worker that fixed the bug proved it.** Runs are dispatched with `void`
   (src/index.ts:3224), so a hung run cannot stall the tick, and the tick is what heartbeats the
   **cross-process** writer lease; that lease was never at risk from a hung run. What expires is the
-  *per-job* `record.leaseUntil`, cleared at line 3063 once no longer live — and it cannot cause a
-  cross-process double-fire either, because admission is separately gated on `state.inFlight`, which
-  a hung run holds. I had conflated two different leases. The **cap starvation** above is real and
-  is what this item fixes; the double-fire was not, and I should not have filed it as p0 on that
-  basis.
+  *per-job* `record.leaseUntil`, cleared once no longer live — and it cannot cause a cross-process
+  double-fire either, because admission is separately gated on `state.inFlight`, which a hung run
+  holds. I had conflated two different leases. The **cap starvation** above is real and is what this
+  item fixes; the double-fire was not, and I should not have filed it as p0 on that basis.
 
 ### Published claims that are false today
 
@@ -93,17 +92,10 @@ A hung run causes two independent failures:
 - [x] The false comment in `runJob` ("bounded by the lease the tick refreshes") is corrected.
       *Corrected, and the replacement is specific: the bound is the timer in `boundRun`, and the
       lease is renewed from run liveness. The old comment was wrong in both clauses.*
-<<<<<<< Updated upstream
 - [x] README states what `runTimeout` actually does. The "Known gap" paragraph the coordinator
       wrote — and the earlier claim it inherited, that an unanswerable permission request was safe —
       is replaced with what the bound really does: `ctx.session.interrupt` on overrun, recorded as
       `timeout`, slot released, and the no-`interrupt` fallback stated rather than hidden.
-=======
-- [x] README states what `runTimeout` actually does. The "Known gap" paragraph the coordinator
-      wrote — and the earlier claim it inherited, that an unanswerable permission request was safe —
-      is replaced with what the bound really does: `ctx.session.interrupt` on overrun, recorded as
-      `timeout`, slot released, and the no-`interrupt` fallback stated rather than hidden.
->>>>>>> Stashed changes
       *Left to T7 / the coordinator, as instructed — but this fix **changes what the bound is**, so
       the box cannot close by deleting the "Known gap" paragraph. Two corrections are needed, and
       the second one is not this item's doing:*
@@ -125,7 +117,6 @@ A hung run causes two independent failures:
       ~15ms rather than hanging, because the test advances an injected clock instead of waiting on
       the wall clock. `runTimeoutMs` is floored at one minute, so a real-clock test of this would
       have to run for a minute to fail.*
-<<<<<<< Updated upstream
 - [x] ~~A test proves the lease is not reclaimed while a run is in flight, and that a *hung* run does
       not leave the project double-fireable.~~ **Amended: unsatisfiable as written, because it rested
       on the false claim corrected above.** Once the bound is enforced the bound timer is always due
@@ -135,17 +126,6 @@ A hung run causes two independent failures:
       (a zero-width boundary), so it was **deleted rather than shipped as a coin flip**, with the
       reasoning recorded in the test file. Renewal is kept as documented defence-in-depth for the day
       the bound is loosened, and `isRunOutstanding` is tested directly.
-=======
-- [x] ~~A test proves the lease is not reclaimed while a run is in flight, and that a *hung* run does
-      not leave the project double-fireable.~~ **Amended: unsatisfiable as written, because it rested
-      on the false claim corrected above.** Once the bound is enforced the bound timer is always due
-      before the lease can expire, so renewal and `inFlight` are provably redundant for every
-      reachable state — mutating either away leaves the suite green. The worker wrote the double-fire
-      test anyway; it reproduced under one mutation but passed on other runs of that same mutation
-      (a zero-width boundary), so it was **deleted rather than shipped as a coin flip**, with the
-      reasoning recorded in the test file. Renewal is kept as documented defence-in-depth for the day
-      the bound is loosened, and `isRunOutstanding` is tested directly.
->>>>>>> Stashed changes
       *Half, and the half that is missing is not closeable — stated rather than ticked.*
       - *Done: a hung run does not leave the project double-fireable. Asserted on the lockfile
       itself (its `heartbeat` advancing across a tick while the prompt is outstanding) and on a
