@@ -1597,6 +1597,56 @@ export function isLeaseLive(state: JobState, nowMs: number): boolean {
   return state.leaseUntil !== undefined && state.leaseUntil > nowMs
 }
 
+/**
+ * How often an in-flight run re-extends its own lease.
+ *
+ * Half the run bound, not the whole of it, so a lease can never lapse *between* renewals: at
+ * every instant of a live run the lease has at least half a window left, while the run itself
+ * has only what is left of its bound. So the lease always reaches past the run's remaining life,
+ * by a margin that grows with every renewal. Tied to the bound rather than fixed, so a `1m` job
+ * and a `1h` job renew at comparable fractions of themselves.
+ *
+ * Exported and pure because "two renewals fit inside one window" is the invariant worth pinning
+ * on its own: a renewal period equal to (or longer than) the window reintroduces exactly the
+ * expiry-under-a-live-run this exists to prevent, and nothing else in the file would notice.
+ */
+export function leaseRenewalMs(runTimeoutMs: number): number {
+  const bounded = boundedInt(runTimeoutMs, DEFAULT_RUN_TIMEOUT_MS, MINUTE_MS, 24 * 60 * MINUTE_MS)
+  return Math.max(1_000, Math.floor(bounded / 2))
+}
+
+/**
+ * Whether a run of this job is already outstanding — the one question admission asks.
+ *
+ * **Two signals, and the rule is their disjunction, because neither can be trusted alone.**
+ *
+ * - `leaseUntil` is a comparison against `now`, so it is only as good as the clock. A stalled
+ *   event loop (a long GC, a suspended laptop, a debugger pause) returns with the wall clock
+ *   minutes past the window the run set at its start, and the lease then reads *expired* while
+ *   the run is provably still going. Re-admitting there is a second prompt into a session that
+ *   is already busy — the double-fire ADR 0003 exists to prevent.
+ * - `inFlight` membership is a fact about *this* process, not a comparison against a clock, so
+ *   it cannot be wrong in that direction. It is also the signal that matches the concurrency
+ *   accounting exactly: an id is in the set from admission until the run returns, whatever the
+ *   outcome.
+ *
+ * The lease is kept regardless, because it is the only signal that survives anything this
+ * process did not observe — a previous instance's, or a restart's. It is renewed from run
+ * liveness while a run is live (see `runJob`) rather than from the tick heartbeat, because the
+ * tick heartbeat is the *cross-process writer* lease's mechanism (ADR 0003) and cannot see runs;
+ * making `leaseUntil` depend on the tick would leave it answering "did a tick happen", not "is a
+ * run outstanding", at the cost of a storage write per in-flight job per tick.
+ *
+ * The asymmetry, stated once: a timeout that fires late is recoverable — the record is a little
+ * pessimistic and the next occurrence is unaffected — while a lease that expires under a live
+ * run is not, because two runs of one occurrence is a fact the history can no longer explain. So
+ * when the two bounds conflict, the run bound wins on *reporting* and liveness wins on
+ * *suppression*.
+ */
+export function isRunOutstanding(record: JobState, inFlight: boolean, nowMs: number): boolean {
+  return inFlight || isLeaseLive(record, nowMs)
+}
+
 // ---------------------------------------------------------------------------
 // Cross-process writer lease (ADR 0003)
 // ---------------------------------------------------------------------------
@@ -2578,6 +2628,8 @@ async function runOneOff(
     logOnce("no-prompt", "ctx.session.prompt is unavailable; one-offs cannot be dispatched")
     return "failed"
   }
+  // Bound to a local, because the narrowing above does not survive into the closure below.
+  const prompt = ctx.session.prompt
   let outcome: RunStatus = "failed"
   let model = "unknown"
   let sessionID: string | undefined
@@ -2586,8 +2638,34 @@ async function runOneOff(
     sessionID = sessionIdOf(created)
     if (sessionID === undefined) return "failed"
     model = await applyJobTarget(ctx, task, sessionID)
-    logLine(`running one-off ${task.id} (due ${new Date(task.dueAt).toISOString()}, model ${model})`)
-    await ctx.session.prompt({ sessionID, text: task.prompt, delivery: "queue" })
+    logLine(
+      `running one-off ${task.id} (due ${new Date(task.dueAt).toISOString()}, model ${model}, runTimeout ${runTimeoutLabel(task.runTimeoutMs)})`,
+    )
+    // Bounded by the same `boundRun` a recurring job run uses, and for the same reason: a
+    // one-off carries a `runTimeoutMs` that was parsed and clamped like a job's, and a bound that
+    // does not bind is worse than none.
+    const bounded = await boundRun(ctx, sessionID, task.runTimeoutMs, () =>
+      prompt({ sessionID: sessionID as string, text: task.prompt, delivery: "queue" }),
+    )
+    if (bounded.outcome === "timeout") {
+      const reason = timeoutReason(task.runTimeoutMs, bounded.stopped)
+      logLine(`one-off ${task.id} timed out: ${reason}`)
+      // Recorded here rather than by the tick: the tick only records an `"ok"` outcome, so a
+      // timeout returned from here would otherwise leave no trace at all.
+      state.history.set(
+        task.id,
+        pushHistory(state.history.get(task.id) ?? [], {
+          dueAt: task.dueAt,
+          startedAt: Date.now(),
+          outcome: "timeout",
+          model,
+          ...(sessionID !== undefined ? { sessionID } : {}),
+          error: reason,
+        }),
+      )
+      await saveHistory(ctx, state, task.id)
+      return "timeout"
+    }
     outcome = "ok"
   } catch (error) {
     const message = clip(error instanceof Error ? error.message : String(error), 300)
@@ -2666,6 +2744,8 @@ async function postLoop(
     await recordLoopRun(ctx, state, loop, sessionID, dueAt, "failed", "unknown", "ctx.session.prompt is unavailable")
     return
   }
+  // Bound to a local, because the narrowing above does not survive into the closure below.
+  const prompt = ctx.session.prompt
 
   let outcome: RunStatus = "failed"
   let model = "unknown"
@@ -2674,8 +2754,24 @@ async function postLoop(
     logLine(
       `loop ${loop.id} posting into its own session (every ${Math.round(loop.intervalMs / MINUTE_MS)}m, model ${model})`,
     )
-    // Queue, so a loop cannot interleave with a human typing into the same session.
-    await ctx.session.prompt({ sessionID, text: loop.prompt, delivery: "queue" })
+    // Bounded by the same `boundRun` a recurring job run uses, and this one matters most: a loop
+    // posts into the session a human is sitting in, so a post that never returns holds a slot
+    // that the whole tick shares (`claimed`) and keeps a live session busy. `SessionLoop` carries
+    // no `runTimeout` — it is configured by `every`, which is a cadence and not a bound — so the
+    // default run bound is used rather than inventing a field the tool does not expose.
+    //
+    // Interrupting is still the right call here: the turn being interrupted *is* the loop's own
+    // queued prompt, and leaving it running is what a bound exists to prevent.
+    const bounded = await boundRun(ctx, sessionID, DEFAULT_RUN_TIMEOUT_MS, () =>
+      // Queue, so a loop cannot interleave with a human typing into the same session.
+      prompt({ sessionID, text: loop.prompt, delivery: "queue" }),
+    )
+    if (bounded.outcome === "timeout") {
+      const reason = timeoutReason(DEFAULT_RUN_TIMEOUT_MS, bounded.stopped)
+      logLine(`loop ${loop.id} timed out: ${reason}`)
+      await recordLoopRun(ctx, state, loop, sessionID, dueAt, "timeout", model, reason)
+      return
+    }
     outcome = "ok"
   } catch (error) {
     const message = clip(error instanceof Error ? error.message : String(error), 300)
@@ -2755,6 +2851,104 @@ async function applyJobTarget(ctx: PluginContext, job: DispatchTarget, sessionID
 }
 
 /**
+ * The configured run bound, as a log line and a run record state it.
+ *
+ * Minutes when it is whole minutes, because that is how `runTimeout` is written in a job file
+ * (`5m`), and the record has to be comparable with the configuration that produced it.
+ */
+function runTimeoutLabel(ms: number): string {
+  return ms % MINUTE_MS === 0 ? `${Math.round(ms / MINUTE_MS)}m` : `${Math.round(ms / 1000)}s`
+}
+
+/** What a bounded dispatch produced: it settled, or it blew the bound. */
+type BoundedRun = { outcome: "ok" } | { outcome: "timeout"; stopped: boolean }
+
+/**
+ * Await one dispatch for at most `timeoutMs`, and stop the session if it overruns.
+ *
+ * This is the whole enforcement of `runTimeoutMs`. It used to be a bare `await ctx.session.prompt`
+ * — unbounded, with no `Promise.race`, no `AbortController` and no timer anywhere in the file —
+ * so a prompt that triggered a permission request nobody would ever answer hung for the life of
+ * the process, kept its `maxConcurrentRuns` slot, and let the whole scheduler stall behind it.
+ *
+ * A rejection from `dispatch` propagates to the caller's own handler, so an ordinary failure is
+ * still recorded as `failed` with its message; only the *timeout* path is new, and it reports
+ * `stopped` honestly rather than claiming the run was ended when it may not have been.
+ *
+ * The timer is cleared on every path. Leaving it armed is the worst available failure: it would
+ * fire during whatever the session does next and interrupt an unrelated turn, possibly a human's.
+ */
+async function boundRun(
+  ctx: PluginContext,
+  sessionID: string,
+  timeoutMs: number,
+  dispatch: () => Promise<unknown>,
+): Promise<BoundedRun> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const expiry = new Promise<"expired">((resolve) => {
+    timer = setTimeout(() => resolve("expired"), timeoutMs)
+    // Never hold the process open just to notice that a run overran.
+    timer.unref?.()
+  })
+  // Deferred through a microtask so a synchronous throw from `dispatch` becomes a rejection
+  // inside the `try`, where the `finally` can still clear the timer. `Promise.race` attaches a
+  // handler to both sides, so a dispatch abandoned by the timeout that rejects later is handled
+  // too — no unhandled rejection escapes the abandoned promise.
+  const work = Promise.resolve()
+    .then(dispatch)
+    .then(() => "settled" as const)
+  let raced: "settled" | "expired"
+  try {
+    raced = await Promise.race([work, expiry])
+  } finally {
+    if (timer !== undefined) clearTimeout(timer)
+  }
+  if (raced === "settled") return { outcome: "ok" }
+  return { outcome: "timeout", stopped: await stopRun(ctx, sessionID) }
+}
+
+/**
+ * Stop a session that blew its run bound, if this host offers any way to.
+ *
+ * **Feature-detected, and the detection is the point.** `ctx.session.interrupt` is verified
+ * present on OpenCode 2.0.22 — probed live inside the host, not read off a type: it is a
+ * function, takes `{ sessionID }`, and resolves `{ interrupted: boolean }`, so a `false` is an
+ * answer rather than a failure. The surface still varies by version, exactly as
+ * `ctx.storage.remove` does, so it is checked before every use rather than assumed.
+ *
+ * Where it is missing the honest outcome is that the await was **abandoned**, not that the run was
+ * stopped: the host may still be working on it. The caller records that distinction, because a
+ * record claiming a session was interrupted when nothing interrupted it is the same class of lie
+ * as a timeout that does not time out.
+ */
+async function stopRun(ctx: PluginContext, sessionID: string): Promise<boolean> {
+  if (typeof ctx.session?.interrupt !== "function") return false
+  try {
+    const result = await ctx.session.interrupt({ sessionID })
+    const interrupted = (result as { interrupted?: unknown } | null | undefined)?.interrupted
+    // Absent or `true` means it did what it was asked; only an explicit `false` is a refusal.
+    return interrupted !== false
+  } catch {
+    // An interrupt that throws stops nothing, so the run counts as abandoned. Reported where the
+    // record is written, once, rather than swallowed here.
+    return false
+  }
+}
+
+/**
+ * Why a run stopped short, as the history entry states it.
+ *
+ * Two clauses, because they are different claims and only one of them is true on a host with no
+ * cancel primitive. `stopped` means the session was interrupted; not stopped means the scheduler
+ * gave up waiting and the host may still be running the turn.
+ */
+function timeoutReason(timeoutMs: number, stopped: boolean): string {
+  return stopped
+    ? `exceeded runTimeout ${runTimeoutLabel(timeoutMs)}; the session was interrupted`
+    : `exceeded runTimeout ${runTimeoutLabel(timeoutMs)}; abandoned — ctx.session.interrupt is unavailable, so the host may still be running it`
+}
+
+/**
  * Run one job: admit the prompt, bound it by `runTimeoutMs`, record the outcome.
  *
  * A run never throws out of here: every failure is recorded on the job's state, which is
@@ -2770,6 +2964,15 @@ async function runJob(
   const record = state.states[job.id] ?? { version: STATE_VERSION }
   record.leaseUntil = now + job.runTimeoutMs
 
+  // The lease is renewed for as long as this run is legitimately in flight, from run liveness and
+  // not from the tick heartbeat — see `isRunOutstanding` for why the two must not be conflated.
+  // Half the bound, so the lease always outlasts the run's remaining life; and the bound below is
+  // the only thing that can end the run, so there is nothing here for a renewal to paper over.
+  const renewLease = setInterval(() => {
+    record.leaseUntil = Date.now() + job.runTimeoutMs
+  }, leaseRenewalMs(job.runTimeoutMs))
+  renewLease.unref?.()
+
   // Collected in the `finally` so a thrown run still lands in the history.
   let outcome: RunStatus = "failed"
   let model = "unknown"
@@ -2781,6 +2984,8 @@ async function runJob(
       record.lastError = "ctx.session.prompt is unavailable"
       return
     }
+    // Bound to a local, because the narrowing above does not survive into the closure below.
+    const prompt = ctx.session.prompt
     sessionID = await sessionFor(ctx, state, job)
     if (sessionID === undefined) {
       record.lastStatus = "failed"
@@ -2790,16 +2995,27 @@ async function runJob(
     model = await applyJobTarget(ctx, job, sessionID)
 
     logLine(
-      `running ${job.id} (schedule "${job.schedule}" ${job.timezone}, model ${model}, session ${job.session})`,
+      `running ${job.id} (schedule "${job.schedule}" ${job.timezone}, model ${model}, session ${job.session}, runTimeout ${runTimeoutLabel(job.runTimeoutMs)})`,
     )
 
-    // `prompt` admits the turn; the run itself is bounded by the lease the tick refreshes.
-    await ctx.session.prompt({
-      sessionID,
-      text: job.prompt,
-      // Queue, so a run cannot interleave with a human typing into the same session.
-      delivery: "queue",
-    })
+    // `prompt` admits the turn; what bounds the run is the timer in `boundRun`, which is the only
+    // enforcement `runTimeoutMs` ever had. It interrupts the session when this host offers a way
+    // to and abandons the wait when it does not — and it says which, in the record.
+    const bounded = await boundRun(ctx, sessionID, job.runTimeoutMs, () =>
+      prompt({
+        sessionID,
+        text: job.prompt,
+        // Queue, so a run cannot interleave with a human typing into the same session.
+        delivery: "queue",
+      }),
+    )
+    if (bounded.outcome === "timeout") {
+      outcome = "timeout"
+      record.lastStatus = "timeout"
+      record.lastError = timeoutReason(job.runTimeoutMs, bounded.stopped)
+      logLine(`job ${job.id} timed out: ${record.lastError}`)
+      return
+    }
     outcome = "ok"
     record.lastStatus = "ok"
     record.lastError = undefined
@@ -2808,6 +3024,9 @@ async function runJob(
     record.lastError = clip(error instanceof Error ? error.message : String(error), 500)
     logLine(`job ${job.id} failed: ${record.lastError}`)
   } finally {
+    // Renewal first, then the lease itself: from here the run is over, so a lease that outlived
+    // it would suppress the next occurrence of a job that is no longer running.
+    clearInterval(renewLease)
     record.leaseUntil = undefined
     state.history.set(
       job.id,
@@ -2848,7 +3067,10 @@ async function tick(ctx: PluginContext, state: SchedulerState, lease: Lease, max
       spec,
       record,
       now,
-      isLeaseLive(record, now),
+      // `isRunOutstanding` and not the bare lease: a lease that reads expired while its run is
+      // provably still going would let a second prompt into a busy session, which is the
+      // double-fire ADR 0003 exists to prevent. The clock-independent signal holds it too.
+      isRunOutstanding(record, state.inFlight.has(job.id), now),
       state.inFlight.size + decisions.length,
       maxConcurrent,
     )
