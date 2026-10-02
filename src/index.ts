@@ -12,6 +12,12 @@
  * scheduler logs once and goes inert. It must never break a session, a tool call or the
  * server (invariant 3, spec 001).
  *
+ * **What arms the tick.** Both ephemeral drains (one-offs, session loops) run *inside* the
+ * tick, so a project with no job file can still have work — and it is handed work after
+ * `setup` has already returned, by `schedules_schedule` / `schedules_start_loop`. Arming is
+ * therefore a pure predicate (`hasWork`) applied by one holder (`arm`) that setup, the
+ * ephemeral tools and the end of every tick all call, rather than a decision made once.
+ *
  * **Dependencies.** There is exactly one, and it is optional *at import time* (ADR 0004):
  * `yaml`, reached only through a guarded dynamic import that runs only when a markdown job
  * file exists. With no `.opencode/tasks/` directory this file imports nothing but `node:`
@@ -1947,9 +1953,15 @@ export function validateLoop(input: Record<string, unknown>, nowMs: number, sess
   return { task: { sessionID, prompt, intervalMs: interval.ms, expiresAt: nowMs + expiresInMs } }
 }
 
-/** Read loops for one session, dropping malformed entries rather than failing the load. */
-async function loadLoops(ctx: PluginContext, sessionID: string): Promise<SessionLoop[]> {
-  const stored = await storageGet(ctx, `${LOOP_PREFIX}${sessionID}`)
+/**
+ * Validate one session's stored loop record, dropping malformed entries rather than failing
+ * the whole load.
+ *
+ * Pure and exported because **two** callers need it and must not drift: the per-session read
+ * (`loadLoops`) and the startup scan, which has a record in hand and the session id it was
+ * filed under rather than being told either.
+ */
+export function normalizeLoops(stored: unknown, sessionID: string): SessionLoop[] {
   if (!Array.isArray(stored)) return []
   const out: SessionLoop[] = []
   for (const raw of stored) {
@@ -1974,6 +1986,109 @@ async function loadLoops(ctx: PluginContext, sessionID: string): Promise<Session
   return out
 }
 
+/** Read loops for one session. */
+async function loadLoops(ctx: PluginContext, sessionID: string): Promise<SessionLoop[]> {
+  return normalizeLoops(await storageGet(ctx, `${LOOP_PREFIX}${sessionID}`), sessionID)
+}
+
+/**
+ * Ceiling on stored loop records one startup scan will consider, and the page size it asks
+ * for. A loop is filed per session, so this bounds how many *sessions* are restored at once —
+ * the cardinality a hostile or long-lived storage namespace could otherwise grow into.
+ */
+export const MAX_LOOP_SCAN_KEYS = 500
+
+const LOOP_SCAN_PAGE = 100
+
+/** One `{ key, value }` pair as a scan hands it back. Both fields are feature-detected. */
+type ScanEntry = { key?: unknown; value?: unknown }
+
+/**
+ * Read one `scan` result as a page plus its continuation cursor.
+ *
+ * Deliberately tolerant in *shape* and strict in *content*: the documented surface is
+ * `{ entries, next }`, and a bare array is accepted because it can only mean the single page
+ * it is. Every field is still validated below — a scan we cannot read must return nothing,
+ * not guesses.
+ */
+function scanPage(result: unknown): { entries: ScanEntry[]; next?: string } {
+  if (Array.isArray(result)) return { entries: result as ScanEntry[] }
+  if (result === null || typeof result !== "object") return { entries: [] }
+  const record = result as { entries?: unknown; next?: unknown }
+  const entries = Array.isArray(record.entries) ? (record.entries as ScanEntry[]) : []
+  const next = asString(record.next)
+  return next === undefined ? { entries } : { entries, next }
+}
+
+/**
+ * Every session that has stored loops, discovered by prefixing this plugin's own namespace.
+ *
+ * `ctx.storage.scan` is **feature-detected**: it is not on every host version's plugin
+ * surface, and a scheduler cannot enumerate state it was never offered. When it is absent the
+ * answer is a degradation with a name (`logOnce`), not a guess: stored loops still resume the
+ * moment their own session calls `schedules_start_loop` / `schedules_stop_loop`, which is the
+ * path that always worked.
+ */
+async function scanLoopSessions(ctx: PluginContext): Promise<Array<{ sessionID: string; stored: unknown }>> {
+  const scan = ctx.storage?.scan
+  if (typeof scan !== "function") {
+    logOnce(
+      "no-storage-scan",
+      "ctx.storage.scan is unavailable, so a stored session loop is not restored at startup; it resumes " +
+        "the next time that session starts or stops a loop",
+    )
+    return []
+  }
+
+  const found: Array<{ sessionID: string; stored: unknown }> = []
+  const seen = new Set<string>()
+  let after: string | undefined
+  for (let page = 0; found.length < MAX_LOOP_SCAN_KEYS && page <= MAX_LOOP_SCAN_KEYS; page += 1) {
+    let result: unknown
+    try {
+      result = await scan({
+        prefix: LOOP_PREFIX,
+        limit: LOOP_SCAN_PAGE,
+        ...(after !== undefined ? { after } : {}),
+      })
+    } catch (error) {
+      logOnce("storage-scan", `storage scan failed (${error instanceof Error ? error.message : String(error)})`)
+      return found
+    }
+    const read = scanPage(result)
+    for (const entry of read.entries) {
+      const key = asString(entry.key)
+      if (key === undefined || !key.startsWith(LOOP_PREFIX)) continue
+      // The key tail is the owning session, and it becomes a storage key and a prompt target,
+      // so it goes through the same token check `schedules_start_loop` applies to its caller.
+      const sessionID = sessionToken(key.slice(LOOP_PREFIX.length))
+      if (sessionID === undefined || seen.has(sessionID)) continue
+      seen.add(sessionID)
+      found.push({ sessionID, stored: entry.value })
+    }
+    if (read.next === undefined) break
+    after = read.next
+  }
+  if (found.length >= MAX_LOOP_SCAN_KEYS) {
+    logLine(`loop scan stopped at the cap of ${MAX_LOOP_SCAN_KEYS} sessions; the rest were not restored`)
+  }
+  return found
+}
+
+/**
+ * Restore every stored session loop at setup.
+ *
+ * Without this a stored, due loop simply never posted again after a restart — while the
+ * comment beside `schedules_start_loop` claimed a loop survives a reload. The sessions that
+ * own one are not knowable without asking storage, which is the whole reason `scan` is here.
+ */
+async function loadAllLoops(ctx: PluginContext, state: SchedulerState): Promise<void> {
+  for (const { sessionID, stored } of await scanLoopSessions(ctx)) {
+    const loops = normalizeLoops(stored, sessionID)
+    if (loops.length > 0) state.loops.set(sessionID, loops)
+  }
+}
+
 async function saveLoops(ctx: PluginContext, loops: readonly SessionLoop[]): Promise<void> {
   // A loop belongs to one session, so the key is that session's: a loop can never outlive
   // the session that asked for it, and a dead session's loops are simply unreachable.
@@ -1985,10 +2100,21 @@ async function saveLoops(ctx: PluginContext, loops: readonly SessionLoop[]): Pro
 // OpenCode V2 plugin context (structural types — no `@opencode/plugin` import)
 // ---------------------------------------------------------------------------
 
+/**
+ * The durable key/value surface, entirely optional.
+ *
+ * `scan` is what makes *stored state* discoverable rather than merely addressable: without it
+ * the plugin can read a key whose id it already knows (a job id, the calling session) but can
+ * never enumerate what a previous run left behind. Verified present on 2.0.22 as
+ * `scan({ prefix?, after?, limit? }) → { entries: [{ key, value }], next? }`, with keys already
+ * relative to this plugin's own namespace — and it is feature-detected everywhere it is used,
+ * because the surface varies by version.
+ */
 type StorageContext = {
   get?(key: string): Promise<unknown>
   set?(key: string, value: unknown): Promise<unknown>
   remove?(key: string): Promise<unknown>
+  scan?(input: { prefix?: string; after?: string; limit?: number }): Promise<unknown>
 }
 
 type SessionContext = {
@@ -2154,6 +2280,31 @@ type SchedulerState = {
   fileError?: string
   invalid: InvalidJob[]
   storageAvailable: boolean
+}
+
+/**
+ * Whether this instance has **anything** for the tick to do.
+ *
+ * Enabled file jobs are only half the answer, and counting only them is the whole bug: both
+ * ephemeral drains live *inside* `tick`, so a project with `jobs: []` and a pending one-off
+ * (or a stored loop) has work even though no job file says so. Deciding that once at setup is
+ * what let `schedules_schedule` report success for work nothing would ever fire.
+ *
+ * Exported and pure because the rule is the invariant worth pinning on its own: it is what
+ * ADR 0003's "take the writer lease only when there is work" is decided against, so a change
+ * here changes when a second instance is expected to stay inert.
+ */
+export function hasWork(work: {
+  jobs: readonly Pick<JobDefinition, "enabled">[]
+  oneOffs: readonly unknown[]
+  loops: ReadonlyMap<string, readonly unknown[]>
+}): boolean {
+  if (work.jobs.some((job) => job.enabled)) return true
+  if (work.oneOffs.length > 0) return true
+  for (const loops of work.loops.values()) {
+    if (loops.length > 0) return true
+  }
+  return false
 }
 
 const NO_INPUT = { type: "object", properties: {}, additionalProperties: false }
@@ -2591,14 +2742,42 @@ async function tick(ctx: PluginContext, state: SchedulerState, lease: Lease, max
   // One-offs are drained after recurring jobs so a one-off never starves a schedule.
   const due = state.oneOffs.filter((task) => task.dueAt <= now)
   if (due.length > 0) {
-    const claimed = due.slice(0, Math.max(0, maxConcurrent - state.inFlight.size - decisions.length))
-    if (claimed.length === 0 && due.length > 0) {
-      logLine(`skipping ${due.length} one-off task(s): concurrency cap reached (${maxConcurrent})`)
+    const free = Math.max(0, maxConcurrent - state.inFlight.size - decisions.length)
+    const claimed = due.slice(0, free)
+    const skipped = due.slice(free)
+
+    if (skipped.length > 0) {
+      // **Skipped and recorded, never queued** (spec 001 § concurrency, ADR 0002) — the same
+      // rule `resolveDue` applies to a recurring occurrence that finds no free slot. Leaving
+      // them pending instead re-decided the *same* due instant on every tick, so under a busy
+      // scheduler a one-off could be deferred indefinitely while the "skipping N" line
+      // repeated once a tick and said nothing about the outcome. Consuming the occurrence here
+      // is what makes the backlog bounded; the record is what makes it honest.
+      logLine(
+        `skipping ${skipped.length} one-off task(s): concurrency cap reached (${maxConcurrent}); recorded as skipped`,
+      )
+      for (const task of skipped) {
+        state.history.set(
+          task.id,
+          pushHistory(state.history.get(task.id) ?? [], {
+            dueAt: task.dueAt,
+            startedAt: now,
+            outcome: "skipped",
+            model: task.model === undefined ? "session default" : `${task.model.providerID}/${task.model.id}`,
+            error: `no free run slot: concurrency cap ${maxConcurrent} reached`,
+          }),
+        )
+        await saveHistory(ctx, state, task.id)
+      }
     }
-    // Removed before running, so a crash cannot replay a one-off forever: the same rule the
-    // recurring cursor uses.
-    state.oneOffs = state.oneOffs.filter((task) => !claimed.includes(task))
+
+    // Every due one-off leaves the pending list — the ones that ran *and* the ones that were
+    // skipped — so a crash cannot replay one forever and a skip cannot be retried into the
+    // next tick's backlog.
+    const dueIds = new Set(due.map((task) => task.id))
+    state.oneOffs = state.oneOffs.filter((task) => !dueIds.has(task.id))
     await saveOneOffs(ctx, state.oneOffs)
+
     for (const task of claimed) {
       const entry = task.id
       void runOneOff(ctx, state, task).then(async (outcome) => {
@@ -2631,7 +2810,13 @@ async function tick(ctx: PluginContext, state: SchedulerState, lease: Lease, max
   }
 }
 
-function buildTools(ctx: PluginContext, state: SchedulerState, lease: Lease, tickMs: number): ToolRegistration[] {
+function buildTools(
+  ctx: PluginContext,
+  state: SchedulerState,
+  currentLease: () => Lease,
+  arm: () => void,
+  tickMs: number,
+): ToolRegistration[] {
   return [
     {
       name: "list",
@@ -2639,8 +2824,13 @@ function buildTools(ctx: PluginContext, state: SchedulerState, lease: Lease, tic
       input: NO_INPUT,
       output: LIST_OUTPUT,
       options: { namespace: TOOL_NAMESPACE, codemode: true },
-      execute: async () => ({
-        output: {
+      execute: async () => {
+        // Read through, not captured: the lease is acquired lazily when ephemeral work first
+        // appears, so a snapshot taken at build time would report `leaseHeld: false` for an
+        // instance that is in fact the writer.
+        const lease = currentLease()
+        return {
+          output: {
           jobs: state.jobs.map((job) => {
             const record = state.states[job.id] ?? { version: STATE_VERSION }
             return {
@@ -2694,8 +2884,9 @@ function buildTools(ctx: PluginContext, state: SchedulerState, lease: Lease, tic
           leaseHeld: lease.held,
           leaseForeign: lease.foreign,
           tickMs,
-        },
-      }),
+          },
+        }
+      },
     },
     {
       name: "start_loop",
@@ -2747,6 +2938,10 @@ function buildTools(ctx: PluginContext, state: SchedulerState, lease: Lease, tic
         }
         state.loops.set(sessionID, [...restored, loop])
         await saveLoops(ctx, state.loops.get(sessionID)!)
+        // The first loop in a project with no jobs is the *only* thing that makes the tick
+        // worth running, and this call happens long after `setup` decided there was nothing
+        // to do. Re-decide rather than asking for a reload.
+        arm()
         logLine(`started loop ${loop.id} every ${Math.round(loop.intervalMs / MINUTE_MS)}m in session ${sessionID}`)
         return {
           output: {
@@ -2778,6 +2973,9 @@ function buildTools(ctx: PluginContext, state: SchedulerState, lease: Lease, tic
         if (id === undefined) {
           state.loops.set(sessionID, [])
           await saveLoops(ctx, [])
+          // Removing work can empty a project, and an empty project owes the writer lease back
+          // rather than polling for the rest of the process's life.
+          arm()
           logLine(`stopped all loops in session ${sessionID}`)
           return { output: { loops: [], cap: DEFAULT_LOOP_CAP } }
         }
@@ -2793,6 +2991,7 @@ function buildTools(ctx: PluginContext, state: SchedulerState, lease: Lease, tic
         const remaining = existing.filter((loop) => loop.id !== id)
         state.loops.set(sessionID, remaining)
         await saveLoops(ctx, remaining)
+        arm()
         logLine(`stopped loop ${id}`)
         return {
           output: { loops: remaining.map((loop) => ({ id: loop.id, nextRunAt: new Date(loop.nextRunAt).toISOString() })), cap: DEFAULT_LOOP_CAP },
@@ -2836,6 +3035,10 @@ function buildTools(ctx: PluginContext, state: SchedulerState, lease: Lease, tic
         const task: OneOffTask = { ...validated.task, id: oneOffId(), createdAt: now }
         state.oneOffs = [...state.oneOffs, task]
         await saveOneOffs(ctx, state.oneOffs)
+        // Same re-decision as `start_loop`, and for the same reason: this tool is the only
+        // thing that can give a job-less project work, and it runs long after `setup` decided
+        // there was none. Returning success without arming is what made the work unreachable.
+        arm()
         logLine(`scheduled one-off ${task.id} for ${new Date(task.dueAt).toISOString()}`)
         return {
           output: {
@@ -2874,6 +3077,7 @@ function buildTools(ctx: PluginContext, state: SchedulerState, lease: Lease, tic
         }
         state.oneOffs = state.oneOffs.filter((task) => task.id !== id)
         await saveOneOffs(ctx, state.oneOffs)
+        arm()
         logLine(`cancelled one-off ${id}`)
         return { output: { id, cancelled: true, pending: state.oneOffs.length } }
       },
@@ -3030,47 +3234,107 @@ const definition: PluginDefinition = {
     await loadStates(ctx, state)
     await loadAllHistory(ctx, state)
     state.oneOffs = await loadOneOffs(ctx)
+    await loadAllLoops(ctx, state)
 
-    const hasWork = state.jobs.some((job) => job.enabled)
+    // -----------------------------------------------------------------------
+    // Arming: one holder for the lease and the timer, re-decided on demand.
+    //
+    // This cannot be a single `const hasWork = …` at setup. Both ephemeral drains
+    // (`state.loops`, `state.oneOffs`) live *inside* `tick`, so a project whose only work is
+    // ephemeral has work that no job file mentions — and it is handed work *after* setup, by
+    // `schedules_schedule` / `schedules_start_loop`, minutes into the session. Deciding once
+    // meant those tools returned success for work nothing would ever fire.
+    //
+    // So `hasWork` is a pure predicate, and `arm` is the single place that turns its answer
+    // into a lease and a timer. It is called from setup, from every tool that creates or
+    // removes ephemeral work, and from the end of each tick. Both operations are synchronous
+    // (`acquireLease` is an atomic `open(…, "wx")`, `setInterval` is immediate), so two
+    // callers can never both decide to arm.
+    // -----------------------------------------------------------------------
+    let lease: Lease = IDLE_LEASE
+    let timer: ReturnType<typeof setInterval> | undefined
+    let ticking = false
 
-    // ADR 0003: a foreign lease leaves the plugin loaded and its tools readable, but the
-    // tick loop unarmed — a second server must not double-fire every job.
-    const lease = hasWork ? acquireLease(leasePath(directory, projectID)) : IDLE_LEASE
-    if (lease.foreign) {
-      logLine(`another OpenCode instance holds the writer lease at ${lease.path}; staying inert`)
-    } else if (hasWork && !lease.held) {
-      logLine(`writer lease unavailable at ${lease.path}; running without arbitration`)
+    const runTick = (): void => {
+      // Never re-enter: a tick still in flight is skipped, not queued (spec 001).
+      if (ticking) return
+      ticking = true
+      void tick(ctx, state, lease, maxConcurrent)
+        .catch((error: unknown) => {
+          logOnce("tick", `tick failed (${error instanceof Error ? error.message : String(error)})`)
+        })
+        .finally(() => {
+          ticking = false
+          // Re-decide after the work, not only before it: a project whose last one-off has
+          // now run owes the writer lease back instead of polling for the rest of the
+          // process's life. Cheap — an armed timer returns on its first line.
+          arm()
+        })
     }
 
-    const registered = registerTools(ctx, state, lease, tickMs)
-    if (registered) disposers.push(registered)
+    const disarm = (): void => {
+      if (timer !== undefined) {
+        clearInterval(timer)
+        timer = undefined
+      }
+      if (lease !== IDLE_LEASE) {
+        lease.release()
+        lease = IDLE_LEASE
+      }
+    }
 
-    if (hasWork && !lease.foreign) {
-      let running = false
-      const interval = setInterval(() => {
-        // Never re-enter: a tick still in flight is skipped, not queued (spec 001).
-        if (running) return
-        running = true
-        void tick(ctx, state, lease, maxConcurrent)
-          .catch((error: unknown) => {
-            logOnce("tick", `tick failed (${error instanceof Error ? error.message : String(error)})`)
-          })
-          .finally(() => {
-            running = false
-          })
-      }, tickMs)
+    const arm = (): void => {
+      // No work at all — check this *first*, because "already polling" must not shadow it:
+      // a project whose last one-off has just run owes the lease back, not another poll.
+      if (!hasWork(state)) {
+        if (lease !== IDLE_LEASE || timer !== undefined) {
+          disarm()
+          logLine("no enabled jobs, pending one-off or loop left; timer stopped and the writer lease released")
+        }
+        return
+      }
+      // Already polling: the timer and the lease it was armed with are both correct.
+      if (timer !== undefined) return
+      // ADR 0003: a foreign lease leaves the plugin loaded and its tools readable, but the
+      // tick loop unarmed — a second server must not double-fire every job. Re-arbitrated
+      // whenever we do not hold it, so a holder that has since died heals on the next
+      // decision instead of wedging the project until a restart.
+      if (!lease.held) {
+        lease = acquireLease(leasePath(directory, projectID))
+        if (lease.foreign) {
+          logOnce(`lease-foreign:${lease.path}`, `another OpenCode instance holds the writer lease at ${lease.path}; staying inert`)
+          return
+        }
+        if (!lease.held) {
+          logOnce(`lease-unavailable:${lease.path}`, `writer lease unavailable at ${lease.path}; running without arbitration`)
+        }
+      }
+      timer = setInterval(runTick, tickMs)
       // Never hold the server process open just to poll a schedule.
-      interval.unref?.()
-      disposers.push(() => clearInterval(interval))
-    } else if (!hasWork) {
+      timer.unref?.()
+      // Armed from cold, which is the interesting case: the work was created after setup
+      // decided there was none, so evaluating on the next interval boundary would leave a
+      // due-in-the-past one-off waiting out a whole tick period for no reason.
+      runTick()
+    }
+
+    const registered = registerTools(ctx, state, () => lease, arm, tickMs)
+    if (registered) disposers.push(registered)
+    disposers.push(disarm)
+
+    if (hasWork(state)) {
+      arm()
+    } else {
       // The file existing but holding only disabled jobs is not the same as having no
       // file at all, and the log is the only place that difference is visible. Both
       // surfaces are named, because either can be the one holding the parked jobs.
       const surfaces = `${JOBS_FILE} or ${TASKS_DIR}`
       logLine(
         state.fileError === undefined
-          ? `no enabled jobs in ${surfaces}; no timer armed`
-          : `no enabled jobs (${state.fileError}); no timer armed`,
+          ? `no enabled jobs in ${surfaces} and no pending one-off or loop; no timer armed ` +
+            `(schedules_schedule and schedules_start_loop arm it on demand)`
+          : `no enabled jobs (${state.fileError}); no timer armed ` +
+            `(schedules_schedule and schedules_start_loop arm it on demand)`,
       )
     }
 
@@ -3082,7 +3346,6 @@ const definition: PluginDefinition = {
           // Cleanup must never throw out of the plugin boundary.
         }
       }
-      lease.release()
     }
   },
 }
@@ -3091,7 +3354,8 @@ const definition: PluginDefinition = {
 function registerTools(
   ctx: PluginContext,
   state: SchedulerState,
-  lease: Lease,
+  currentLease: () => Lease,
+  arm: () => void,
   tickMs: number,
 ): (() => void) | undefined {
   try {
@@ -3103,7 +3367,7 @@ function registerTools(
     let registration: unknown
     const pending = transform((editor: ToolEditorLike) => {
       editor.namespace?.({ name: TOOL_NAMESPACE, description: TOOL_NAMESPACE_DESCRIPTION })
-      for (const tool of buildTools(ctx, state, lease, tickMs)) editor.add?.(tool)
+      for (const tool of buildTools(ctx, state, currentLease, arm, tickMs)) editor.add?.(tool)
     })
     if (pending !== undefined && typeof (pending as Promise<unknown>).then === "function") {
       void (pending as Promise<unknown>).then(
