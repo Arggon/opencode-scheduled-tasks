@@ -57,3 +57,22 @@ Filed by the coordinator from the T3–T6 lead-architect review. Serialized afte
 other three `src/index.ts` bugs only to keep two agents out of one file; they are not logically
 dependent. ADR 0003's single-writer guarantee must survive the change: the lease is still taken
 only when there is work, and a second instance must still stay inert.
+
+### 2026-10-02 @ses_f037cc89cffeOo07JPEJShqzJw
+**Live E2E on the real host** (OpenCode v2.0.22, deployed byte-identical to `src/index.ts`, run from this session against project `c183fba7…`):
+
+```
+19:35:07.087  scheduled one-off oneoff_sn7ndgh4murd4ea5 for 2026-10-02T19:35:27.085Z
+19:35:37.087  no enabled jobs, pending one-off or loop left; timer stopped and the writer lease released
+19:35:37.103  running one-off oneoff_sn7ndgh4murd4ea5 (due …, model session default, runTimeout 15m)
+```
+
+This project has **no enabled job file entry** (its only job, `dogfood-smoke`, is `enabled: false`), so this is exactly the scenario the reviewer said silently did nothing. Verified in-session:
+
+- `schedules.list` before: `leaseHeld: false`, `oneOffs: []`
+- `schedules.schedule({ dueIn: "20s" })` returned success
+- `schedules.list` immediately after: **`leaseHeld: true`** — armed on creation, no restart, no reload
+- the tick fired it 10s after due, on the next 30s tick
+- `schedules.list` after completion: `leaseHeld: false`, `oneOffs: []` — the lease was handed back
+
+Both halves of this item are confirmed in production conditions, not just under a fake `ctx`: ephemeral work arms the tick, and a drained project gives the writer lease back. Closing as done is honest.
