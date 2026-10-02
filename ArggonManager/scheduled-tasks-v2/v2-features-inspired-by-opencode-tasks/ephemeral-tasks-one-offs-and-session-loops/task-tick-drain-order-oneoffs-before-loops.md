@@ -46,14 +46,14 @@ ephemeral drains, the least-repeating intent should win the scarce slot.
 
 ## Acceptance
 
-- [ ] The tick drains one-offs before loops, with a comment recording the specific-beats-recurring
+- [x] The tick drains one-offs before loops, with a comment recording the specific-beats-recurring
       rule and the ADR 0006 reasoning above.
-- [ ] The shared `claimed` budget still spans all three drains, and a loop can no longer consume a
+- [x] The shared `claimed` budget still spans all three drains, and a loop can no longer consume a
       slot a pending one-off needed.
-- [ ] A test pins it: at `maxConcurrentRuns: 1`, with one due loop and one due one-off, the **one-off
+- [x] A test pins it: at `maxConcurrentRuns: 1`, with one due loop and one due one-off, the **one-off
       runs** and the loop is recorded as `skipped`. Mutation-check it — invert the drain order and
       confirm the test fails.
-- [ ] The log line for the skipped loop is clear that it lost the slot to a one-off, not to another
+- [x] The log line for the skipped loop is clear that it lost the slot to a one-off, not to another
       loop.
 
 ## Notes
@@ -61,3 +61,23 @@ ephemeral drains, the least-repeating intent should win the scarce slot.
 Filed by the coordinator from the loop-fix worker's report. P2: it is a fairness wart with a small
 diff, not a correctness hole — the cap is respected either way. Sequence it **after**
 `bug-run-timeout-never-enforced`, since that fix also rewrites the tick's run path.
+
+### Implementation (branch `fix/task-tick-drain-order-oneoffs-before-loops`)
+
+- `src/index.ts`, `tick`: the one-off drain moved **above** the loop drain. The job loop is untouched
+  and still decides first. The budget is still seeded once (`inFlightBeforeTick + decisions.length`,
+  the old `state.inFlight.size + decisions.length`) and spent from by all three drains — neither
+  ephemeral drain re-reads the live counter, so moving one earlier cannot hand out a second budget.
+- The rule and its ADR 0006 reasoning are recorded at the reordering site; the loop drain points back
+  at it.
+- A loop that loses its slot now names who took it:
+  `skipping loop <id>: concurrency cap reached (1/1); the slot went to 1 one-off task(s) earlier this
+  tick`. The same clause goes into the recorded history `error` (`…concurrency cap 1 reached, spent
+  on 1 one-off task(s) earlier this tick`), which preserves the existing `concurrency cap 1` match.
+- Tests: the suite pinned the *previous* order ("spends the tick's single slot on the loop…"), so
+  that test was inverted rather than duplicated, and one test was added for the shared budget across
+  all three drains. 233 → 234.
+- Mutation checks, all caught: swapping the two drain blocks fails the ordering test (`expected
+  { sessionID: 'ses_abc', … } to match object { text: 'the one-off prompt' }`); making the one-off
+  drain recompute `free` from `state.inFlight.size` fails the shared-budget test (2 prompts under a
+  cap of 1); dropping the `spentBy` clause from the skip line fails both log assertions.

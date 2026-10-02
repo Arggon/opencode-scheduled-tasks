@@ -3390,6 +3390,52 @@ describe("arming the tick — ephemeral work is work (bug-ephemeral-work-never-a
     })
 
     it(
+      "spends one budget across all three drains, so reordering neither of them buys a slot",
+      async () => {
+        // The other half of the reordering's safety: moving a drain must not give it a *second*
+        // budget. One slot, and all three kinds due in the same tick — a recurring job (decided
+        // first, above), then the one-off drain, then the loop drain. Exactly one prompt may
+        // result.
+        //
+        // The mutation this is here for: a drain that recomputes its own `free` from
+        // `state.inFlight.size` instead of spending the shared `claimed` counter. The job's id is
+        // not in `inFlight` yet (its dispatch is the last thing the tick does), so both ephemeral
+        // drains would each hand out a fresh full budget and three prompts would go out under
+        // `maxConcurrentRuns: 1`.
+        const { prompts, store } = await harness({
+          jobs: [{ id: "busy", schedule: "* * * * *", timezone: "UTC", prompt: "the job prompt" }],
+          scan: true,
+          seed: {
+            "scheduled-tasks/busy": { version: STATE_VERSION, lastRun: Date.now() - 5 * MINUTE_MS },
+            [key("ses_abc")]: [storedLoop({ id: "loop_out" })],
+            "scheduled-tasks/oneoff/pending": [pendingOneOff({ prompt: "the one-off prompt" })],
+          },
+          pluginOptions: { maxConcurrentRuns: 1 },
+        })
+
+        await waitFor(() => prompts.length > 0, "the recurring job to take the slot")
+        await waitFor(
+          () =>
+            Array.isArray(store.get("scheduled-tasks/history/loop/loop_out")) &&
+            Array.isArray(store.get("scheduled-tasks/history/oneoff/oneoff_probe")),
+          "both ephemeral drains to find the slot gone",
+        )
+
+        expect(prompts).toHaveLength(1)
+        expect(prompts[0]).toMatchObject({ text: "the job prompt" })
+        // Both ephemeral kinds are recorded skipped rather than queued, and the loop's line names
+        // the drain that actually took the slot.
+        expect(storedHistory(store, "loop_out")[0]).toMatchObject({ outcome: "skipped" })
+        const oneoff = store.get("scheduled-tasks/history/oneoff/oneoff_probe") as Array<Record<string, unknown>>
+        expect(oneoff[0]).toMatchObject({ outcome: "skipped" })
+        expect(consoleLines.filter((line) => line.includes("skipping loop loop_out"))).toEqual([
+          expect.stringMatching(/the slot went to 1 recurring job occurrence\(s\) decided this tick/),
+        ])
+      },
+      20_000,
+    )
+
+    it(
       "spends the same per-tick budget as a recurring job",
       async () => {
         // One slot, a due job and a due loop. The job is decided first, so the loop must find
@@ -3420,37 +3466,57 @@ describe("arming the tick — ephemeral work is work (bug-ephemeral-work-never-a
     )
 
     it(
-      "spends the tick's single slot on the loop, and records the one-off behind it as skipped",
+      "spends the tick's single slot on the one-off, and records the loop behind it as skipped",
       async () => {
-        // The loop drain runs before the one-off drain, so with one slot the loop takes it and
-        // the one-off is spent and recorded rather than queued. Pinned because it is a
-        // deliberate order, not an accident. `slowWrites` makes the loop record settle on a
-        // later macrotask, so the loop's post has already finished by the time the one-off
-        // drain looks: the cap that holds here is the budget *this tick decided*, not whatever
-        // still happens to be in flight — a tick that re-read the live counter would hand the
-        // same slot back.
+        // The ordering rule, pinned: **one-offs drain before loops** — specific beats recurring.
+        // One slot, one due loop, one due one-off. The old order (loops first) let the loop take
+        // the slot and *spend* the one-off as `skipped` — permanently, since a skipped one-off is
+        // consumed by design — so a user who asked for a task at a specific instant lost it
+        // silently to a request that recurs every minute anyway. The loop is the cheap thing to
+        // disappoint: it keeps its loop and is owed another occurrence in a minute.
+        //
+        // `slowWrites` makes the *loop* record settle on a later macrotask. Under the old order
+        // that was what pinned "the budget *this tick decided*, not whatever still happens to be
+        // in flight" — a tick that re-read the live counter would hand the same slot back. It is
+        // kept here so the test still fails that way: with the one-offs first, the one-off drain
+        // cannot see a loop post that has not been dispatched yet, and the loop drain must still
+        // find the slot spent from the counter the one-off drain incremented.
         const { prompts, store } = await harness({
           jobs: [],
           scan: true,
           slowWrites: true,
           seed: {
-            [key("ses_abc")]: [storedLoop({ id: "loop_first" })],
+            [key("ses_abc")]: [storedLoop({ id: "loop_second" })],
             "scheduled-tasks/oneoff/pending": [pendingOneOff({ prompt: "the one-off prompt" })],
           },
           pluginOptions: { maxConcurrentRuns: 1 },
         })
 
-        await waitFor(() => prompts.length > 0, "the loop to take the only slot")
+        await waitFor(() => prompts.length > 0, "the one-off to take the only slot")
         await waitFor(
-          () => Array.isArray(store.get("scheduled-tasks/history/oneoff/oneoff_probe")),
-          "the one-off to find no free slot",
+          () => Array.isArray(store.get("scheduled-tasks/history/loop/loop_second")),
+          "the loop to find no free slot",
         )
+        // The one-off ran, and *it* was the one that ran: one prompt, the one-off's.
         expect(prompts).toHaveLength(1)
-        expect(prompts[0]).toMatchObject({ text: "the loop prompt" })
-        const history = store.get("scheduled-tasks/history/oneoff/oneoff_probe") as Array<Record<string, unknown>>
+        expect(prompts[0]).toMatchObject({ text: "the one-off prompt" })
+
+        // The loop is recorded as skipped, never queued — and the record says which drain spent
+        // the slot, so the log cannot be read as "another loop outranked this one".
+        const history = storedHistory(store, "loop_second")
         expect(history).toHaveLength(1)
-        expect(history[0]).toMatchObject({ outcome: "skipped" })
+        expect(history[0]).toMatchObject({ outcome: "skipped", sessionID: "ses_abc" })
         expect(String(history[0]!.error)).toMatch(/concurrency cap 1/)
+        expect(String(history[0]!.error)).toMatch(/1 one-off task\(s\) earlier this tick/)
+        expect(consoleLines.filter((line) => line.includes("skipping loop loop_second"))).toEqual([
+          expect.stringMatching(/concurrency cap reached \(1\/1\); the slot went to 1 one-off task\(s\)/),
+        ])
+
+        // The loop is alive and re-armed: it lost one turn, not the loop. A skip that stopped it
+        // would trade a fairness wart for a much worse one.
+        expect(storedIds(store, "ses_abc")).toEqual(["loop_second"])
+        const stored = store.get(key("ses_abc")) as Array<Record<string, unknown>>
+        expect(stored[0]!.nextRunAt as number).toBeGreaterThan(Date.now())
       },
       20_000,
     )
