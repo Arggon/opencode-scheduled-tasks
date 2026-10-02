@@ -160,3 +160,7 @@ now downgraded to a deny before dispatch) — not a conflict, both statements ho
 
 Branch `fix/task-audit-spec-001-acceptance-boxes`, one commit, one file changed
 (`ArggonManager/docs/specs/spec-opencode-scheduled-tasks-001.md`, +169/−24).
+
+### handoff 2026-10-02 @arggon-worker (session: arggon-worker) — next: Review the 39 verdicts in the spec, then file the 4 false boxes (backfill, tick cost, storage-absent, log dir) and the 12 missing tests.
+- branch: fix/task-audit-spec-001-acceptance-boxes
+- open questions: Flip spec+plan status to proposed? (SPEC-STATUS-DRIFT); should the 4 findings be 4 bugs or 1?
