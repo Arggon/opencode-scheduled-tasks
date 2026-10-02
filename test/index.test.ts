@@ -484,6 +484,251 @@ describe("resolveDue — misfire and cost bounds (ADR 0002)", () => {
   })
 })
 
+// ---------------------------------------------------------------------------
+// The cost bound: a tick is a function of the number of jobs, not of sleep length.
+// ---------------------------------------------------------------------------
+
+describe("the dropped-backlog count costs a bounded walk, not a walk per occurrence", () => {
+  /**
+   * `MAX_BACKLOG_SCAN`, restated as a literal.
+   *
+   * **The constant is deliberately not exported** (`src/index.ts` keeps it module-private), and
+   * asserting the literal is the stronger test rather than the weaker convenience: a test reading
+   * the constant would follow any new value silently, so doubling the walk would pass green. With
+   * the number written here, raising the bound has to break this assertion in the open, which is
+   * what makes "the bound changed" a reviewable fact instead of an invisible one.
+   */
+  const SCAN_BOUND = 1000
+
+  /**
+   * Lookups one occurrence search may cost, with headroom.
+   *
+   * `wallToInstant` probes three candidate instants and reads each one twice (`zoneOffsetMs` and
+   * `rendersAs`), so a search that matches costs six. The ceiling is deliberately loose: these
+   * tests assert that the walk is **bounded**, not that a search is implemented a particular way.
+   */
+  const LOOKUPS_PER_SEARCH = 12
+
+  /**
+   * Timezone lookups `run` performs.
+   *
+   * **Work, not wall-clock.** Every occurrence search bottoms out in `wallParts` →
+   * `Intl.DateTimeFormat#formatToParts`, and nothing else in the plugin calls it, so counting these
+   * counts exactly the searches the scheduler made. A duration would be the same claim measured
+   * badly — it fails on a loaded machine and passes on a fast one. The counter is installed on the
+   * prototype, so the formatters the module already cached are counted too, and restored in a
+   * `finally` so a failing assertion cannot leak it into the next test.
+   */
+  function lookupsDuring<T>(run: () => T): { lookups: number; value: T } {
+    const real = Intl.DateTimeFormat.prototype.formatToParts
+    let calls = 0
+    Intl.DateTimeFormat.prototype.formatToParts = function (
+      this: Intl.DateTimeFormat,
+      date?: Date | number,
+    ): Intl.DateTimeFormatPart[] {
+      calls += 1
+      return (real as (d?: Date | number) => Intl.DateTimeFormatPart[]).call(this, date)
+    }
+    try {
+      // The value comes out of the *same* call the counter measured. Measuring a call and then
+      // repeating it to see what it returned would spend the occurrence twice, which for a
+      // `backfill` replay means testing a plan that is one tick further drained than intended.
+      const value = run()
+      return { lookups: calls, value }
+    } finally {
+      Intl.DateTimeFormat.prototype.formatToParts = real
+    }
+  }
+
+  const definition = (over: Partial<JobDefinition> = {}): JobDefinition => ({
+    session: "reuse",
+    id: "j",
+    schedule: "* * * * *",
+    timezone: "UTC",
+    prompt: "p",
+    enabled: true,
+    misfire: "skip" as const,
+    maxCatchUp: DEFAULT_MAX_CATCH_UP,
+    runTimeoutMs: MINUTE_MS,
+    ...over,
+  })
+
+  /** A pinned minute boundary, so the window holds exactly as many occurrences as the test means. */
+  const FROM = Date.UTC(2026, 4, 10, 0, 0)
+  const minutely = parseCron("* * * * *")
+
+  it("stops at the bound instead of at the backlog: a year of sleep costs the same as a day", () => {
+    // The item's claim to test: the count is an enumeration, so its cost has to be *capped*
+    // somewhere or it grows with sleep. `MAX_BACKLOG_SCAN` is that cap.
+    //
+    // A window of N minutes on `* * * * *` holds N occurrences and `limit` of them come back as
+    // instants, so the remainder to count is `N - limit`. Every window below is past that by a wide
+    // margin — a window of only a few hundred occurrences would be counted to the end and never
+    // reach the bound, which is what these windows have to avoid.
+    const short = missedOccurrences(minutely, FROM, FROM + 30 * MINUTE_MS, "UTC", 1)
+    expect(short).toMatchObject({ dropped: 29, droppedCapped: false })
+
+    // Counted under `skip` (limit 1) as the scheduler does. `limit = 1` is what makes the rest of
+    // the window a *count* rather than a list — the case this item is about.
+    const day = missedOccurrences(minutely, FROM, FROM + 24 * 60 * MINUTE_MS, "UTC", 1)
+    const year = missedOccurrences(minutely, FROM, FROM + 365 * 24 * 60 * MINUTE_MS, "UTC", 1)
+
+    // **The bound.** Both report the same count and the same honest flag: past the bound the
+    // answer is a lower bound, and that is said rather than presented as a count.
+    for (const measured of [day, year]) {
+      expect(measured.dropped).toBe(SCAN_BOUND)
+      expect(measured.droppedCapped).toBe(true)
+    }
+
+    // **Cost, as a bounded work count rather than a clock.** A removed or raised cap does not
+    // fail this on a timing threshold — it fails because `missedOccurrences` is now asked for
+    // 525 600 searches instead of 1001, and this asserts the *ceiling* rather than a duration.
+    // `* * * * *` matched under UTC never re-probes, so work is exactly proportional to searches.
+    const searches = (windowMs: number): number =>
+      lookupsDuring(() => missedOccurrences(minutely, FROM, FROM + windowMs, "UTC", 1)).lookups
+
+    // Warm the formatter cache and the JIT, so the first measured call is not the outlier.
+    void searches(MINUTE_MS)
+
+    const dayWork = searches(24 * 60 * MINUTE_MS)
+    const yearWork = searches(365 * 24 * 60 * MINUTE_MS)
+    const decadeWork = searches(3650 * 24 * 60 * MINUTE_MS)
+
+    // A decade is 5.2 million occurrences. If the walk were unbounded this would be five million
+    // searches' worth of lookups; instead the cost is the same as a single day's window, because
+    // both stop at the bound.
+    expect(decadeWork).toBe(dayWork)
+    expect(yearWork).toBe(dayWork)
+    // And it really did count 1000 occurrences rather than short-circuiting to "a lot".
+    expect(dayWork).toBeGreaterThan(SCAN_BOUND)
+    expect(dayWork).toBeLessThanOrEqual(SCAN_BOUND * LOOKUPS_PER_SEARCH)
+  })
+
+  it("keeps a backlog smaller than the bound exact, so `droppedCapped` stays honest", () => {
+    // The flag has to mean "the scan stopped here", not "`dropped` is a round number". A count that
+    // reached exactly the bound is exact, and calling it capped would report a truncation that did
+    // not happen — the ADR 0002 failure this item's predecessor was filed for, inverted.
+    //
+    // 1001 occurrences with one instant returned leaves exactly 1000 to count: the walk finishes on
+    // the bound without being cut short, so the number is a count and the flag is absent.
+    const exact = missedOccurrences(minutely, FROM, FROM + (SCAN_BOUND + 1) * MINUTE_MS, "UTC", 1)
+    expect(exact.instants).toHaveLength(1)
+    expect(exact.dropped).toBe(SCAN_BOUND)
+    expect(exact.droppedCapped).toBe(false)
+
+    // One occurrence more, and the walk *is* cut short — so the bound is a lower bound and the
+    // flag has to say so, or the number reads as a count the scheduler cannot back up.
+    const beyond = missedOccurrences(minutely, FROM, FROM + (SCAN_BOUND + 2) * MINUTE_MS, "UTC", 1)
+    expect(beyond.dropped).toBe(SCAN_BOUND)
+    expect(beyond.droppedCapped).toBe(true)
+  })
+
+  it("reports the count on the run record, not only in the log", () => {
+    // `dropped` is load-bearing since the predecessor item: it is the number the walk is paid for.
+    // A number that is computed and never read is the cost this item exists to justify, so the
+    // record has to carry it — this is the "the work is not discarded" half of that claim.
+    // `maxCatchUp: 2` returns two instants, so 1003 occurrences leaves 1001 to count: past the
+    // bound, and therefore reported as a lower bound.
+    const state: JobState = { version: STATE_VERSION, lastRun: FROM }
+    const decision = resolveDue(
+      definition({ misfire: "backfill", maxCatchUp: 2 }),
+      minutely,
+      state,
+      FROM + (SCAN_BOUND + 3) * MINUTE_MS,
+      false,
+      0,
+      1,
+    )
+    expect(decision?.occurrence).toMatchObject({ dropped: SCAN_BOUND, droppedCapped: true })
+
+    const kept = pushHistory([], {
+      dueAt: 1,
+      startedAt: 2,
+      outcome: "ok",
+      model: "session default",
+      dropped: decision?.occurrence.dropped,
+      droppedCapped: decision?.occurrence.droppedCapped,
+    })
+    expect(kept[0]).toMatchObject({ dropped: SCAN_BOUND, droppedCapped: true })
+  })
+
+  it("charges the walk to the tick that finds the backlog, not to every tick after it", () => {
+    // The item's own framing — "one tick costs O(occurrences)" — was measured per tick. It is per
+    // *backlog*: the tick that finds one pays it, and every later tick over the same job pays one
+    // search to arm `nextRun` and nothing else. The cursor advance is the amortization the bound
+    // rests on, so it is what this test watches.
+    const now = FROM + 24 * 60 * MINUTE_MS
+    const state: JobState = { version: STATE_VERSION, lastRun: FROM }
+
+    // Warm the formatter cache and the JIT, so the first measured call is not the outlier.
+    resolveDue(definition(), minutely, { version: STATE_VERSION, lastRun: FROM }, now, false, 0, 1)
+
+    const found = lookupsDuring(() => resolveDue(definition(), minutely, state, now, false, 0, 1))
+    // It really did count to the bound, on the tick that found the backlog.
+    expect(found.lookups).toBeGreaterThan(SCAN_BOUND)
+    expect(found.value?.occurrence.dropped).toBe(SCAN_BOUND)
+    expect(state.lastRun).toBe(now)
+
+    // Thirty seconds later, on the same job: the window was consumed, so there is nothing to count.
+    const ordinary = lookupsDuring(() => resolveDue(definition(), minutely, state, now + 30_000, false, 0, 1))
+    expect(ordinary.value).toBeUndefined()
+    expect(ordinary.lookups).toBeLessThanOrEqual(LOOKUPS_PER_SEARCH)
+  })
+
+  it("replays a `backfill` backlog off the plan, so each replay tick costs one search too", () => {
+    // The other half of the amortization: a `backfill` backlog keeps draining across following
+    // ticks, so a per-replay walk would be exactly the "once per tick, forever" cost the item
+    // describes. The durable plan is what makes the replay cheap — it carries the remainder, so
+    // nothing has to be re-counted to know it again.
+    const now = FROM + 24 * 60 * MINUTE_MS
+    const state: JobState = { version: STATE_VERSION, lastRun: FROM }
+    const backfill = definition({ misfire: "backfill", maxCatchUp: 5 })
+
+    resolveDue(backfill, minutely, { version: STATE_VERSION, lastRun: FROM }, now, false, 0, 1)
+
+    const found = lookupsDuring(() => resolveDue(backfill, minutely, state, now, false, 0, 1))
+    expect(found.lookups).toBeGreaterThan(SCAN_BOUND)
+    // The remainder is on the plan, which is what a later replay reads instead of re-counting.
+    expect(state.catchUp?.dropped).toBe(SCAN_BOUND)
+
+    // Each replay tick owes the next occurrence and still reports the same remainder — for the
+    // price of one search, because the number travelled with the plan instead of being re-derived.
+    for (const tick of [1, 2, 3]) {
+      const replay = lookupsDuring(() => resolveDue(backfill, minutely, state, now + tick * 30_000, false, 0, 1))
+      expect(replay.value?.occurrence).toMatchObject({ collapsed: 1, dropped: SCAN_BOUND })
+      expect(replay.lookups).toBeLessThanOrEqual(LOOKUPS_PER_SEARCH)
+    }
+  })
+
+  it("scales with the number of jobs, not with the number of occurrences each one owes", () => {
+    // What the spec box has to mean: a tick's cost is a function of how many jobs it evaluated.
+    // Five jobs owing a day each and five owing a decade each cost the same, because each walk
+    // stops at the bound — so a tick is O(jobs × bound) with a fixed bound, and the sleep length
+    // is not in it at all.
+    const day = FROM + 24 * 60 * MINUTE_MS
+    const decade = FROM + 3650 * 24 * 60 * MINUTE_MS
+
+    const tickOfFive = (now: number): number =>
+      lookupsDuring(() => {
+        for (const state of Array.from({ length: 5 }, () => ({ version: STATE_VERSION, lastRun: FROM }))) {
+          resolveDue(definition(), minutely, state, now, false, 0, 1)
+        }
+      }).lookups
+
+    // Warm the formatter cache and the JIT first.
+    tickOfFive(day)
+
+    const fiveDays = tickOfFive(day)
+    const fiveDecades = tickOfFive(decade)
+
+    // A decade per job is 5.2M occurrences against 1440 for a day, and the two ticks cost the same.
+    expect(fiveDecades).toBe(fiveDays)
+    // Five jobs, each paying its own bound and no more than that.
+    expect(fiveDays).toBeGreaterThan((5 * SCAN_BOUND) / 2)
+    expect(fiveDays).toBeLessThanOrEqual(5 * SCAN_BOUND * LOOKUPS_PER_SEARCH)
+  })
+})
+
 describe("normalizeState", () => {
   it("re-initializes an unknown version instead of misreading it", () => {
     expect(normalizeState({ version: 99, lastRun: 5 })).toEqual({ version: STATE_VERSION })
@@ -6328,6 +6573,38 @@ describe("backfill replays a backlog and reports what it dropped (bug-backfill-c
     // Newest first, and carrying the remainder the cap swallowed.
     expect(out.output.runs).toMatchObject([{ dropped: 2, droppedCapped: true }])
   })
+
+  it("says a capped count is a lower bound in the log, not just a number", async () => {
+    // Added by `bug-tick-cost-grows-with-sleep-not-with-jobs`, in this block because this is its
+    // harness. Mutating the `droppedCapped` wording out of `truncationClause` leaves the whole
+    // suite green, so the log half of "this count is a lower bound" was pinned by nothing: the flag
+    // survived on the record while the one line a human reads called 1000 a count.
+    vi.useFakeTimers()
+    try {
+      vi.setSystemTime(START)
+      const h = await backlogged({
+        jobs: [catchUpJob()],
+        // 2001 minutely occurrences owed: 3 replayed, and more than the 1000-occurrence scan bound
+        // counts, so the remainder is a lower bound rather than a count.
+        seed: { "scheduled-tasks/catchup": { version: STATE_VERSION, lastRun: START - 2001 * MINUTE_MS } },
+        pluginOptions: { tickMs: MIN_TICK_MS, maxConcurrentRuns: 1 },
+      })
+
+      expect(await advanceUntil(() => truncations(h).length === 1, 4 * MIN_TICK_MS)).toBe(true)
+      await settle()
+
+      const [line] = truncations(h)
+      // The count, then the honesty about it — a lower bound that reads as a count is how "1000
+      // dropped" turns into a claim the scheduler cannot back up.
+      expect(line).toMatch(/1000 occurrence\(s\) dropped or more/)
+      expect(line).toMatch(/backlog scan bound was reached/)
+      // The record carries the same flag, so a reader holding the record is told the same thing.
+      expect(h.history("catchup")?.[0]).toMatchObject({ dropped: 1000, droppedCapped: true })
+      expect(h.jobState("catchup")?.catchUp).toMatchObject({ dropped: 1000, droppedCapped: true })
+    } finally {
+      vi.useRealTimers()
+    }
+  }, 20_000)
 
   it("drops a malformed stored remainder instead of reporting a number it cannot stand behind", async () => {
     const seeded: Runs = [

@@ -55,16 +55,105 @@ printed**.
 
 ## Acceptance
 
-- [ ] The miss computation is bounded independently of backlog length, **or** its cost is justified
+- [x] The miss computation is bounded independently of backlog length, **or** its cost is justified
       in a comment with the measurement that justifies it.
-- [ ] The work is not discarded: whatever the collapse walk computes is either printed or recorded,
+
+> **First branch — it already held, and is now measured and pinned.** The enumeration is capped by
+> `MAX_BACKLOG_SCAN`, so the work is flat in sleep length: a `* * * * *` job costs the **identical
+> 6012 timezone lookups** for a backlog of 24 h, 720 h, 8760 h, 87600 h and 876000 h (measured
+> 2026-10-02, before and after this branch — unchanged, because what shipped is documentation and
+> pinning, not a behaviour change). 22–27 ms for the walk; 12 lookups (~0.07 ms) for the next
+> ordinary tick; 6 per `backfill` replay tick. The bound and the measurement are now written at
+> `MAX_BACKLOG_SCAN` (src/index.ts:1528) and on `missedOccurrences`, replacing the stale
+> "a number nobody acts on" comment — which described a premise this tracker has since corrected.
+
+- [x] The work is not discarded: whatever the collapse walk computes is either printed or recorded,
       or it is not computed. If `dropped`/`droppedCapped` stay unread, delete the computation rather
       than paying for it 2× a minute forever.
-- [ ] A test or benchmark pins the bound so a future change cannot quietly reintroduce an
+
+> **The count is printed and recorded, and that is now proven rather than asserted.** It rides the
+> log line once per backlog (`truncationClause`) and **every** run record of the backlog
+> (`truncationFields`). Mutation-checked: making `truncationFields` return `{}` fails 5 tests;
+> making `truncationClause` return `""` fails 3. A third mutation found a real gap, now closed:
+> deleting only the `" or more; the backlog scan bound was reached"` wording from the log clause —
+> reporting a lower bound as though it were a count — left the suite **fully green**. New test
+> “says a capped count is a lower bound in the log, not just a number” pins it (that mutation now
+> fails 1).
+
+- [x] A test or benchmark pins the bound so a future change cannot quietly reintroduce an
       unbounded walk. A synthetic 1000-occurrence backlog with an injected clock is sufficient — no
       real-time performance assertion needed.
-- [ ] The spec box is re-worded to describe the bound that actually holds, or the code is brought
+
+> Five unit tests and one plugin-level test, all asserting **work counts**, never durations. Work is
+> counted by instrumenting `Intl.DateTimeFormat#formatToParts` — the primitive every occurrence
+> search bottoms out in, and the only thing in the plugin that calls it — through a `lookupsDuring`
+> helper, so the assertion is deterministic and a timing flake is impossible by construction.
+> Named: “stops at the bound instead of at the backlog: a year of sleep costs the same as a day”
+> (work for a year === work for a day), “keeps a backlog smaller than the bound exact, so
+> `droppedCapped` stays honest”, “reports the count on the run record, not only in the log”,
+> “charges the walk to the tick that finds the backlog, not to every tick after it” (the
+> amortization), “replays a `backfill` backlog off the plan, so each replay tick costs one search
+> too” (the durable plan is why a draining backlog is not re-counted per tick), “scales with the
+> number of jobs, not with the number of occurrences each one owes” (O(jobs × bound)), plus the log
+> test above. Mutations: `MAX_BACKLOG_SCAN` 1000→5000 → **6 failed**; the walk bound removed
+> (`Number.MAX_SAFE_INTEGER`) → **6 failed**; `consume()` no longer advancing the cursor, i.e. the
+> amortization gone → **1 failed**, exactly the amortization test; `droppedCapped` forced `false` →
+> **4 failed**.
+
+- [x] The spec box is re-worded to describe the bound that actually holds, or the code is brought
       under it.
+
+> spec 001 box 124 reworded to the invariant that holds and is now tested: `nextRun` is advanced
+> arithmetically, the dropped-backlog count is bounded by `MAX_BACKLOG_SCAN`, the cost therefore does
+> not grow with sleep past that ceiling, and it is paid once per backlog rather than once per tick.
+> The audit's original verdict is kept beneath the new one as history, with a note that its
+> "no caller reads" premise no longer applies.
+
+## Decision: option (a) — the cost is acceptable as it stands
+
+Both remedies were open. **(a) was chosen, on the measurement, and the count stays an enumeration.**
+The reasoning, so the next reader does not have to re-derive it:
+
+- **The alarm was stale.** The audit's 48.8 ms *per tick* figure predates the predecessor item that
+  made the count load-bearing. On this branch the walk is paid **once per backlog**: 22–27 ms once,
+  then ~0.07 ms per ordinary tick.
+- **The bound is arithmetic in the sense that matters.** `MAX_BACKLOG_SCAN` stops the walk at a fixed
+  ceiling, which is what makes a tick a function of jobs. Work is *identical* from 24 h of sleep to
+  100 years of it — the walk saturates, so sleep length is not in the cost.
+- **A closed-form count is not merely more work; it is a worse answer.** Cron occurrences are a
+  function of a timezone, a calendar and DST, so an exact count *is* a search. Counting per
+  (day, hour) against a `spec.minutes.size` cardinality would cut a minutely backlog's work by
+  roughly 180×, but it needs a second walk whose result must agree exactly with `nextOccurrence`
+  under spring-forward and the Vixie day rule — and a count that disagrees with the instants it is
+  reported beside is precisely the ADR 0002 failure this tracker exists to catch. Paying ~23 ms
+  **once per backlog** is a good trade against that risk.
+- **There is no "arithmetic machinery in the rest of the file" to reuse**, contrary to the item's
+  framing: `nextRun` is advanced with a *single* `nextOccurrence` call, not by an arithmetic step
+  across the window. It is cheap in backlog length because it searches forward once, which is a
+  different mechanism from the one a miss count needs.
+
+**Worst case, stated honestly**: at `DEFAULT_MAX_JOBS` (100 jobs) with every job owing a capped
+backlog — which needs ≥17 h of sleep, since 1000 minutely occurrences is 16.7 h — one tick costs
+~602 000 lookups / **~2.3 s, once**. The next ten ticks over those same 100 jobs total ~15 000
+lookups / ~59 ms. That is a stall on the first tick after a long sleep, not a per-tick cost, and it
+is linear in jobs as the box now claims.
+
+## `MAX_BACKLOG_SCAN`: keep it unexported, assert the literal
+
+**Do not export it.** A test that imported the constant would follow any new value silently, so
+doubling the walk — a 2× cost change to every backlog — would pass green. `test/index.test.ts`
+declares `const SCAN_BOUND = 1000` with that reasoning recorded, so raising the bound breaks an
+assertion in the open and shows up in the diff as the cost decision it is. Confirmed by mutation:
+1000→5000 fails 6 tests. Exporting it would have made the strongest available test unwritable.
+
+## `droppedCapped`'s lower-bound meaning
+
+Unchanged, and still honest, because the count stayed an enumeration — which is exactly the case the
+flag was written for. Past the bound it remains a **lower bound**, and two new tests pin the
+distinction in both directions: a window of exactly 1001 occurrences with one instant returned leaves
+exactly 1000 to count, so the walk *ends* on the bound without being cut short — `dropped: 1000`,
+`droppedCapped: false` — while one occurrence more gives `droppedCapped: true`. (The old box comment
+implied "exactly at the bound" was the flagged case; it is the **un**flagged one.)
 
 ## Notes
 
@@ -73,12 +162,16 @@ this is a cost-invariant violation and would be lost inside a correctness fix. I
 two share a root cause — a collapse path that computes and discards — say so in your report and the
 coordinator will sequence them together.
 
-### handoff 2026-10-02 @ses_f01169724ffecGiuYkio61NMWf (session: ses_f01169724ffecGiuYkio61NMWf) — next: Coordinator: code-review 4e22019 and merge. Verdict is (a) - cost measured acceptable, count left as an enumeration; no behaviour change to review.
-- branch: fix/bug-tick-cost-grows-with-sleep-not-with-jobs
-- open questions: Aggregate worst case is ~2.3s once for 100 jobs all backlogged (needs 17h+ sleep) - accept, or should tick yield between jobs?; item text still says O(occurrences) not O(jobs) in its H1 - retitle?
+**Answered by this branch: yes, they shared a root cause, and the predecessor already resolved it.**
+The discarded computation *was* the collapse count; `bug-backfill-collapses-to-one-run-and-never-reports-truncation`
+made it load-bearing rather than leaving it to be deleted here. There is no shared code left to fix —
+what remained was the cost of a computation that is now reported, which is what this item measured.
 
-### 2026-10-02 @ses_f01169724ffecGiuYkio61NMWf
-Worker report — **verdict (a): the cost is acceptable as it stands**, decided on a measurement taken before anything changed. The count stays an **enumeration**; what shipped is documentation plus tests that pin the bound.
+Untouched, deliberately: `README.md` (T7 owns docs), and the rest of `src/index.ts` /
+`test/index.test.ts` beyond the cost comments and the new tests — no behaviour change, because the
+measurement did not justify one.
+
+## Worker report — commit 4e22019
 
 ## 1. The measurement I took first (before touching anything)
 
