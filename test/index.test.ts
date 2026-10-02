@@ -351,13 +351,86 @@ describe("resolveDue — misfire and cost bounds (ADR 0002)", () => {
     expect(state.lastRun).toBe(now)
   })
 
-  it("replays up to maxCatchUp under `backfill` and records the dropped remainder", () => {
+  it("backfill admits one occurrence per decision and owes the rest as a plan", () => {
+    // ADR 0002: "replay missed occurrences oldest-first, up to `maxCatchUp`". Pre-fix this test
+    // asserted `collapsed: 3` — which read like a replay and was a single run, the item's whole
+    // defect. The plan is what makes the remaining occurrences owed rather than discarded.
     const from = Date.UTC(2026, 4, 10, 0, 0)
     const now = from + 8 * 60 * MINUTE_MS
     const state: JobState = { version: STATE_VERSION, lastRun: from }
-    const decision = resolveDue(job({ misfire: "backfill", maxCatchUp: 3 }), hourly, state, now, false, 0, 1)
-    expect(decision?.occurrence.collapsed).toBe(3)
-    expect(decision?.occurrence.dropped).toBe(5)
+    const definition = job({ misfire: "backfill", maxCatchUp: 3 })
+
+    const first = resolveDue(definition, hourly, state, now, false, 0, 1)
+    expect(first?.kind).toBe("run")
+    // **One** occurrence per decision, and the oldest one.
+    expect(first?.occurrence).toMatchObject({
+      dueAt: from + 60 * MINUTE_MS,
+      // Nothing is folded into a decision any more: the other two are owed, not covered.
+      collapsed: 1,
+      // The remainder past the cap, reported rather than discarded.
+      dropped: 5,
+      // Flagged once, on the tick that found the backlog, so the log line is not a per-replay loop.
+      backlogFound: true,
+    })
+    // The plan holds the occurrences this decision did not run, oldest first.
+    expect(state.catchUp?.pending).toEqual([from + 2 * 60 * MINUTE_MS, from + 3 * 60 * MINUTE_MS])
+    // The window is consumed, so the backlog cannot reappear as a *new* one next tick.
+    expect(state.lastRun).toBe(now)
+
+    // Each later tick replays the next occurrence, oldest first, still carrying the remainder.
+    const second = resolveDue(definition, hourly, state, now, false, 0, 1)
+    expect(second?.occurrence).toMatchObject({ dueAt: from + 2 * 60 * MINUTE_MS, collapsed: 1, dropped: 5 })
+    expect(second?.occurrence.backlogFound).toBeUndefined()
+    const third = resolveDue(definition, hourly, state, now, false, 0, 1)
+    expect(third?.occurrence).toMatchObject({ dueAt: from + 3 * 60 * MINUTE_MS, dropped: 5 })
+
+    // The plan is spent: the last replay clears it, so the next tick owes nothing.
+    expect(state.catchUp).toBeUndefined()
+    expect(resolveDue(definition, hourly, state, now, false, 0, 1)).toBeUndefined()
+  })
+
+  it("defers a replay that finds no free slot instead of spending the occurrence", () => {
+    // A backlog behind a long run is *waiting*, not skipped. Consuming it here would lose an
+    // occurrence the user explicitly asked `backfill` for — the same loss as the cap, one tick late.
+    const from = Date.UTC(2026, 4, 10, 0, 0)
+    const now = from + 8 * 60 * MINUTE_MS
+    const state: JobState = { version: STATE_VERSION, lastRun: from }
+    const definition = job({ misfire: "backfill", maxCatchUp: 3 })
+    resolveDue(definition, hourly, state, now, false, 0, 1)
+
+    const inFlight = resolveDue(definition, hourly, state, now, true, 0, 1)
+    expect(inFlight).toMatchObject({ kind: "skip", suppression: { reason: "in-flight" } })
+    expect(state.catchUp?.pending).toHaveLength(2)
+    // Nothing was skipped, so nothing claims to be: the last run's status is left alone.
+    expect(state.lastStatus).toBeUndefined()
+
+    const capped = resolveDue(definition, hourly, state, now, false, 1, 1)
+    expect(capped).toMatchObject({ kind: "skip", suppression: { reason: "concurrency", running: 1 } })
+    expect(state.catchUp?.pending).toHaveLength(2)
+    expect(state.lastStatus).toBeUndefined()
+  })
+
+  it("reports a lower bound once the backlog scan bound is reached", () => {
+    // `MAX_BACKLOG_SCAN` exists so counting a year of `* * * * *` cannot cost half a million
+    // `nextOccurrence` calls — but a lower bound is only honest if it says so. 1010 minutes of a
+    // `* * * * *` backlog is 1010 occurrences, one more than the bound admits to counting.
+    const from = Date.UTC(2026, 4, 10, 0, 0)
+    const now = from + 1010 * MINUTE_MS
+    const state: JobState = { version: STATE_VERSION, lastRun: from }
+    // A `* * * * *` spec, because only a per-minute cadence fills 1010 occurrences in 1010 minutes.
+    const minutely = parseCron("* * * * *")
+    const decision = resolveDue(
+      job({ misfire: "backfill", maxCatchUp: 2, schedule: "* * * * *" }),
+      minutely,
+      state,
+      now,
+      false,
+      0,
+      1,
+    )
+    expect(decision?.occurrence).toMatchObject({ dropped: 1000, droppedCapped: true })
+    // The one occurrence the cap admits past the first, and it is owed rather than counted.
+    expect(state.catchUp?.pending).toEqual([from + 2 * MINUTE_MS])
   })
 
   it("never backfills history for a job with no previous run", () => {
@@ -437,6 +510,48 @@ describe("normalizeState", () => {
 
   it("bounds a stored error string", () => {
     expect(normalizeState({ version: STATE_VERSION, lastError: "x".repeat(9000) }).lastError).toHaveLength(500)
+  })
+
+  it("keeps a stored catch-up plan, oldest first, and bounds it", () => {
+    // A plan is the only record of occurrences still owed, so it has to survive a restart — and it
+    // is storage, so it is repaired rather than trusted: the replay promise is *oldest first*, and
+    // that is enforced on the read side instead of assuming the writer ordered it.
+    const plan = normalizeState({
+      version: STATE_VERSION,
+      catchUp: { pending: [30, 10, 20], dropped: 4, droppedCapped: true },
+    })
+    expect(plan.catchUp).toEqual({ pending: [10, 20, 30], dropped: 4, droppedCapped: true })
+
+    // Bounded by the scan bound, which is more than a plan can ever hold.
+    const huge = normalizeState({
+      version: STATE_VERSION,
+      catchUp: { pending: Array.from({ length: 5_000 }, (_, n) => n + 1), dropped: 0 },
+    })
+    expect(huge.catchUp?.pending).toHaveLength(1_000)
+  })
+
+  it("drops a catch-up plan it cannot replay rather than dispatching a bogus instant", () => {
+    // Each of these is a stored record that cannot mean what it claims, so it is dropped rather
+    // than replayed: storage is writable from outside, and a bogus instant would be dispatched as
+    // though the schedule had asked for it.
+    for (const catchUp of [
+      { pending: "later", dropped: 2 },
+      // Every instant unusable, so there is nothing left that could be replayed.
+      { pending: [Number.NaN, Number.POSITIVE_INFINITY], dropped: 2 },
+      // A spent plan is not a plan.
+      { pending: [], dropped: 3 },
+      { dropped: 3 },
+      null,
+    ]) {
+      expect(normalizeState({ version: STATE_VERSION, catchUp }).catchUp).toBeUndefined()
+    }
+
+    // A count nobody can stand behind is dropped, but the occurrences still owed are not: losing
+    // them would be the very loss this whole path exists to prevent.
+    expect(normalizeState({ version: STATE_VERSION, catchUp: { pending: [10], dropped: -4 } }).catchUp).toEqual({
+      pending: [10],
+      dropped: 0,
+    })
   })
 })
 
@@ -1101,6 +1216,23 @@ describe("run history (T3)", () => {
   it("bounds a stored error string", () => {
     const h = pushHistory([], { ...entry(1), outcome: "failed", error: "x".repeat(5000) })
     expect(h[0]!.error!.length).toBe(300)
+  })
+
+  it("keeps the truncated remainder, and drops a count it cannot stand behind", () => {
+    // ADR 0002: the remainder is "dropped and reported as truncated in the run record, never
+    // silently". A zero carries no information — "nothing was dropped" — so it is absent rather
+    // than stored, which is also what makes the field's absence an answer.
+    const kept = pushHistory([], { ...entry(1), dropped: 4, droppedCapped: true })
+    expect(kept[0]).toMatchObject({ dropped: 4, droppedCapped: true })
+
+    expect(pushHistory([], { ...entry(1), dropped: 0 })[0]).not.toHaveProperty("dropped")
+    // The flag has nothing to qualify without a count, so it goes with it.
+    expect(pushHistory([], { ...entry(1), dropped: -3, droppedCapped: true })[0]).not.toHaveProperty("dropped")
+    expect(pushHistory([], { ...entry(1), dropped: -3, droppedCapped: true })[0]).not.toHaveProperty("droppedCapped")
+    // …including a count that is not one.
+    expect(pushHistory([], { ...entry(1), dropped: "two", droppedCapped: true } as unknown as HistoryEntry)[0]).not.toHaveProperty(
+      "dropped",
+    )
   })
 
   it("records a run's outcome, model and session, and survives a storage round-trip", async () => {
@@ -5810,4 +5942,410 @@ describe("schedules_run is bounded, capped and leased (bug-schedules-run-not-bou
       vi.useRealTimers()
     }
   }, 20_000)
+})
+
+// ---------------------------------------------------------------------------
+// ADR 0002: `backfill` replays, and the remainder is reported in both sinks.
+// ---------------------------------------------------------------------------
+
+describe("backfill replays a backlog and reports what it dropped (bug-backfill-collapses-to-one-run-and-never-reports-truncation)", () => {
+  const PROJECT = "backfill"
+  /**
+   * A pinned minute boundary. The synthetic backlog is built from this and a cursor five minutes
+   * earlier, so the window holds exactly five occurrences whatever time the suite happens to run —
+   * a `Date.now()` start makes that true only to within the minute.
+   */
+  const START = Date.UTC(2026, 4, 10, 12, 0, 0)
+
+  let dir: string
+  let restoreEnv: string | undefined
+  let consoleLines: string[]
+  let realConsoleError: typeof console.error
+  const outstanding: Array<() => void> = []
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "st-backfill-"))
+    mkdirSync(join(dir, ".opencode"), { recursive: true })
+    restoreEnv = process.env[DATA_DIR_ENV]
+    process.env[DATA_DIR_ENV] = join(dir, "state")
+    realConsoleError = console.error
+    consoleLines = []
+    console.error = (...args: unknown[]): void => void consoleLines.push(args.map(String).join(" "))
+  })
+
+  afterEach(() => {
+    for (const dispose of outstanding.splice(0).reverse()) {
+      try {
+        dispose()
+      } catch {
+        /* a failing teardown must not mask the assertion before it */
+      }
+    }
+    console.error = realConsoleError
+    if (restoreEnv === undefined) delete process.env[DATA_DIR_ENV]
+    else process.env[DATA_DIR_ENV] = restoreEnv
+    rmSync(dir, { recursive: true, force: true })
+    vi.useRealTimers()
+  })
+
+  type Runs = Array<Record<string, unknown>>
+  type Tool = { execute: (input: Record<string, unknown>) => Promise<{ output: Record<string, unknown> }> }
+
+  type BacklogHarness = {
+    prompts: Record<string, unknown>[]
+    store: Map<string, unknown>
+    /** The stored ring a scheduled run writes — the run record sink. */
+    history: (id: string) => Runs | undefined
+    jobState: (id: string) => Record<string, unknown> | undefined
+    tool: (name: string) => Tool
+    /** Every log line, as an interactive `--print-logs` run sees them. */
+    logged: () => string[]
+    /** The same lines in the durable log file. */
+    logFile: () => string
+    release: () => void
+  }
+
+  /**
+   * A plugin on an injected clock, seeded with a backlog it owes.
+   *
+   * `hold` parks every prompt so a replay can be caught *behind* an earlier run still in flight —
+   * the one case where a catch-up plan is either kept or silently thrown away.
+   */
+  async function backlogged(
+    options: {
+      jobs?: unknown[]
+      seed?: Record<string, unknown>
+      pluginOptions?: Record<string, unknown>
+      hold?: boolean
+    } = {},
+  ): Promise<BacklogHarness> {
+    const store = new Map<string, unknown>(Object.entries(options.seed ?? {}))
+    if (options.jobs !== undefined) {
+      writeFileSync(join(dir, ".opencode", "schedules.json"), JSON.stringify({ version: 1, jobs: options.jobs }))
+    }
+    const prompts: Record<string, unknown>[] = []
+    const tools: Array<Record<string, unknown>> = []
+    let openTheGate: () => void = () => {}
+    const gate = options.hold === true ? new Promise<void>((resolve) => void (openTheGate = resolve)) : undefined
+    const ctx: Record<string, unknown> = {
+      ...(options.pluginOptions === undefined ? {} : { options: options.pluginOptions }),
+      location: { directory: dir, project: { id: PROJECT } },
+      storage: {
+        get: async (key: string) => store.get(key),
+        set: async (key: string, value: unknown) => void store.set(key, value),
+        remove: async (key: string) => void store.delete(key),
+      },
+      session: {
+        create: async () => ({ id: "ses_backfill" }),
+        prompt: async (input: Record<string, unknown>) => {
+          prompts.push(input)
+          if (gate !== undefined) await gate
+          return { id: `inbox_${prompts.length}` }
+        },
+      },
+      tool: {
+        transform: async (cb: (editor: { add?: (tool: unknown) => void }) => void) => {
+          cb({ add: (tool) => void tools.push(tool as Record<string, unknown>) })
+          return { dispose() {} }
+        },
+      },
+    }
+    const resolved = await plugin.setup(ctx as never)
+    outstanding.push(() => {
+      ;(resolved as () => void)?.()
+      // Never leave a held prompt pending into the next test.
+      openTheGate()
+    })
+    return {
+      prompts,
+      store,
+      history: (id) => store.get(`scheduled-tasks/history/${id}`) as Runs | undefined,
+      jobState: (id) => store.get(`scheduled-tasks/${id}`) as Record<string, unknown> | undefined,
+      tool: (name) => {
+        const found = tools.find((entry) => entry.name === name)
+        if (found === undefined) throw new Error(`tool ${name} was not registered`)
+        return found as unknown as Tool
+      },
+      logged: () => [...consoleLines],
+      logFile: () => {
+        const path = logPath(dir, PROJECT)
+        expect(existsSync(path)).toBe(true)
+        return readFileSync(path, "utf8")
+      },
+      release: openTheGate,
+    }
+  }
+
+  /** A `* * * * *` job whose `backfill` cap is three, unless a test says otherwise. */
+  const catchUpJob = (over: Record<string, unknown> = {}): Record<string, unknown> => ({
+    id: "catchup",
+    schedule: "* * * * *",
+    timezone: "UTC",
+    prompt: "catch me up",
+    misfire: "backfill",
+    maxCatchUp: 3,
+    // A short bound so a held prompt in the deferral test times out inside the test's own budget
+    // rather than outliving it.
+    runTimeout: "1m",
+    ...over,
+  })
+
+  /** A cursor five minutes before `START`: the five hourly/minutely occurrences ADR 0002 replays. */
+  const owedFive = (id = "catchup"): Record<string, unknown> => ({
+    [`scheduled-tasks/${id}`]: { version: STATE_VERSION, lastRun: START - 5 * MINUTE_MS },
+  })
+
+  const truncations = (h: BacklogHarness): string[] => h.logged().filter((line) => /backlog truncated/.test(line))
+
+  /** Flush pending microtasks and 0/1ms timers on the injected clock, as a `void`-dispatched run does. */
+  async function settle(turns = 20): Promise<void> {
+    for (let n = 0; n < turns; n += 1) await vi.advanceTimersByTimeAsync(1)
+  }
+
+  /** Advance until `predicate` holds, or give up after `budgetMs` — never a guessed interval. */
+  async function advanceUntil(predicate: () => boolean, budgetMs: number, stepMs = MIN_TICK_MS): Promise<boolean> {
+    for (let elapsed = 0; elapsed <= budgetMs; elapsed += stepMs) {
+      if (predicate()) return true
+      await vi.advanceTimersByTimeAsync(stepMs)
+      await settle(2)
+    }
+    return predicate()
+  }
+
+  it(
+    "replays a capped backlog oldest-first, one dispatch per occurrence, and reports the remainder in both sinks",
+    async () => {
+      // The item's reproduction: `backfill`, `maxCatchUp: 3`, five missed occurrences. Pre-fix this
+      // produced **one** prompt, one record with no field for the remainder, and no truncation line.
+      vi.useFakeTimers()
+      try {
+        vi.setSystemTime(START)
+        const h = await backlogged({
+          jobs: [catchUpJob()],
+          seed: owedFive(),
+          pluginOptions: { tickMs: MIN_TICK_MS, maxConcurrentRuns: 1 },
+        })
+
+        // Three ticks, not one: each replay spends the tick's single slot, so the backlog drains
+        // across ticks rather than inside the tick that found it.
+        expect(await advanceUntil(() => h.prompts.length === 3, 8 * MIN_TICK_MS)).toBe(true)
+        expect(await advanceUntil(() => (h.history("catchup") ?? []).length === 3, 4 * MIN_TICK_MS)).toBe(true)
+        await settle()
+
+        // **The dispatch count**, and oldest-first: three prompts, three occurrences, in order.
+        expect(h.prompts).toHaveLength(3)
+        expect(h.prompts[0]).toMatchObject({ text: "catch me up", delivery: "queue" })
+        expect((h.history("catchup") ?? []).map((entry) => entry.dueAt)).toEqual([
+          START - 4 * MINUTE_MS,
+          START - 3 * MINUTE_MS,
+          START - 2 * MINUTE_MS,
+        ])
+
+        // **The record**: every run of a truncated backlog carries the remainder the cap swallowed,
+        // so `schedules_history` answers "did I miss anything?" without reading a log.
+        expect(h.history("catchup")).toMatchObject([
+          { outcome: "ok", dropped: 2 },
+          { outcome: "ok", dropped: 2 },
+          { outcome: "ok", dropped: 2 },
+        ])
+
+        // **The log**, once, naming the job and the number — and in the file, not only the stream.
+        expect(truncations(h)).toHaveLength(1)
+        expect(truncations(h)[0]).toContain("catchup")
+        expect(truncations(h)[0]).toMatch(/2 occurrence\(s\)/)
+        expect(h.logFile()).toMatch(/backlog truncated[^\n]*catchup[^\n]*2 occurrence\(s\)/)
+
+        // And nothing is left owed: the plan drained instead of stalling half-replayed.
+        expect(h.jobState("catchup")?.catchUp).toBeUndefined()
+      } finally {
+        vi.useRealTimers()
+      }
+    },
+    20_000,
+  )
+
+  it(
+    "keeps a replay owed while the previous run is still in flight, rather than dropping it",
+    async () => {
+      // The plan is the only thing standing between "a long run" and "a lost occurrence", so a
+      // deferral has to keep the occurrence. Consuming it here is the same class of loss this
+      // item is about, one tick later.
+      vi.useFakeTimers()
+      try {
+        vi.setSystemTime(START)
+        const h = await backlogged({
+          jobs: [catchUpJob()],
+          seed: owedFive(),
+          pluginOptions: { tickMs: MIN_TICK_MS, maxConcurrentRuns: 1 },
+          hold: true,
+        })
+
+        expect(await advanceUntil(() => h.prompts.length === 1, 4 * MIN_TICK_MS)).toBe(true)
+
+        // Two ticks pass with the first run still holding the one slot: nothing new is dispatched…
+        await vi.advanceTimersByTimeAsync(2 * MIN_TICK_MS)
+        await settle()
+        expect(h.prompts).toHaveLength(1)
+
+        // …and the two remaining occurrences are still owed, not spent.
+        const owed = (h.jobState("catchup")?.catchUp as { pending?: number[] } | undefined)?.pending
+        expect(owed).toEqual([START - 3 * MINUTE_MS, START - 2 * MINUTE_MS])
+
+        // The deferred occurrence is not *reported* as skipped, and its line still carries the
+        // truncation — a suppressed decision about a backlog the cap cut short is one decision, and
+        // naming only half of it is how the other half goes missing.
+        const deferrals = h.logged().filter((line) => /skipping catchup/.test(line))
+        expect(deferrals).not.toHaveLength(0)
+        for (const line of deferrals) expect(line).toMatch(/previous run still in flight.*2 occurrence\(s\)/)
+
+        // Releasing the slot drains the rest, oldest first: a deferral cost time, not an occurrence.
+        h.release()
+        expect(await advanceUntil(() => h.prompts.length === 3, 6 * MIN_TICK_MS)).toBe(true)
+        await advanceUntil(() => (h.history("catchup") ?? []).length === 3, 4 * MIN_TICK_MS)
+        await settle()
+        expect((h.history("catchup") ?? []).map((entry) => entry.dueAt)).toEqual([
+          START - 4 * MINUTE_MS,
+          START - 3 * MINUTE_MS,
+          START - 2 * MINUTE_MS,
+        ])
+      } finally {
+        vi.useRealTimers()
+      }
+    },
+    20_000,
+  )
+
+  it(
+    "keeps the rest of a backlog owed across a restart",
+    async () => {
+      // The plan is durable for one reason: these are billable occurrences the user asked for, so a
+      // process restart mid-drain must not lose them. Re-arming from the cursor alone would silently
+      // drop whatever the plan still held.
+      vi.useFakeTimers()
+      try {
+        vi.setSystemTime(START)
+        const first = await backlogged({
+          jobs: [catchUpJob()],
+          seed: owedFive(),
+          pluginOptions: { tickMs: MIN_TICK_MS, maxConcurrentRuns: 1 },
+        })
+        // One tick only, so the drain is caught half-finished: three occurrences are owed and the
+        // first has just been dispatched. (Advancing further would let the whole backlog go, which
+        // is the outcome this test is not about.)
+        await vi.advanceTimersByTimeAsync(0)
+        await settle()
+        expect(first.prompts).toHaveLength(1)
+        const halfDrained = first.store.get("scheduled-tasks/catchup") as Record<string, unknown>
+        expect((halfDrained.catchUp as { pending: number[] }).pending).toEqual([
+          START - 3 * MINUTE_MS,
+          START - 2 * MINUTE_MS,
+        ])
+
+        // Tear the instance down — timer, lease, in-memory state — and start a new one over the same
+        // storage, exactly as a server restart would.
+        for (const dispose of outstanding.splice(0)) dispose()
+
+        const second = await backlogged({
+          jobs: [catchUpJob()],
+          seed: { "scheduled-tasks/catchup": halfDrained },
+          pluginOptions: { tickMs: MIN_TICK_MS, maxConcurrentRuns: 1 },
+        })
+        expect(await advanceUntil(() => second.prompts.length === 2, 6 * MIN_TICK_MS)).toBe(true)
+        await settle()
+
+        // The two still owed came through the restart, oldest first, and nothing ran twice.
+        expect((second.history("catchup") ?? []).map((entry) => entry.dueAt)).toEqual([
+          START - 3 * MINUTE_MS,
+          START - 2 * MINUTE_MS,
+        ])
+        expect(second.prompts).toHaveLength(2)
+        expect(second.jobState("catchup")?.catchUp).toBeUndefined()
+      } finally {
+        vi.useRealTimers()
+      }
+    },
+    20_000,
+  )
+
+  it(
+    "collapses the same backlog to one run under `skip`, and records the occurrences it collapsed",
+    async () => {
+      // `skip` is the other half of ADR 0002 and shares the same reporting sink, so the collapsed
+      // remainder is stated in the record too: a run that stood for a backlog of five must not
+      // read as though it was the whole backlog.
+      vi.useFakeTimers()
+      try {
+        vi.setSystemTime(START)
+        const h = await backlogged({
+          jobs: [catchUpJob({ misfire: "skip" })],
+          seed: owedFive(),
+          pluginOptions: { tickMs: MIN_TICK_MS, maxConcurrentRuns: 1 },
+        })
+
+        expect(await advanceUntil(() => h.prompts.length === 1, 4 * MIN_TICK_MS)).toBe(true)
+        await vi.advanceTimersByTimeAsync(2 * MIN_TICK_MS)
+        await settle()
+
+        expect(h.prompts).toHaveLength(1)
+        expect(h.history("catchup")).toMatchObject([
+          { outcome: "ok", dueAt: START - 4 * MINUTE_MS, dropped: 4 },
+        ])
+        expect(truncations(h)).toHaveLength(1)
+        expect(truncations(h)[0]).toMatch(/4 occurrence\(s\)/)
+      } finally {
+        vi.useRealTimers()
+      }
+    },
+    20_000,
+  )
+
+  it("reads the truncated remainder back out of storage, rather than dropping the field", async () => {
+    // `loadHistory` rebuilds every record from storage and keeps only the fields it recognises,
+    // so a field that is written but not read back is a report that survives nowhere. This is the
+    // read side of the same promise.
+    const seeded: Runs = [
+      {
+        dueAt: START - 4 * MINUTE_MS,
+        startedAt: START - 4 * MINUTE_MS,
+        outcome: "ok",
+        model: "session default",
+        dropped: 2,
+        droppedCapped: true,
+      },
+    ]
+    const h = await backlogged({
+      // `@daily` with a cursor at `START` is not due, so this test reads the ring without a run
+      // appending to it.
+      jobs: [catchUpJob({ schedule: "@daily" })],
+      seed: {
+        "scheduled-tasks/catchup": { version: STATE_VERSION, lastRun: START },
+        "scheduled-tasks/history/catchup": seeded,
+      },
+      pluginOptions: { tickMs: MIN_TICK_MS, maxConcurrentRuns: 1 },
+    })
+
+    const out = await h.tool("history").execute({ id: "catchup" })
+    // Newest first, and carrying the remainder the cap swallowed.
+    expect(out.output.runs).toMatchObject([{ dropped: 2, droppedCapped: true }])
+  })
+
+  it("drops a malformed stored remainder instead of reporting a number it cannot stand behind", async () => {
+    const seeded: Runs = [
+      // Not a count, and a flag with no count behind it.
+      { dueAt: 1, startedAt: 1, outcome: "ok", model: "session default", dropped: "two", droppedCapped: true },
+    ]
+    const h = await backlogged({
+      jobs: [catchUpJob({ schedule: "@daily" })],
+      seed: {
+        "scheduled-tasks/catchup": { version: STATE_VERSION, lastRun: START },
+        "scheduled-tasks/history/catchup": seeded,
+      },
+      pluginOptions: { tickMs: MIN_TICK_MS, maxConcurrentRuns: 1 },
+    })
+
+    const out = await h.tool("history").execute({ id: "catchup" })
+    const runs = out.output.runs as Runs
+    expect("dropped" in runs[0]!).toBe(false)
+    expect("droppedCapped" in runs[0]!).toBe(false)
+  })
 })

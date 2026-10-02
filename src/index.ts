@@ -123,7 +123,7 @@ Both validate the same way: one bad job is refused by name; the rest still load.
 | \`agent\` | no | Agent switched to before dispatch. |
 | \`enabled\` | no | \`false\` parks a job without deleting it. |
 | \`misfire\` | no | \`skip\` (default, one run per backlog) or \`backfill\`. |
-| \`maxCatchUp\` | no | Replay ceiling for \`backfill\`. Default 5. |
+| \`maxCatchUp\` | no | Replay ceiling for \`backfill\`, one run per tick. Default 5, max 50. |
 | \`runTimeout\` | no | Duration: \`30s\`, \`5m\`, \`1h30m\`, \`1d\`. A bare number means seconds. |
 | \`runTimeoutMs\` | no | The millisecond form; kept for compatibility. |
 
@@ -135,8 +135,19 @@ visible — but naming it is what you meant.
 
 ### Costs money
 
-Every run is a real model request. \`misfire: skip\` means a backlog collapses to one run;
+Every run is a real model request. \`misfire: skip\` (the default) collapses a backlog to one run;
 runs are never retried within an occurrence. Trigger a re-run with \`schedules_run\`.
+
+### What a missed backlog does
+
+\`misfire: skip\` runs the oldest occurrence once and drops the rest. \`misfire: backfill\` replays
+up to \`maxCatchUp\` of them, **oldest first, one run per tick** — so a five-occurrence backlog with
+\`maxCatchUp: 3\` costs three runs spread over three ticks, not three at once.
+
+Either way the occurrences that did not run are **reported, never dropped in silence**: the log line
+names the count, and \`schedules_history\` carries it as \`dropped\` on every record of that backlog
+(\`droppedCapped\` says the count is a lower bound). An occurrence waiting for a free slot stays
+*owed* — it is deferred to a later tick, not discarded — so a backlog costs time, never work.
 
 ### Unattended permission rules (v2)
 
@@ -742,6 +753,18 @@ export type HistoryEntry = {
    * permission event here that nobody is present to see.
    */
   asksAsDeny?: string[]
+  /**
+   * Occurrences this run's backlog owed that were **not** run: past `maxCatchUp` under `backfill`,
+   * collapsed by policy under `skip`.
+   *
+   * Present only when there was a remainder, so its absence means "this run was the whole backlog"
+   * rather than "not known" (ADR 0002: the remainder is "dropped and reported as truncated in the
+   * run record, never silently"). It is what makes that promise a *record* instead of a log line a
+   * user has to go looking for after the fact — the same reason `asksAsDeny` is one.
+   */
+  dropped?: number
+  /** `dropped` hit the backlog scan bound, so it is a lower bound rather than a count. */
+  droppedCapped?: boolean
   error?: string
 }
 
@@ -1403,6 +1426,23 @@ export function localTimeZone(): string {
 
 export type RunStatus = "ok" | "failed" | "timeout" | "skipped"
 
+/**
+ * What a `backfill` job still owes after the cursor moved past its window.
+ *
+ * Durable, and on the job's own state record for two reasons. The occurrences in it are real
+ * billable work the user asked for, so a restart must not lose them; and the remainder has to
+ * travel with them, because it is reported once — when the backlog was found — and a number that
+ * lived only in the decision that found it would be gone by the time anyone read the record.
+ */
+export type CatchUpPlan = {
+  /** Occurrences not yet dispatched, oldest first. Bounded by `maxCatchUp`. */
+  pending: number[]
+  /** Occurrences past the cap. Exact up to `MAX_BACKLOG_SCAN`, a lower bound beyond it. */
+  dropped: number
+  /** `dropped` hit the scan bound, so it is a lower bound rather than a count. */
+  droppedCapped?: boolean
+}
+
 /** Durable, versioned per-job record. Only mutable run state lives here — never the job. */
 export type JobState = {
   version: number
@@ -1412,6 +1452,11 @@ export type JobState = {
   nextRun?: number
   /** Heartbeat of an in-flight run; an expired one is treated as abandoned. */
   leaseUntil?: number
+  /**
+   * Occurrences a `backfill` job still owes, replayed one per tick (ADR 0002). Absent whenever
+   * nothing is owed, which is also what a *finished* backlog leaves behind.
+   */
+  catchUp?: CatchUpPlan
 }
 
 export type JobStateMap = Record<string, JobState>
@@ -1421,11 +1466,24 @@ export type Occurrence = {
   jobId: string
   /** The instant the occurrence was due. */
   dueAt: number
-  /** How many due occurrences this decision covers, and how many past the cap were dropped. */
+  /**
+   * How many due occurrences this decision covers.
+   *
+   * One, always: a decision is one occurrence, dispatched on its own. `skip` still collapses a
+   * backlog into a single run and `backfill` replays one occurrence per tick, so nothing folds
+   * several occurrences into one decision any more — and the occurrences a decision did *not* run
+   * are counted by `dropped`, which is where that fact now lives.
+   */
   collapsed: number
+  /** Occurrences this decision's backlog owed that were not run: past `maxCatchUp`, or collapsed by `skip`. */
   dropped: number
   /** True when `dropped` hit the scan bound and is therefore a lower bound. */
   droppedCapped?: boolean
+  /**
+   * True only on the tick that found the backlog, so the truncation is logged once instead of once
+   * per replayed occurrence. The number itself rides every record (see `CatchUpPlan`).
+   */
+  backlogFound?: boolean
 }
 
 /** Why a due job was not run. */
@@ -1433,6 +1491,22 @@ export type Suppression =
   | { reason: "in-flight" }
   | { reason: "concurrency"; running: number }
   | { reason: "backlog-truncated"; dropped: number }
+
+/**
+ * The clause a log line carries when a decision's backlog did not fit, or `""` when it did.
+ *
+ * **Empty rather than a zero**, so a line about a run that covered its whole backlog reads exactly as
+ * it did before truncation was reported — "nothing was dropped" is what a missing clause means, and
+ * ADR 0002's "never silently" is a promise about the cases where something *was* dropped.
+ *
+ * The scan-bound flag is spelled out rather than left to the reader: a lower bound that looks like a
+ * count is how "2 dropped" turns into a claim the scheduler cannot back up.
+ */
+function truncationClause(occurrence: Occurrence): string {
+  if (occurrence.dropped <= 0) return ""
+  const capped = occurrence.droppedCapped === true ? " or more; the backlog scan bound was reached" : ""
+  return `backlog truncated, ${occurrence.dropped} occurrence(s) dropped${capped}`
+}
 
 export type TickDecision =
   | { kind: "run"; job: JobDefinition; occurrence: Occurrence }
@@ -1494,9 +1568,17 @@ export function missedOccurrences(
  * fresh install never replays a decade of the past — only a job that has actually run
  * before carries a cursor that can fall behind.
  *
- * Whichever policy fires, the cursor is advanced to `nowMs`. That is what makes `skip`
- * genuinely *collapse* a backlog rather than replaying it one occurrence per tick: the
- * window is consumed whether or not each of its occurrences was run.
+ * **One occurrence per decision, whichever policy fires.** `skip` collapses a backlog into a single
+ * run; `backfill` replays up to `maxCatchUp` of them, oldest first, one per tick. What the window
+ * held beyond that is counted in `occurrence.dropped` and reported in both sinks — it is never
+ * simply discarded.
+ *
+ * Whichever policy fires, the cursor is advanced to `nowMs`. That is what makes `skip` genuinely
+ * *collapse* a backlog rather than replaying it one occurrence per tick: the window is consumed
+ * whether or not each of its occurrences was run. Under `backfill` the occurrences that are owed
+ * instead of run move into `state.catchUp` first, so consuming the window loses nothing — a backlog
+ * replays across the following ticks rather than replaying inside the tick that found it, which is
+ * what keeps one tick's cost to one run and leaves the shared per-tick budget in charge of the rest.
  */
 export function resolveDue(
   job: JobDefinition,
@@ -1508,10 +1590,21 @@ export function resolveDue(
   maxConcurrentRuns: number,
 ): TickDecision | undefined {
   const after = state.lastRun ?? nowMs
-  const limit = job.misfire === "backfill" ? job.maxCatchUp : 1
-  const { instants, dropped, droppedCapped } = missedOccurrences(spec, after, nowMs, job.timezone, limit)
+  const backfill = job.misfire === "backfill"
+  // A backlog still being replayed owes exactly the next occurrence, whatever the window says: the
+  // cursor already moved past the whole window when the plan was made, so re-deriving from it would
+  // find nothing and the plan could never drain.
+  const replay = backfill ? state.catchUp : undefined
+  const found: MissedOccurrences =
+    replay === undefined || replay.pending.length === 0
+      ? missedOccurrences(spec, after, nowMs, job.timezone, backfill ? job.maxCatchUp : 1)
+      : {
+          instants: [replay.pending[0] as number],
+          dropped: replay.dropped,
+          droppedCapped: replay.droppedCapped === true,
+        }
 
-  if (instants.length === 0) {
+  if (found.instants.length === 0) {
     // Arm the cursor the first time we ever see this job. Without this the job stays
     // starved forever: with `lastRun` still undefined every tick re-derives
     // `after = nowMs`, the window is always empty, and the job can never come due.
@@ -1523,10 +1616,33 @@ export function resolveDue(
 
   const occurrence: Occurrence = {
     jobId: job.id,
-    dueAt: instants[0] as number,
-    collapsed: instants.length,
-    dropped,
-    ...(droppedCapped ? { droppedCapped: true } : {}),
+    dueAt: found.instants[0] as number,
+    // One, because this decision dispatches one occurrence. The field is kept rather than dropped
+    // because a record that says how many occurrences it covered is what makes "this run stood for
+    // a backlog" answerable — and its value is the honest answer, which is no longer "several".
+    collapsed: 1,
+    dropped: found.dropped,
+    ...(found.droppedCapped ? { droppedCapped: true } : {}),
+    // Only the tick that *found* the backlog logs the truncation: every later replay would repeat a
+    // line about a backlog discovered minutes ago, and the number is in every record regardless.
+    ...(replay === undefined && found.dropped > 0 ? { backlogFound: true } : {}),
+  }
+
+  // The backlog becomes a plan the moment it is found, **before** admission is decided: whether
+  // these occurrences are owed cannot depend on whether a slot happened to be free this tick. The
+  // remainder travels with them, because it is reported on the tick that finds the backlog and the
+  // records of the replays that follow.
+  if (backfill && replay === undefined) {
+    state.catchUp = {
+      pending: found.instants,
+      dropped: found.dropped,
+      ...(found.droppedCapped ? { droppedCapped: true } : {}),
+    }
+  } else if (!backfill) {
+    // A policy that stopped being `backfill` mid-drain collapses what is left, which is what
+    // `skip` means. Keeping the old plan would instead spend one of its occurrences per tick —
+    // neither policy, and silent.
+    state.catchUp = undefined
   }
 
   /** Consume the whole window: the cursor moves to `nowMs`, never to a replayed instant. */
@@ -1536,21 +1652,39 @@ export function resolveDue(
     if (upcoming !== undefined) state.nextRun = upcoming
   }
 
-  if (inFlight) {
-    state.lastStatus = "skipped"
-    consume()
-    return { kind: "skip", job, occurrence, suppression: { reason: "in-flight" } }
-  }
-  if (running >= maxConcurrentRuns) {
-    state.lastStatus = "skipped"
-    consume()
-    return { kind: "skip", job, occurrence, suppression: { reason: "concurrency", running } }
+  /**
+   * Take the occurrence this decision covered off what the job still owes.
+   *
+   * Before the dispatch, not after: a crash mid-run must not replay the same occurrence forever. A
+   * plan with nothing left is removed rather than kept as an empty shell, so "this job is owed
+   * nothing" needs no field of its own to say so.
+   */
+  const take = (): void => {
+    const plan = state.catchUp
+    if (plan === undefined) return
+    const pending = plan.pending.slice(1)
+    state.catchUp = pending.length === 0 ? undefined : { ...plan, pending }
   }
 
-  // Advance the cursor *before* the run, so a crash mid-run cannot replay the same
-  // occurrence forever — and advance it to `nowMs`, so the rest of the backlog is consumed
-  // rather than trickling out one occurrence per tick.
+  // Suppressed rather than decided: under `backfill` an occurrence that finds no free slot stays
+  // **owed**, because the plan now holds it. `skip` has no such thing — collapsing the window is its
+  // whole decision — so there the occurrence is spent, exactly as it always was, and the record says
+  // so in `lastStatus`.
+  const defer = (suppression: Suppression): TickDecision => {
+    consume()
+    if (backfill) return { kind: "skip", job, occurrence, suppression }
+    state.lastStatus = "skipped"
+    return { kind: "skip", job, occurrence, suppression }
+  }
+
+  if (inFlight) return defer({ reason: "in-flight" })
+  if (running >= maxConcurrentRuns) return defer({ reason: "concurrency", running })
+
+  // Consume the occurrence *before* the run, so a crash mid-run cannot replay it forever — and
+  // consume the whole window too, so the rest of the backlog is owed as a plan rather than
+  // trickling out of a window that has already been taken.
   consume()
+  take()
 
   return { kind: "run", job, occurrence }
 }
@@ -1617,7 +1751,38 @@ export function normalizeState(value: unknown): JobState {
   }
   if (isRunStatus(record.lastStatus)) state.lastStatus = record.lastStatus
   if (typeof record.lastError === "string") state.lastError = record.lastError.slice(0, 500)
+  const catchUp = normalizeCatchUp(record.catchUp)
+  if (catchUp !== undefined) state.catchUp = catchUp
   return state
+}
+
+/**
+ * Repair a stored catch-up plan, or refuse it.
+ *
+ * Refused when it cannot mean what it claims — not an object, no instant list, nothing left in it —
+ * because a bogus entry here is not a cosmetic defect: it is a *dispatch*, of an instant no schedule
+ * ever asked for. A spent plan (empty list) is refused for the ordinary reason, that there is
+ * nothing left to replay.
+ *
+ * Kept, but sorted and bounded, when it does: "oldest first" is the promise ADR 0002 makes about
+ * what `backfill` replays, so it is enforced here rather than assumed of whatever wrote the record.
+ */
+function normalizeCatchUp(value: unknown): CatchUpPlan | undefined {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return undefined
+  const plan = value as Record<string, unknown>
+  if (!Array.isArray(plan.pending)) return undefined
+  const pending: number[] = []
+  for (const raw of plan.pending.slice(0, MAX_BACKLOG_SCAN)) {
+    if (typeof raw === "number" && Number.isFinite(raw)) pending.push(Math.trunc(raw))
+  }
+  if (pending.length === 0) return undefined
+  const dropped =
+    typeof plan.dropped === "number" && Number.isFinite(plan.dropped) ? Math.max(0, Math.trunc(plan.dropped)) : 0
+  return {
+    pending: pending.sort((a, b) => a - b),
+    dropped,
+    ...(plan.droppedCapped === true ? { droppedCapped: true } : {}),
+  }
 }
 
 function isRunStatus(value: unknown): value is RunStatus {
@@ -1676,6 +1841,32 @@ function clipAsks(value: unknown): string[] | undefined {
 }
 
 /**
+ * A count a run record may carry: a non-negative integer, or nothing at all.
+ *
+ * Shared by the write and read sides for the reason `clipAsks` shares `clip` — a record is storage,
+ * and storage can be edited from outside, so the two sides must not disagree about what a field
+ * means. A zero is *nothing dropped*, which is what the absent field already says, so it is dropped
+ * rather than stored: its absence has to be an answer.
+ */
+function storedCount(value: unknown): number | undefined {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) return undefined
+  const count = Math.trunc(value)
+  return count === 0 ? undefined : count
+}
+
+/**
+ * The truncation clause a run record carries, or `{}` when the backlog had no remainder.
+ *
+ * The flag travels with the count and only with it: `droppedCapped` qualifies a number, so a record
+ * carrying it alone would describe a lower bound of nothing.
+ */
+function truncationFields(dropped: unknown, droppedCapped: unknown): Pick<HistoryEntry, "dropped" | "droppedCapped"> {
+  const count = storedCount(dropped)
+  if (count === undefined) return {}
+  return { dropped: count, ...(droppedCapped === true ? { droppedCapped: true } : {}) }
+}
+
+/**
  * Append one run to a job's history, evicting oldest-first at the limit.
  *
  * Pure and exported so the eviction rule is testable without a clock or a session.
@@ -1690,14 +1881,16 @@ export function pushHistory(
   // or the same run reads back differently depending on which one happened to see it.
   // Destructured out first because a spread cannot *remove* a key: a record carrying an empty or
   // malformed list must come back without the field, not with the raw one still attached.
-  const { asksAsDeny: rawAsks, ...rest } = entry
+  const { asksAsDeny: rawAsks, dropped, droppedCapped, ...rest } = entry
   const asksAsDeny = clipAsks(rawAsks)
+  const truncation = truncationFields(dropped, droppedCapped)
   const next = [
     ...history,
     {
       ...rest,
       ...(rest.error === undefined ? {} : { error: clip(rest.error, HISTORY_ERROR_MAX) }),
       ...(asksAsDeny === undefined ? {} : { asksAsDeny }),
+      ...truncation,
       model: clip(rest.model, HISTORY_LABEL_MAX),
       ...(rest.sessionID === undefined ? {} : { sessionID: clip(rest.sessionID, HISTORY_LABEL_MAX) }),
     },
@@ -2849,6 +3042,9 @@ async function loadHistory(ctx: PluginContext, key: string): Promise<HistoryEntr
     const sessionID = asString(record.sessionID)
     const error = asString(record.error)
     const asksAsDeny = clipAsks(record.asksAsDeny)
+    // The truncated remainder survives the round-trip, or "reported in the run record" is a promise
+    // about a field that exists only between the write and the next restart.
+    const truncation = truncationFields(record.dropped, record.droppedCapped)
     entries.push({
       dueAt: record.dueAt,
       startedAt: record.startedAt,
@@ -2856,6 +3052,7 @@ async function loadHistory(ctx: PluginContext, key: string): Promise<HistoryEntr
       model: clip(record.model, HISTORY_LABEL_MAX),
       ...(sessionID !== undefined ? { sessionID: clip(sessionID, HISTORY_LABEL_MAX) } : {}),
       ...(asksAsDeny !== undefined ? { asksAsDeny } : {}),
+      ...truncation,
       ...(error !== undefined ? { error: clip(error, HISTORY_ERROR_MAX) } : {}),
     })
   }
@@ -3324,12 +3521,16 @@ function timeoutReason(timeoutMs: number, stopped: boolean): string {
  *
  * A run never throws out of here: every failure is recorded on the job's state, which is
  * what keeps invariant 3 (never breaks a session) true for the scheduling path too.
+ *
+ * The whole occurrence is passed rather than its `dueAt`, because what the record also needs is what
+ * the occurrence's backlog did **not** run — the truncated remainder, which is the one part of the
+ * misfire policy that belongs in the record and nowhere else (ADR 0002).
  */
 async function runJob(
   ctx: PluginContext,
   state: SchedulerState,
   job: JobDefinition,
-  dueAt: number,
+  occurrence: Occurrence,
 ): Promise<void> {
   const now = Date.now()
   const record = jobState(state, job.id)
@@ -3398,12 +3599,16 @@ async function runJob(
     // it would suppress the next occurrence of a job that is no longer running.
     releaseLease()
     await recordRun(ctx, state, "job", job.id, {
-      dueAt,
+      dueAt: occurrence.dueAt,
       startedAt: now,
       outcome,
       model,
       ...(sessionID !== undefined ? { sessionID } : {}),
       ...(asksAsDeny.length === 0 ? {} : { asksAsDeny }),
+      // The remainder, on **every** record of a truncated backlog, not only the first: each of these
+      // records is an occurrence of a backlog that was cut short, and a reader holding any one of
+      // them is owed the fact. Absent when the backlog had no remainder — see `HistoryEntry`.
+      ...truncationFields(occurrence.dropped, occurrence.droppedCapped),
       ...(record.lastError !== undefined ? { error: record.lastError } : {}),
     })
     await saveState(ctx, state, job.id)
@@ -3443,15 +3648,27 @@ async function tick(ctx: PluginContext, state: SchedulerState, lease: Lease, max
     if (decision === undefined) continue
 
     if (decision.kind === "skip") {
+      // The truncation rides the **occurrence**, not the suppression, and both are reported in one
+      // line because they are one decision: a truncated backlog is not why a run did not happen, it
+      // is what the run could not cover, so a line naming only the reason drops half of it.
+      // (`backlog-truncated` remains a `Suppression` member and is still read here, so a
+      // pre-existing record of one is reported rather than silently un-printed.)
       const reason =
         decision.suppression.reason === "in-flight"
           ? "previous run still in flight"
           : decision.suppression.reason === "concurrency"
             ? `concurrency cap reached (${decision.suppression.running}/${maxConcurrent})`
             : `backlog truncated, ${decision.suppression.dropped} occurrence(s) dropped`
-      logLine(`skipping ${job.id}: ${reason}`)
+      const truncated = truncationClause(decision.occurrence)
+      logLine(`skipping ${job.id}: ${reason}${truncated === "" ? "" : `; ${truncated}`}`)
       await saveState(ctx, state, job.id)
       continue
+    }
+    // A run's own truncation is reported here rather than inside `runJob`, which knows the outcome
+    // and not when the backlog was found. Once per backlog, not once per replay.
+    const truncated = truncationClause(decision.occurrence)
+    if (decision.occurrence.backlogFound === true && truncated !== "") {
+      logLine(`backlog truncated for ${job.id}: ${truncated}`)
     }
     decisions.push(decision)
   }
@@ -3631,7 +3848,8 @@ async function tick(ctx: PluginContext, state: SchedulerState, lease: Lease, max
 
   for (const decision of decisions) {
     state.inFlight.add(decision.job.id)
-    void runJob(ctx, state, decision.job, decision.occurrence.dueAt)
+    // The whole occurrence, because the record needs what the backlog did not run, not only when.
+    void runJob(ctx, state, decision.job, decision.occurrence)
       .catch((error: unknown) => {
         logOnce(`run-${decision.job.id}`, `run failed (${error instanceof Error ? error.message : String(error)})`)
       })
@@ -3974,6 +4192,9 @@ function buildTools(
             model: entry.model,
             ...(entry.sessionID !== undefined ? { sessionID: entry.sessionID } : {}),
             ...(entry.asksAsDeny !== undefined ? { asksAsDeny: entry.asksAsDeny } : {}),
+            // What the backlog owed and this run did not cover, so "how much did I miss?" is
+            // answered here rather than by reading the log (ADR 0002).
+            ...truncationFields(entry.dropped, entry.droppedCapped),
             ...(entry.error !== undefined ? { error: entry.error } : {}),
           }))
         return {
