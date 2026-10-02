@@ -1,12 +1,14 @@
 ---
 type: bug
-status: todo
+status: in_progress
 id: bug-ephemeral-work-never-arms-tick
 title: Ephemeral work never arms the tick loop
+assignee: arggon
 parent: ephemeral-tasks-one-offs-and-session-loops
 labels: []
 created: "2026-10-02"
 updated: "2026-10-02"
+claimed_at: "2026-10-02T16:24:50.366Z"
 depends_on: [task-t2-markdown-task-files]
 ---
 <!--
