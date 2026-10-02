@@ -1,12 +1,14 @@
 ---
 type: task
-status: todo
+status: in_progress
 id: task-cross-process-writer-lease
 title: Cross-process writer lease
+assignee: arggon
 parent: v1-tick-loop-scheduler
 labels: []
 created: "2026-10-02"
 updated: "2026-10-02"
+claimed_at: "2026-10-02T12:46:55.896Z"
 ---
 <!--
   Placement (v0): ArggonManager/opencode-scheduled-tasks/opencode-scheduled-tasks-plugin/v1-tick-loop-scheduler/task-cross-process-writer-lease.md
