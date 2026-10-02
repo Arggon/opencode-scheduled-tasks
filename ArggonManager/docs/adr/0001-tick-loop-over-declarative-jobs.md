@@ -1,7 +1,7 @@
 ---
 id: 0001
 title: Tick loop over declarative jobs
-status: Proposed
+status: Accepted
 date: 2026-10-02
 deciders: arggon
 ---

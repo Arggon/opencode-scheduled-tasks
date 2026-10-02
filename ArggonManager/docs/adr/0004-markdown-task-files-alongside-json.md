@@ -1,7 +1,7 @@
 ---
 id: 0004
 title: Markdown task files alongside the JSON array
-status: Proposed
+status: Accepted
 date: 2026-10-02
 deciders: arggon
 ---

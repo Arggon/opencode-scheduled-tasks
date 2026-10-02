@@ -5,6 +5,14 @@ status: proposed
 created: 2026-10-02
 ---
 
+<!-- status: NOT implemented. Flipping this to `implemented` was attempted and
+     reverted: the markdown-union acceptance block is unimplemented until
+     task-t2-markdown-task-files lands, and task-t7 still owes the v2 gate. Only
+     `proposed`, `implemented` and `superseded` are legal (DOC_STATUSES), and there
+     is no in-progress state - so `proposed` is the honest value while any
+     acceptance box is open. Flip it in the PR that closes the last box. -->
+
+
 # Spec: v2 — markdown task files, run control, ephemeral tasks (opencode-scheduled-tasks-002)
 
 ## Purpose

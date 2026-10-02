@@ -1,7 +1,7 @@
 ---
 id: 0002
 title: Misfire and cost bounds
-status: Proposed
+status: Accepted
 date: 2026-10-02
 deciders: arggon
 ---
