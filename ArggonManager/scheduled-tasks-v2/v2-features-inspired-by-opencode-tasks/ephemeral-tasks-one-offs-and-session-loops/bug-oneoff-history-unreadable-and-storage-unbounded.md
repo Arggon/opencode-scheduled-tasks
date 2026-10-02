@@ -82,3 +82,7 @@ schedules_history({ id: "oneoff_sn7ndgh4murd4ea5" })
 ```
 
 So the history was written under the one-off's own id while `schedules_history` resolves only `state.jobs`. This is now confirmed against a real host, not only under a fake `ctx`, and it makes two published statements false: the README ("a completed one-off survives only in `schedules_history`") and the `cancel` error message ("check schedules_history"). It also confirms `storage.remove` is never called, so every one-off leaves a permanent key.
+
+### handoff 2026-10-02 @ses_f01df884affeb0gIJWfPeR009z (session: ses_f01df884affeb0gIJWfPeR009z) — next: Coordinator: review + merge 4bc026a on fix/bug-oneoff-history-unreadable-and-storage-unbounded (216 tests, all gates green)
+- branch: main
+- open questions: README L110-112 (schedules_history now also takes one-off/loop ids) and L225 (now true; bounded ring) are T7's to edit — untouched here. No item filed for the evictions; check M8/M11 dead code was ri…
