@@ -1,12 +1,14 @@
 ---
 type: task
-status: todo
+status: in_progress
 id: task-t2-markdown-task-files
 title: Markdown task files alongside the JSON array
+assignee: arggon
 parent: config-surface-markdown-task-files-durations
 labels: []
 created: "2026-10-02"
 updated: "2026-10-02"
+claimed_at: "2026-10-02T16:23:53.351Z"
 depends_on: [task-t1-durations-and-format-tool]
 ---
 <!--
