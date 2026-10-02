@@ -50,18 +50,38 @@ catch, and the tick recorded only `ok`. The success path also stamped `startedAt
 
 ## Acceptance
 
-- [ ] `schedules_history` reads a completed one-off, and the README + `cancel` message become true.
-- [ ] One-off history keys are removed once read or superseded, or namespaced so they are bounded.
-- [ ] `loadOneOffs` / `loadLoops` cap on read as well as on write; `MAX_LOOP_CAP` is used or
+- [x] `schedules_history` reads a completed one-off, and the README + `cancel` message become true.
+- [x] One-off history keys are removed once read or superseded, or namespaced so they are bounded.
+- [x] `loadOneOffs` / `loadLoops` cap on read as well as on write; `MAX_LOOP_CAP` is used or
       removed.
-- [ ] Every one-off path — missing prompt surface, missing session, throw, success — records a
+- [x] Every one-off path — missing prompt surface, missing session, throw, success — records a
       history entry.
-- [ ] `startedAt` is the dispatch instant, not the completion instant.
-- [ ] Tests assert each, including a hand-edited oversized stored record.
+- [x] `startedAt` is the dispatch instant, not the completion instant.
+- [x] Tests assert each, including a hand-edited oversized stored record.
 
 ## Notes
 
 Filed by the coordinator from the T3–T6 lead-architect review.
+
+### Shape chosen, and why
+
+Ephemeral history is **namespaced and bounded by a capped index**, which is option 2 with the
+bounding made real:
+
+| kind   | key                        | retained |
+| ------ | -------------------------- | -------- |
+| job    | `scheduled-tasks/history/<jobId>` (unchanged) | that job's ring, ≤ 50 |
+| one-off | `scheduled-tasks/history/oneoff/<id>` | index-capped at `MAX_EPHEMERAL_HISTORY_KEYS` (50) |
+| loop   | `scheduled-tasks/history/loop/<id>`   | same index |
+
+Namespacing alone fixes the collision but not the accumulation, so the index
+(`scheduled-tasks/history/ephemeral`, an array of `{ key, at }`) is what bounds the key count:
+it works with `get`/`set` alone, unlike `scan`, which is feature-detected and often absent.
+Re-recording a key on each write (rather than appending) keeps an active loop's history at the
+young end, so a loop that keeps posting is never evicted in favour of a one-off that ran once.
+
+`storage.remove` is now reached three ways: the eviction, the pre-fix legacy migration below, and
+the loop-set teardown it always had.
 
 ### 2026-10-02 @ses_f037cc89cffeOo07JPEJShqzJw
 **Live reproduction on the real host** (v2.0.22, deployed build, run from a session), which confirms B4 exactly as the reviewer predicted:
@@ -82,3 +102,72 @@ schedules_history({ id: "oneoff_sn7ndgh4murd4ea5" })
 ```
 
 So the history was written under the one-off's own id while `schedules_history` resolves only `state.jobs`. This is now confirmed against a real host, not only under a fake `ctx`, and it makes two published statements false: the README ("a completed one-off survives only in `schedules_history`") and the `cancel` error message ("check schedules_history"). It also confirms `storage.remove` is never called, so every one-off leaves a permanent key.
+
+### How `schedules_history` resolves an ephemeral id
+
+`resolveHistoryOwner` tries, in order, and answers `undefined` only when all four miss:
+
+1. `state.jobs` → `kind: "job"`, session from the job (unchanged behaviour, in-memory).
+2. `state.oneOffs` → a **pending** one-off: `kind: "oneoff"`, `runs: []`.
+3. `state.dispatching` → a one-off **running right now**: `kind: "oneoff"`, `runs: []`. This set
+   is new; without it the id of an in-flight one-off was in no list at all (consumed from
+   `oneOffs` before dispatch, recorded only at the end), so the same "no job with id" answer
+   came back for a run that was plainly happening.
+4. `state.loops`, per session → `kind: "loop"` with the owning session.
+5. **Storage**, namespaced: `history/oneoff/<id>` then `history/loop/<id>`. This is the case the
+   bug lived in — a finished one-off is in no live list, so this is where its record is read.
+6. A pre-fix flat key, **only** for an id shaped like a generated one (`oneoff_*` / `loop_*`):
+   the runs are copied to `history/oneoff/<id>` and the flat key is deleted. A host on 2.0.22
+   already holds keys in that shape, so the migration both makes them readable for the first time
+   and reclaims the leak rather than inheriting it.
+
+Output gained `kind` (`job` | `oneoff` | `loop`); `session` is now omitted when there is none, and
+the `ids` list on a miss names jobs **and** pending one-offs, which are the ids a caller can
+actually name. The error text `no job with id "…"` is unchanged, so no existing assertion had to
+move — it is still literally true.
+
+`cancel`'s message needed no edit: "check schedules_history" became true by making the lookup
+work, which is the honest way to fix a message that was wrong.
+
+### Mutation results
+
+Each mutation applied, the suite run, the file restored (`/tmp/opencode/mutate.py`).
+
+| # | mutation | caught by |
+| - | -------- | --------- |
+| M1 | ephemeral lookup removed from the reader | 9 tests (the live repro, the loop read, the migration, all four one-off recording paths, `startedAt`) |
+| M2 | `storage.remove` → `storage.set(undefined)` in the eviction | the eviction test, and the no-`remove`-host test |
+| M3 | read-side cardinality + string caps dropped from `loadHistory` | the oversized-record test |
+| M4 | `startedAt` moved back to completion | the dispatch-instant test |
+| M5 | the missing-`session.create` record removed | that one recording test |
+| M6 | `MAX_LOOP_CAP` read cap removed from `normalizeLoops` | the loop-cap test |
+| M7 | `MAX_ONEOFF_CAP` read cap removed from `loadOneOffs` | the one-off-cap test |
+| M8 | the namespace guard removed from the eviction loop | **nothing** — dead code, see below |
+| M8b | the namespace filter removed from the index reader | the eviction test |
+| M9 | legacy key copied but not reclaimed | the migration test |
+| M10 | the `dispatching` marker removed | the dispatch-instant test (in-flight assertion) |
+| M11 | the `MAX_LOOP_CAP` write-side slice removed from `saveLoops` | **nothing** — dead code, see below |
+| M12 | ephemeral namespacing collapsed back to flat | 6 tests |
+| M13 | write-side string clip removed from `pushHistory` | the host-session-id test |
+
+**Two mutations caught nothing, and both were deleted rather than documented as "defence".**
+
+- M8: the eviction re-checked `isEphemeralHistoryKey` before deleting, but `isEphemeralHistoryKeyRecord`
+  had already refused every non-ephemeral entry on the way in, so the check was unreachable. It is
+  gone; the rule now lives in the filter, which M8b proves is load-bearing.
+- M11: a second `MAX_LOOP_CAP` slice in `saveLoops` was unreachable while the read cap held (every
+  array reaching it came from `normalizeLoops` or from `schedules_start_loop`). It is gone, and the
+  ceiling is enforced at the one place that can be reached.
+
+Both were my own additions in this change, so this is the same class of mistake the suite was
+written to catch, caught by the same method.
+
+### Not tested black-box, and why
+
+- `isEphemeralId` gating the legacy migration. It only decides whether a *flat* key whose id is not
+  ephemeral-shaped may be adopted into the one-off namespace. A test would have to assert that a
+  deleted job's flat history is *not* adopted — i.e. that it stays unreadable. That is arguably the
+  worse behaviour, so pinning it would enshrine a choice rather than a requirement.
+- `storage.remove` failing during eviction (falls back to writing an empty record). The fallback is
+  `storageRemove`, shared with the loop teardown, which is covered; its failure branch is one
+  `logOnce`.
