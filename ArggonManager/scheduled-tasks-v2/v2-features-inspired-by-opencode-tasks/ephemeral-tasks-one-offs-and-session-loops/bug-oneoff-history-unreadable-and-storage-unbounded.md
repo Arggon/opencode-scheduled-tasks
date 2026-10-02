@@ -170,3 +170,43 @@ written to catch, caught by the same method.
 - `storage.remove` failing during eviction (falls back to writing an empty record). The fallback is
   `storageRemove`, shared with the loop teardown, which is covered; its failure branch is one
   `logOnce`.
+
+### 2026-10-02 @ses_f037cc89cffeOo07JPEJShqzJw
+**Live after-fix verification on the real host** (OpenCode v2.0.22, redeployed byte-identical, `opencode reload`, run from this session). This is the exact call that failed before.
+
+Before — one-off created, tick fired it, log recorded:
+```
+19:35:37.103  running one-off oneoff_sn7ndgh4murd4ea5 (…)
+schedules_history({ id: "oneoff_sn7ndgh4murd4ea5" })
+→ { error: 'no job with id "oneoff_sn7ndgh4murd4ea5"', ids: ["dogfood-smoke"] }
+```
+
+After — same sequence, new id:
+```
+20:17:19.430  running one-off oneoff_7fsc77yqmurem030 (due …, runTimeout 15m)
+20:17:18.410  lease armed on creation, and released once the work drained
+
+schedules_history({ id: "oneoff_7fsc77yqmurem030" })
+→ { id: "oneoff_7fsc77yqmurem030",
+     kind: "oneoff",
+     runs: [{ dueAt: "2026-10-02T20:17:08.108Z",
+              startedAt: "2026-10-02T20:17:18.410Z",
+              outcome: "ok",
+              model: "session default",
+              sessionID: "ses_f01bc65b5ffetv2739kgwImUlJ" }],
+     limit: 10 }
+```
+
+Three things this confirms on a real host, not just under a fake `ctx`:
+
+1. **B4 is fixed** — a finished one-off is readable through `schedules_history`, so the README
+   ("a completed one-off survives only in `schedules_history`") and the `cancel` message are now
+   true. `cancel` needed no text change; it became true by fixing the lookup.
+2. **`startedAt` is the dispatch instant**, not completion — `startedAt` (20:17:18.410) precedes
+   the `running` log line (20:17:19.430) by about a second, which is the dispatch, and the run
+   finished after that.
+3. **The arming/lease-handing-back fix still holds** with the new history path: `leaseHeld` went
+   `false → true` on `schedules_schedule` and back to `false` once the one-off drained.
+
+The item was already closed as `done` before this ran; this comment is the after-fix evidence, not a
+reopen.
