@@ -166,3 +166,7 @@ the heartbeat. The lease that really did expire mid-run was the per-job `record.
 
 Bounded paths: `runJob`, `runOneOff` (by `task.runTimeoutMs`) and `postLoop` (by the default run
 bound — a loop has no `runTimeout` field and `every` is a cadence, not a bound).
+
+### handoff 2026-10-02 @ses_f024cc54dffeq7BUIFZMa6JqAU (session: ses_f024cc54dffeq7BUIFZMa6JqAU) — next: Coordinator: review commit 9386375, then let T7 close acceptance box 5 (README) using the two corrections spelled out on the item.
+- branch: fix/bug-run-timeout-never-enforced
+- open questions: Box 7 left unticked: the lease-renewal half is not black-box observable (M4/M5/M6/M7 all green). Also: `schedules_run` still awaits `ctx.session.prompt` unbounded and never enters `inFlight` — separa…
