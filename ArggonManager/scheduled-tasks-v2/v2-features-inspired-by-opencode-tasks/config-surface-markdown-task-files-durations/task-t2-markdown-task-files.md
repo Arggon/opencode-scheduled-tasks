@@ -27,14 +27,14 @@ See plan 002 §T2 and spec 002 § "Config surface".
 
 ## Acceptance
 
-- [ ] A markdown job loads and fires; the body is the prompt with frontmatter stripped and
+- [x] A markdown job loads and fires; the body is the prompt with frontmatter stripped and
       surrounding blank lines trimmed.
-- [ ] A duplicate id across surfaces yields exactly one job plus one **reported** shadow.
-- [ ] Bad YAML, a missing schedule, a bad id or a missing body refuses **only** that job, with a
+- [x] A duplicate id across surfaces yields exactly one job plus one **reported** shadow.
+- [x] Bad YAML, a missing schedule, a bad id or a missing body refuses **only** that job, with a
       named reason, through the same validation path as JSON.
-- [ ] With no `.opencode/tasks/` directory the plugin imports **nothing** new and behaves
+- [x] With no `.opencode/tasks/` directory the plugin imports **nothing** new and behaves
       identically to v1 (asserted by a load-time test — invariant 4).
-- [ ] Frontmatter is treated as untrusted: field sizes and collection cardinality bounded, and
+- [x] Frontmatter is treated as untrusted: field sizes and collection cardinality bounded, and
       no frontmatter value interpolated into a prompt.
 
 
