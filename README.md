@@ -359,9 +359,16 @@ including the search that should have found this project first.
 
 ## Status
 
-v1 shipped: declarative jobs, tick loop, per-job sessions, cost-bounded misfire handling,
-cross-process single-writer lease, DST-correct cron. v2 in progress — markdown task files,
-per-job permissions, one-off tasks and session loops. ADRs and specs live under
+**v1 shipped:** declarative jobs, tick loop, per-job sessions, cost-bounded misfire handling,
+cross-process single-writer lease, DST-correct cron, `runTimeout` durations.
+
+**Shipped in v2:** per-job `permissions`, `session: reuse|fresh`, bounded run history, one-off
+tasks, session loops.
+
+**Not yet:** markdown task files (`.opencode/tasks/<id>.md`) — jobs are still defined only in
+`.opencode/schedules.json`.
+
+ADRs and specs live under
 `ArggonManager/docs/`.
 
 Known limitation: **jobs only run while an OpenCode server is up.** For a job that must fire
