@@ -1,6 +1,6 @@
 ---
 type: story
-status: todo
+status: done
 id: run-control-permissions-session-mode-history
 title: "Run control: permissions, session mode, history"
 parent: v2-features-inspired-by-opencode-tasks

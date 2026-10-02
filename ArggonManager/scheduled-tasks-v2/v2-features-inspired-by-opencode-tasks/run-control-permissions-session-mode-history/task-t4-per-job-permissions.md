@@ -1,14 +1,14 @@
 ---
 type: task
-status: in_progress
+status: done
 id: task-t4-per-job-permissions
 title: Per-job permission rules
 assignee: arggon
+branch: feat/task-t4-per-job-permissions
 parent: run-control-permissions-session-mode-history
 labels: []
 created: "2026-10-02"
 updated: "2026-10-02"
-claimed_at: "2026-10-02T15:15:20.711Z"
 depends_on: [task-t3-session-mode-and-run-history]
 ---
 <!--
@@ -30,14 +30,14 @@ See plan 002 §T4 and spec 002 § "Permissions".
 
 ## Acceptance
 
-- [ ] Declared rules are applied before dispatch, in the tested order alongside `agent`/`model`.
-- [ ] A job with **no** `permissions` leaves the session rules untouched — no implicit tightening.
-- [ ] An `"ask"` in a scheduled context is reported as a deny in the run record and the
+- [x] Declared rules are applied before dispatch, in the tested order alongside `agent`/`model`.
+- [x] A job with **no** `permissions` leaves the session rules untouched — no implicit tightening.
+- [x] An `"ask"` in a scheduled context is reported as a deny in the run record and the
       `running` log line, never left to time out.
-- [ ] A host without `ctx.permission.rules` degrades to session defaults and logs once.
-- [ ] README documents last-match-wins ordering with a correct and an incorrect example, and
+- [x] A host without `ctx.permission.rules` degrades to session defaults and logs once.
+- [x] README documents last-match-wins ordering with a correct and an incorrect example, and
       names `external_directory` as the quiet default that fails.
-- [ ] An invalid permission shape refuses the job with a named reason.
+- [x] An invalid permission shape refuses the job with a named reason.
 
 
 
