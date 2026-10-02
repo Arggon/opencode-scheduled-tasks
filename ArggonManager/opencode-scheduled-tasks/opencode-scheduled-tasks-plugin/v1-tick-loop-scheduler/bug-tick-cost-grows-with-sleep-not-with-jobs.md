@@ -8,6 +8,7 @@ labels: []
 priority: p1
 created: "2026-10-02"
 updated: "2026-10-02"
+depends_on: [bug-backfill-collapses-to-one-run-and-never-reports-truncation]
 ---
 <!--
   Placement (v0): ArggonManager/opencode-scheduled-tasks/opencode-scheduled-tasks-plugin/v1-tick-loop-scheduler/bug-tick-cost-grows-with-sleep-not-with-jobs.md
