@@ -1,12 +1,14 @@
 ---
 type: task
-status: todo
+status: in_progress
 id: task-t5-one-off-tasks
 title: One-off tasks
+assignee: arggon
 parent: ephemeral-tasks-one-offs-and-session-loops
 labels: []
 created: "2026-10-02"
 updated: "2026-10-02"
+claimed_at: "2026-10-02T15:17:56.705Z"
 depends_on: [task-t3-session-mode-and-run-history]
 ---
 <!--
