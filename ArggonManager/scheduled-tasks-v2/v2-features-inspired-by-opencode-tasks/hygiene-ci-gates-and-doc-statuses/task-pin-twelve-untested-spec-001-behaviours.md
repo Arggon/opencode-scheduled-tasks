@@ -8,6 +8,7 @@ labels: []
 priority: p2
 created: "2026-10-02"
 updated: "2026-10-02"
+depends_on: [bug-log-lines-before-first-lease-never-reach-the-file]
 ---
 <!--
   Placement (v0): ArggonManager/scheduled-tasks-v2/v2-features-inspired-by-opencode-tasks/hygiene-ci-gates-and-doc-statuses/task-pin-twelve-untested-spec-001-behaviours.md
