@@ -155,3 +155,7 @@ observable side effect, so no black-box test can distinguish it from a constant.
 Two harness knobs were added for this and are worth knowing about: `slowWrites` (settle a loop-record write
 on the next macrotask, so a finished post no longer looks in flight) and `failWrites`/`storageRemove: false`
 (a host with no `remove`, and a host whose writes fail). Every wait is followed by a real assertion.
+
+### handoff 2026-10-02 @ses_f0273ba47ffe8nSj6fb5n88RMi (session: ses_f0273ba47ffe8nSj6fb5n88RMi) — next: Code-review the branch, then open a PR referencing the item id; 191 tests green, all six boxes ticked with notes.
+- branch: fix/bug-loop-stop-does-not-persist-and-concurrency-bypass
+- open questions: Drain order (loops before one-offs) means a one-off can be skipped for a loop at cap 1 - policy call?; runTimeoutMs is stored but unenforced for one-offs too; loop history shares the history/ key spa…
