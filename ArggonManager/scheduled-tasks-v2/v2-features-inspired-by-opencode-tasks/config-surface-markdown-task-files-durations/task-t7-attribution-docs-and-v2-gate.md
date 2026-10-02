@@ -7,6 +7,7 @@ parent: config-surface-markdown-task-files-durations
 labels: []
 created: "2026-10-02"
 updated: "2026-10-02"
+depends_on: [task-t2-markdown-task-files, task-t4-per-job-permissions, task-t6-session-loops]
 ---
 <!--
   Placement (v0): ArggonManager/scheduled-tasks-v2/v2-features-inspired-by-opencode-tasks/config-surface-markdown-task-files-durations/task-t7-attribution-docs-and-v2-gate.md
