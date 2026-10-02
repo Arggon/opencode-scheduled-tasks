@@ -1,12 +1,14 @@
 ---
 type: task
-status: todo
+status: in_progress
 id: task-t1-durations-and-format-tool
 title: Duration parsing and the schedules_format tool
+assignee: arggon
 parent: config-surface-markdown-task-files-durations
 labels: []
 created: "2026-10-02"
 updated: "2026-10-02"
+claimed_at: "2026-10-02T14:33:53.407Z"
 ---
 <!--
   Placement (v0): ArggonManager/scheduled-tasks-v2/v2-features-inspired-by-opencode-tasks/config-surface-markdown-task-files-durations/task-t1-durations-and-format-tool.md
