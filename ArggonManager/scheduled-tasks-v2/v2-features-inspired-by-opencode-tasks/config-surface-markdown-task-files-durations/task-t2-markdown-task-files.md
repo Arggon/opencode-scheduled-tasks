@@ -139,3 +139,7 @@ exactly these two outcomes, so they will pass wherever `yaml` is installed.
   already has `yaml`). `JOB_FORMAT_REFERENCE` (the `schedules_format` output, written in T1) already
   names both surfaces and the precedence rule and was left untouched; it may now deserve a short
   worked example plus the degradation note. README was not edited, per instructions.
+
+### handoff 2026-10-02 @arggon (session: ses_f02bf259cffe6cQ2eSBhSu63tJ) — next: Coordinator: review commit c7a5ae2 (5 files: src/index.ts, test/index.test.ts, package.json, package-lock.json, item checklist), then merge and mark done. Nothing left to implement.
+- branch: feat/task-t2-markdown-task-files
+- open questions: Document `yaml` as an OPTIONAL dependency (T7/README): vendored `cp src/index.ts` gets it only if the user's project already has it. Was: should a stray .md with no frontmatter (README.md) be refused…
