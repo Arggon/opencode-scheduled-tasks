@@ -88,3 +88,50 @@ that one is a fairness wart.
 Note for whoever picks this up: `boundRun` already exists and already clears its timer on every
 path, so the timeout half is mostly reuse. The genuinely new work is cap participation and the
 lease decision.
+
+### 2026-10-02 @ses_f0195142fffea0T5V01mum916y
+## Evidence — all gates green on `fix/bug-schedules-run-not-bounded-capped-or-leased`
+
+```
+npx tsc --noEmit            # clean (no output)
+npx vitest run              # 233 passed (233)   [was 221; +12 new, 1 existing rewritten]
+npx tsx harness/smoke.ts    # PASS
+node .../dist/cli.js validate     # ok (0 warnings, convention v5)
+node .../dist/cli.js spec analyze # clean (2 specs scanned)
+```
+Suite run 6x end-to-end: 233/233 every time (see the flakiness note below).
+
+### Existing test rewritten, not deleted
+`records a run's outcome, model and session, and survives a storage round-trip` asserted
+`expect(keys).toEqual([])` with the comment "No scheduled run happened, so nothing should be
+stored yet" — after awaiting a `schedules_run` call. It pinned the defect (box 3). It now asserts
+the record is written, well-formed, and stamped at dispatch.
+
+### Flakiness found and fixed in my own test
+`holds its slot for the whole manual run` failed ~1 run in 8 in the full suite. Cause: the manual
+job's `runTimeout: "1m"` expired *inside* the `advanceUntil` window, so the test was reporting the
+bound, not the cap. Fixed by giving that job a 10m bound (the bound has its own tests), with the
+reason in a comment. Then 10/10 on the block and 6/6 on the suite.
+
+### Mutation checks — each mutation, and the named test that failed
+| Mutation | Caught by |
+|---|---|
+| M1 bound dropped (await `prompt` directly, the pre-fix shape) | 4 tests fail **by timeout, not by hanging**: "bounds a hung manual trigger…", "says it abandoned the run…", "gives the slot back on every path…", "reports the outcome of every manual run…" |
+| M2 cap check dropped (`if (false && …)`) | "refuses a manual trigger while the shared budget is spent, and says so in the result" |
+| M3 `inFlight` registration dropped | "bounds a hung manual trigger…", "holds its slot for the whole manual run…", "gives the slot back on every path…" |
+| M4 writer-lease gate dropped | "refuses a manual trigger while another instance holds the writer lease" |
+| M6 lease taken but never released | "drops the run lease when the trigger ends, so the job is not suppressed afterwards" |
+| M7 timeout recorded as `failed` | "bounds a hung manual trigger…", "says it abandoned the run…", "reports the outcome of every manual run…" |
+| M8 `asksAsDeny` dropped from a manual record | "reports an ask downgraded on an on-demand trigger…" (in the dependency item's block — the record assertion I added there) |
+
+M1 was written and confirmed to fail by timeout before the fix, as required.
+
+### M5: a real gap, reported rather than papered over
+`openRunLease` not called at all in the tool path is caught by **nothing**. It is provably
+indistinguishable from M3 through the plugin's surfaces: `isRunOutstanding(record, inFlight.has(id),
+now)` is the disjunction of the two signals, and `inFlight` alone keeps the job outstanding for the
+whole run — the same redundancy the existing run-timeout suite documents for the scheduled path. So
+the *scheduler-observable* lease behaviour is pinned (M6 catches a leaked lease; the
+`openRunLease` unit test pins take/renew/release/idempotence), but "the manual path calls
+`openRunLease`" is a code fact, not a behavioural one. Flagging it rather than adding a test that
+would have to manufacture an unreachable state to go red.
