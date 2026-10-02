@@ -7,6 +7,7 @@ parent: ephemeral-tasks-one-offs-and-session-loops
 labels: []
 created: "2026-10-02"
 updated: "2026-10-02"
+depends_on: [bug-loop-stop-does-not-persist-and-concurrency-bypass]
 ---
 <!--
   Placement (v0): ArggonManager/scheduled-tasks-v2/v2-features-inspired-by-opencode-tasks/ephemeral-tasks-one-offs-and-session-loops/bug-oneoff-history-unreadable-and-storage-unbounded.md
@@ -21,8 +22,9 @@ updated: "2026-10-02"
 
 <!-- What went wrong / how to reproduce. -->
 
-## Acceptance
 
-<!-- The real acceptance criteria; tick each box when met. -->
 
 ## Notes
+
+Filed by the coordinator from the T3–T6 lead-architect review; the reviewer's
+verdict and probe evidence are in this body.
