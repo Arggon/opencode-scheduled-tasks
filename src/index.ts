@@ -75,6 +75,56 @@ const STORAGE_PREFIX = "scheduled-tasks/"
 /** Version of the persisted run-state record. An unknown version is re-initialized. */
 export const STATE_VERSION = 1
 
+/**
+ * Job-file reference handed to an agent by `schedules_format`.
+ *
+ * Bounded on purpose: this text is model context, and the Code Mode catalog is charged per
+ * request. It states both config surfaces, the precedence rule, and the fields that carry a
+ * cost or a permission consequence — the three things an agent gets wrong otherwise.
+ */
+export const JOB_FORMAT_REFERENCE = `## Scheduled jobs (.opencode/schedules.json or .opencode/tasks/<id>.md)
+
+Two surfaces, merged by job id. **A markdown file wins over a JSON job with the same id.**
+Both validate the same way: one bad job is refused by name; the rest still load.
+
+### Fields
+
+| Field | Required | Notes |
+| --- | --- | --- |
+| \`id\` | yes | \`^[a-z0-9][a-z0-9._-]*$\`; the markdown filename stem. |
+| \`schedule\` | yes | 5-field cron (\`min hour dom month dow\`) or \`@hourly\`/\`@daily\`/\`@weekly\`/\`@monthly\`. |
+| \`prompt\` | yes | JSON: a string. Markdown: the body after the frontmatter. |
+| \`timezone\` | no | IANA zone. Default: the server's local zone. |
+| \`model\` | no | \`provider/model\`. **Always set it.** |
+| \`agent\` | no | Agent switched to before dispatch. |
+| \`enabled\` | no | \`false\` parks a job without deleting it. |
+| \`misfire\` | no | \`skip\` (default, one run per backlog) or \`backfill\`. |
+| \`maxCatchUp\` | no | Replay ceiling for \`backfill\`. Default 5. |
+| \`runTimeout\` | no | Duration: \`30s\`, \`5m\`, \`1h30m\`, \`1d\`. A bare number means seconds. |
+| \`runTimeoutMs\` | no | The millisecond form; kept for compatibility. |
+
+### Always name a model
+
+A job with no \`model\` inherits the session default, which for unattended recurring work is
+often a **paid** model. The resolved model is logged on every run, so an inherited one is
+visible — but naming it is what you meant.
+
+### Costs money
+
+Every run is a real model request. \`misfire: skip\` means a backlog collapses to one run;
+runs are never retried within an occurrence. Trigger a re-run with \`schedules_run\`.
+
+### Unattended permission rules (v2)
+
+Scheduled runs have nobody to answer an \`"ask"\`: treat it as a deny. Declare \`permissions\`
+in the host's own schema if a job needs to be constrained, and remember that **the last
+matching rule wins** — catch-all first, specifics after.
+
+### Recurring jobs are file-only
+
+Only file-defined jobs recur. One-offs and in-session loops are runtime; see \`schedules_schedule\`
+and \`schedules_start_loop\`.`
+
 /** Log prefix; one bounded line per fire, skip or error. */
 const LOG_PREFIX = "scheduled-tasks:"
 
@@ -567,6 +617,75 @@ function boundedInt(value: unknown, fallback: number, min: number, max: number):
   return Math.min(max, Math.max(min, Math.trunc(value)))
 }
 
+/** Duration units, in milliseconds. `w` is deliberately absent: no job needs weeks. */
+const DURATION_UNITS: Record<string, number> = {
+  ms: 1,
+  s: 1000,
+  m: MINUTE_MS,
+  h: 60 * MINUTE_MS,
+  d: 24 * 60 * MINUTE_MS,
+}
+
+const DURATION_TOKEN = /(\d+(?:\.\d+)?)\s*(ms|s|m|h|d)/gy
+
+/**
+ * Parse a duration into milliseconds.
+ *
+ * Accepts a bare number as **seconds** (`30` → 30s, the convention taken from
+ * `opencode-tasks` — see ADR 0007), a single `<n><unit>` term, or compound terms
+ * (`1h30m`). Units are `ms`, `s`, `m`, `h`, `d`.
+ *
+ * Returns `{ ms }` on success, `{ reason }` for a malformed, non-positive or
+ * non-finite value, and `undefined` when the field is absent — so an absent
+ * duration can never be confused with an invalid one.
+ */
+export function parseDuration(value: unknown): { ms: number } | { reason: string } | undefined {
+  if (value === undefined || value === null) return undefined
+
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) return { reason: "duration must be a finite number of seconds" }
+    if (value <= 0) return { reason: `duration must be greater than zero, got ${value}` }
+    return { ms: Math.round(value * 1000) }
+  }
+
+  if (typeof value !== "string") {
+    return { reason: "duration must be a number of seconds or a string like \"30m\"" }
+  }
+
+  const text = value.trim().toLowerCase()
+  if (text === "") return { reason: "duration is empty" }
+  // A bare number in string form follows the same rule as a bare number.
+  if (/^\d+(?:\.\d+)?$/.test(text)) return parseDuration(Number(text))
+
+  DURATION_TOKEN.lastIndex = 0
+  let total = 0
+  let matched = 0
+  let token: RegExpExecArray | null
+  while ((token = DURATION_TOKEN.exec(text)) !== null) {
+    const amount = Number(token[1])
+    const unit = DURATION_UNITS[token[2]!]
+    if (unit === undefined) return { reason: `unknown duration unit "${token[2]}"` }
+    total += amount * unit
+    matched = DURATION_TOKEN.lastIndex
+  }
+
+  // Anything left over means the tail was not a term we understand: "5m foo" and
+  // "5x" must both fail loudly rather than silently resolving to 5 minutes.
+  const compact = text.replace(/\s+/g, "")
+  if (matched !== compact.length || matched === 0) {
+    // A number followed by letters is a bad unit, not random text: say which one.
+    const badUnit = /(\d+(?:\.\d+)?)([a-z]+)$/.exec(compact)
+    if (badUnit !== null && DURATION_UNITS[badUnit[2]!] === undefined) {
+      return { reason: `unknown duration unit "${badUnit[2]}"` }
+    }
+    return { reason: `cannot parse duration "${value}"` }
+  }
+  if (!Number.isFinite(total) || total <= 0) {
+    return { reason: `duration must be greater than zero, got "${value}"` }
+  }
+  return { ms: Math.round(total) }
+}
+
 /**
  * Validate one raw job entry. Returns either a `JobDefinition` or the reason it is
  * refused; a refused job never silently disappears (spec 001 § "Loading and validation").
@@ -606,6 +725,16 @@ export function validateJob(raw: unknown, index: number): { job: JobDefinition }
 
   const misfire = record.misfire === "backfill" ? "backfill" : "skip"
 
+  // `runTimeout` is a duration string; `runTimeoutMs` is the v1 millisecond field and is
+  // kept working unchanged. When both are present the explicit `runTimeout` wins.
+  const duration = parseDuration(record.runTimeout)
+  if (duration !== undefined && "reason" in duration) return { reason: `job "${id}": ${duration.reason}` }
+  const runTimeoutMs =
+    duration !== undefined && "ms" in duration
+      ? duration.ms
+      : boundedInt(record.runTimeoutMs, DEFAULT_RUN_TIMEOUT_MS, MINUTE_MS, 24 * 60 * MINUTE_MS)
+  const clampedRunTimeoutMs = boundedInt(runTimeoutMs, DEFAULT_RUN_TIMEOUT_MS, MINUTE_MS, 24 * 60 * MINUTE_MS)
+
   const model = parseModelRef(record.model)
   if (model !== undefined && "reason" in model) return { reason: `job "${id}": ${model.reason}` }
 
@@ -620,7 +749,7 @@ export function validateJob(raw: unknown, index: number): { job: JobDefinition }
       enabled: record.enabled !== false,
       misfire,
       maxCatchUp: boundedInt(record.maxCatchUp, DEFAULT_MAX_CATCH_UP, 1, 50),
-      runTimeoutMs: boundedInt(record.runTimeoutMs, DEFAULT_RUN_TIMEOUT_MS, MINUTE_MS, 24 * 60 * MINUTE_MS),
+      runTimeoutMs: clampedRunTimeoutMs,
     },
   }
 }
@@ -1181,6 +1310,11 @@ const RUN_OUTPUT = {
   properties: { id: { type: "string" }, sessionID: { type: "string" }, admitted: { type: "string" } },
 }
 
+const FORMAT_OUTPUT = {
+  type: "object",
+  properties: { reference: { type: "string" } },
+}
+
 /** Read, validate and parse the job file; never throws. */
 function reloadJobs(ctx: PluginContext, directory: string, state: SchedulerState): void {
   let payload: unknown
@@ -1406,6 +1540,15 @@ function buildTools(ctx: PluginContext, state: SchedulerState, lease: Lease, tic
           tickMs,
         },
       }),
+    },
+    {
+      name: "format",
+      description:
+        "Return the job-file reference: both config surfaces, the precedence rule, and the fields that carry a cost or permission consequence.",
+      input: NO_INPUT,
+      output: FORMAT_OUTPUT,
+      options: { namespace: TOOL_NAMESPACE, codemode: true },
+      execute: async () => ({ output: { reference: JOB_FORMAT_REFERENCE } }),
     },
     {
       name: "run",

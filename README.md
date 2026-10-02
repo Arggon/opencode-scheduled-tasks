@@ -81,7 +81,8 @@ plugin, logs `no enabled jobs`, arms no timer, and takes no writer lease.
 | `enabled` | `true` | Set `false` to park a job without deleting it. |
 | `misfire` | `"skip"` | `skip` collapses a backlog to one run; `backfill` replays up to `maxCatchUp`. |
 | `maxCatchUp` | `5` | Replay ceiling for `backfill`. |
-| `runTimeoutMs` | `900000` | Per-run bound; on expiry the session is interrupted. |
+| `runTimeout` | `15m` | Duration: `30s`, `5m`, `2h`, `1h30m`, `1d`. A bare number means seconds (see Acknowledgements). |
+| `runTimeoutMs` | — | The millisecond form, kept for compatibility; wins only when `runTimeout` is absent. |
 
 Supported cron syntax: `*`, lists (`1,15`), ranges (`9-17`), steps (`*/15`, `9-17/4`),
 month names (`JAN-mar`) and day names (`sun`); `7` is accepted as Sunday. Day-of-month and
@@ -95,6 +96,9 @@ named reason rather than becoming a job that silently never fires.
 
 - **`schedules_list`** — pure read. Per job: schedule, timezone, `nextRun`, `lastRun`,
   `lastStatus`, `lastError`, plus whether another instance holds the lease.
+- **`schedules_format`** — return the job-file reference: both config surfaces, the precedence
+  rule, and the fields that carry a cost or a permission consequence. Read it before
+  authoring a job rather than guessing.
 - **`schedules_run`** — trigger one job now, obeying the same concurrency, timeout and lease
   rules. Returns the admitted inbox id.
 
@@ -124,7 +128,7 @@ Every run is a real model request, so the scheduler is deliberately conservative
   no free slot is **skipped and recorded**, never queued.
 - A failed run is **not** retried within its occurrence. Trigger a re-run with
   `schedules_run`.
-- `runTimeoutMs` bounds every run, which is also what makes a job safe when its prompt
+- `runTimeout` bounds every run, which is also what makes a job safe when its prompt
   triggers a permission request nobody will ever answer.
 
 ## Observability
@@ -188,6 +192,31 @@ npx tsx harness/smoke.ts   # real-clock end-to-end: admits an actual scheduled p
 The harness matters: it is what caught the two bugs unit tests with an injected clock could
 not — a never-run job whose cursor stayed unarmed and so never came due, and a cadence floor
 that silently doubled the default interval.
+
+## Acknowledgements
+
+This plugin was designed after an investigation concluded that OpenCode V2 ships no
+scheduler. That was true of OpenCode core and **wrong about the ecosystem**:
+[`jdormit/opencode-tasks`](https://github.com/jdormit/opencode-tasks) (MIT, Jeremy
+Dormitzer) had been solving the same problem since March 2026, and several of its ideas are
+better than ours.
+
+Ideas adopted from it, and credited where they appear:
+
+| Idea | Where it lives here |
+| --- | --- |
+| Duration strings with a bare number meaning seconds | the `runTimeout` field |
+| Per-task permission rules, and the unattended-`ask` warnings | ADR 0005, spec 002 |
+| One-off tasks and in-session loops | ADR 0006, spec 002 |
+| Opt-in session reuse rather than always reusing | spec 002 § Session mode |
+| Per-task agent/model selection | job fields, spec 001 |
+
+Where we deliberately diverge, the ADR says so and says why: we keep the JSON array
+alongside markdown rather than replacing it (ADR 0004), and we stay in-process rather than
+shipping an OS daemon (ADR 0001). The implementations are ours and differ in engine,
+storage and API surface. See
+[ADR 0007](ArggonManager/docs/adr/0007-attribution-and-lineage.md) for the full account,
+including the search that should have found this project first.
 
 ## Design
 

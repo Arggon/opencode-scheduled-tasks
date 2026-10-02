@@ -12,8 +12,22 @@ import { join } from "node:path"
 
 import plugin, { DATA_DIR_ENV } from "../src/index.ts"
 
-const WAIT_MS = Number(process.env.SMOKE_WAIT_MS ?? 30_000)
 const TICK_MS = Number(process.env.SMOKE_TICK_MS ?? 5_000)
+
+/**
+ * How long to wait: to the next minute boundary, plus one tick, plus slack.
+ *
+ * A fixed wait made this harness flaky — the job only becomes due at a minute boundary, so
+ * a 25s window passed and a 30s window failed purely by where in the minute it started.
+ * Deriving the window from the clock makes it deterministic.
+ */
+function waitForFirstOccurrence(): number {
+  const toNextMinute = 60_000 - (Date.now() % 60_000)
+  const override = Number(process.env.SMOKE_WAIT_MS)
+  return Number.isFinite(override) && override > 0 ? override : toNextMinute + TICK_MS + 5_000
+}
+
+const WAIT_MS = waitForFirstOccurrence()
 const dir = mkdtempSync(join(tmpdir(), "st-smoke-"))
 mkdirSync(join(dir, ".opencode"), { recursive: true })
 process.env[DATA_DIR_ENV] = join(dir, "state")

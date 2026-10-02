@@ -17,6 +17,7 @@ import plugin, {
   nextOccurrence,
   normalizeState,
   parseCron,
+  parseDuration,
   parseModelRef,
   resolveDue,
   validateJob,
@@ -551,14 +552,14 @@ describe("plugin setup — context wiring and failure isolation", () => {
     writeFileSync(join(dir, ".opencode", "schedules.json"), JSON.stringify({ version: 1, jobs }))
   }
 
-  it("registers both tools and returns an idempotent cleanup", async () => {
+  it("registers every tool and returns an idempotent cleanup", async () => {
     writeJobs([{ id: "nightly", schedule: "@daily", prompt: "review" }])
     const { ctx, calls } = fakeCtx()
     const cleanup = await setupWithCleanup(ctx)
 
     expect(calls).toHaveLength(1)
     const names = calls[0]!.added.map((tool) => tool.name)
-    expect(names).toEqual(["list", "run"])
+    expect(names).toEqual(["list", "format", "run"])
     for (const tool of calls[0]!.added) {
       expect((tool.options as Record<string, unknown>).namespace).toBe("schedules")
       expect((tool.options as Record<string, unknown>).codemode).toBe(true)
@@ -809,6 +810,112 @@ describe("model selection — a scheduled job should never silently inherit a pa
       ).output
       expect(result.jobs.find((j) => j.id === "explicit")!.model).toBe("opencode/space-bunny-free")
       expect(result.jobs.find((j) => j.id === "implicit")!.model).toBe("session default")
+    } finally {
+      ;(cleanup as () => void)?.()
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+})
+
+describe("parseDuration (T1)", () => {
+  it("accepts every unit and compound terms", () => {
+    expect(parseDuration("30s")).toEqual({ ms: 30_000 })
+    expect(parseDuration("5m")).toEqual({ ms: 5 * MINUTE_MS })
+    expect(parseDuration("2h")).toEqual({ ms: 2 * 60 * MINUTE_MS })
+    expect(parseDuration("1d")).toEqual({ ms: 24 * 60 * MINUTE_MS })
+    expect(parseDuration("1h30m")).toEqual({ ms: 90 * MINUTE_MS })
+    expect(parseDuration("1h30m15s")).toEqual({ ms: 90 * MINUTE_MS + 15_000 })
+    expect(parseDuration("250ms")).toEqual({ ms: 250 })
+  })
+
+  it("treats a bare number as seconds, the convention taken from opencode-tasks", () => {
+    expect(parseDuration(30)).toEqual({ ms: 30_000 })
+    expect(parseDuration(0.5)).toEqual({ ms: 500 })
+    expect(parseDuration("90")).toEqual({ ms: 90_000 })
+  })
+
+  it("is case- and space-insensitive", () => {
+    expect(parseDuration(" 1H30M ")).toEqual({ ms: 90 * MINUTE_MS })
+  })
+
+  it("returns undefined for an absent value, so absence is never an error", () => {
+    expect(parseDuration(undefined)).toBeUndefined()
+    expect(parseDuration(null)).toBeUndefined()
+  })
+
+  it("refuses malformed, zero, negative and non-finite values with a reason", () => {
+    for (const bad of ["", "   ", "abc", "5x", "5m foo", "m5", "-5m", "0s", 0, -1, Number.NaN, Infinity]) {
+      expect(parseDuration(bad), `expected ${String(bad)} to be refused`).toHaveProperty("reason")
+    }
+  })
+
+  it("does not silently accept a valid prefix of a malformed duration", () => {
+    // "5m foo" must not resolve to 5 minutes.
+    expect(parseDuration("5m foo")).toHaveProperty("reason")
+  })
+})
+
+describe("runTimeout vs runTimeoutMs (T1)", () => {
+  const wrap = (job: Record<string, unknown>): unknown => ({ version: 1, jobs: [job] })
+
+  it("accepts a duration string for runTimeout", () => {
+    const { jobs } = loadJobs(wrap({ id: "j", schedule: "@daily", prompt: "p", runTimeout: "30m" }))
+    expect(jobs[0]!.runTimeoutMs).toBe(30 * MINUTE_MS)
+  })
+
+  it("keeps runTimeoutMs working unchanged", () => {
+    const { jobs } = loadJobs(wrap({ id: "j", schedule: "@daily", prompt: "p", runTimeoutMs: 120_000 }))
+    expect(jobs[0]!.runTimeoutMs).toBe(2 * MINUTE_MS)
+  })
+
+  it("prefers an explicit runTimeout when both are present", () => {
+    const { jobs } = loadJobs(
+      wrap({ id: "j", schedule: "@daily", prompt: "p", runTimeout: "2h", runTimeoutMs: 1000 }),
+    )
+    expect(jobs[0]!.runTimeoutMs).toBe(2 * 60 * MINUTE_MS)
+  })
+
+  it("clamps to the v1 bounds, exactly as runTimeoutMs did", () => {
+    const { jobs } = loadJobs(wrap({ id: "j", schedule: "@daily", prompt: "p", runTimeout: "90d" }))
+    expect(jobs[0]!.runTimeoutMs).toBe(24 * 60 * MINUTE_MS)
+  })
+
+  it("refuses the whole job on an invalid duration, naming it", () => {
+    const { jobs, invalid } = loadJobs(wrap({ id: "j", schedule: "@daily", prompt: "p", runTimeout: "5x" }))
+    expect(jobs).toHaveLength(0)
+    expect(invalid[0]!.reason).toMatch(/job "j".*unknown duration unit/)
+  })
+})
+
+describe("schedules_format (T1)", () => {
+  it("returns a reference naming both surfaces, the precedence rule and the model field", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "st-fmt-"))
+    mkdirSync(join(dir, ".opencode"), { recursive: true })
+    writeFileSync(join(dir, ".opencode", "schedules.json"), JSON.stringify({ version: 1, jobs: [] }))
+    let added: Array<Record<string, unknown>> = []
+    const ctx = {
+      location: { directory: dir, project: { id: "fmt" } },
+      session: { create: async () => ({ id: "s" }), prompt: async () => ({ id: "i" }) },
+      tool: {
+        transform: async (cb: (e: { add?: (tool: unknown) => void }) => void) => {
+          cb({ add: (tool) => added.push(tool as Record<string, unknown>) })
+          return { dispose: () => {} }
+        },
+      },
+    }
+    const cleanup = await plugin.setup(ctx as never)
+    try {
+      const fmt = added.find((tool) => tool.name === "format")!
+      const out = await (fmt.execute as (i: unknown) => Promise<{ output: { reference: string } }>)({})
+      const ref = out.output.reference
+      expect(ref).toContain(".opencode/schedules.json")
+      expect(ref).toContain(".opencode/tasks/<id>.md")
+      expect(ref).toMatch(/markdown file wins/i)
+      expect(ref).toContain("provider/model")
+      expect(ref).toMatch(/paid/i)
+      expect(ref).toContain("runTimeout")
+      // Bounded: this is model context on every call.
+      expect(ref.length).toBeLessThan(4000)
     } finally {
       ;(cleanup as () => void)?.()
       rmSync(dir, { recursive: true, force: true })
