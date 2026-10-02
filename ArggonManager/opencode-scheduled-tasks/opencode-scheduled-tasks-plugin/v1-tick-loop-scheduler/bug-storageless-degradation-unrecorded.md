@@ -1,13 +1,15 @@
 ---
 type: bug
-status: todo
+status: in_progress
 id: bug-storageless-degradation-unrecorded
 title: "Storage-absent degradation is recorded nowhere, and ephemeral history is unreachable without storage"
+assignee: arggon
 parent: v1-tick-loop-scheduler
 labels: []
 priority: p1
 created: "2026-10-02"
 updated: "2026-10-02"
+claimed_at: "2026-10-02T23:57:02.918Z"
 depends_on: [bug-tick-cost-grows-with-sleep-not-with-jobs]
 ---
 <!--
