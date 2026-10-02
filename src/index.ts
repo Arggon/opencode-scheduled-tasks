@@ -1,22 +1,31 @@
 /**
  * opencode-scheduled-tasks — cron-style scheduled agent tasks for OpenCode V2.
  *
- * Single dependency-free source file: it is simultaneously the npm package entry and the
- * file you copy into `.opencode/plugins/scheduled-tasks/index.ts`. Node builtins only, and
- * **no** `@opencode/plugin` import — that static import fails to load an auto-discovered
- * plugin in a dependency-less tree (probed on 2.0.7/2.0.8/2.0.10/2.0.12; see
- * ArggonManager's plugin playbook). The plain default-export definition object below is a
- * valid V2 plugin definition and loads identically.
+ * Single source file: it is simultaneously the npm package entry and the file you copy into
+ * `.opencode/plugins/scheduled-tasks/index.ts`. Node builtins only, and **no**
+ * `@opencode/plugin` import — that static import fails to load an auto-discovered plugin in a
+ * dependency-less tree (probed on 2.0.7/2.0.8/2.0.10/2.0.12; see ArggonManager's plugin
+ * playbook). The plain default-export definition object below is a valid V2 plugin definition
+ * and loads identically.
  *
  * Every `ctx` API is feature-detected and every path is failure-isolated: a broken
  * scheduler logs once and goes inert. It must never break a session, a tool call or the
  * server (invariant 3, spec 001).
  *
- * Pure helpers (cron parsing, occurrence arithmetic, misfire resolution) are exported for
- * unit tests and contain no OpenCode dependency.
+ * **Dependencies.** There is exactly one, and it is optional *at import time* (ADR 0004):
+ * `yaml`, reached only through a guarded dynamic import that runs only when a markdown job
+ * file exists. With no `.opencode/tasks/` directory this file imports nothing but `node:`
+ * builtins, which is invariant 4 — and the test that pins it is the first thing to fail if a
+ * future edit adds a top-level import. There is deliberately no hand-rolled YAML subset: a
+ * parser that silently misreads what it does not cover is a CVE-shaped bug, so a host with no
+ * reader gets a named refusal and the JSON surface, not a guess.
+ *
+ * Pure helpers (cron parsing, occurrence arithmetic, misfire resolution, markdown
+ * frontmatter) are exported for unit tests and contain no OpenCode dependency.
  *
  * Architecture: ADR 0001 (tick loop over declarative jobs), ADR 0002 (misfire and cost
- * bounds), ADR 0003 (cross-process writer lease).
+ * bounds), ADR 0003 (cross-process writer lease), ADR 0004 (markdown task files alongside
+ * the JSON array), ADR 0006 (ephemeral tasks).
  */
 
 import {
@@ -25,6 +34,8 @@ import {
   mkdirSync,
   openSync,
   readFileSync,
+  readdirSync,
+  statSync,
   unlinkSync,
   utimesSync,
   writeFileSync,
@@ -150,6 +161,56 @@ export function logPath(directory: string, id: string): string {
 
 /** Job file, relative to the plugin's location directory. */
 const JOBS_FILE = join(".opencode", "schedules.json")
+
+/**
+ * Directory of markdown job files, relative to the plugin's location directory (ADR 0004).
+ *
+ * The second config surface. Both are loaded and merged by id, so adopting markdown one job
+ * at a time works: a JSON array and this directory coexist during a migration.
+ */
+export const TASKS_DIR = join(".opencode", "tasks")
+
+/** Extension of a markdown job file. The stem minus this is the job id. */
+const MARKDOWN_EXT = ".md"
+
+/**
+ * Largest markdown job file read at all.
+ *
+ * `MAX_PROMPT_CHARS` already bounds the body; this bounds the file around it, and it is
+ * checked with `stat` *before* the read, so a 4 GB `.md` cannot be pulled into memory just
+ * to be refused.
+ */
+export const MAX_MARKDOWN_FILE_BYTES = 128 * 1024
+
+/**
+ * Largest frontmatter block handed to the YAML reader.
+ *
+ * Frontmatter is untrusted input, and a size bound is the only bound that applies to keys we
+ * do not know about: it caps every collection's cardinality structurally, because you cannot
+ * put a million list entries in 8 KB. The known collections (`permissions`) are bounded again
+ * by `validatePermissions`.
+ */
+export const MAX_FRONTMATTER_CHARS = 8 * 1024
+
+/**
+ * Alias/anchor budget handed to the reader.
+ *
+ * YAML aliases are the format's own expansion bomb: a few KB of anchors and aliases can
+ * describe an object graph that costs gigabytes to materialize. The reader refuses it, so the
+ * bound is a number we own rather than a default we inherit.
+ */
+const MAX_YAML_ALIASES = 10
+
+/**
+ * Ceiling on markdown job files considered in one directory. **Per surface**: the JSON array
+ * has its own (identical) cap, so a project running both mid-migration loads at most twice
+ * this. That is deliberate — cost is bounded downstream by concurrency and by misfire, and a
+ * combined cap would mean one surface's contents could refuse another surface's jobs.
+ */
+export const MAX_MARKDOWN_JOBS = DEFAULT_MAX_JOBS
+
+/** The one accepted dependency, by name. Resolved lazily; never at import time. */
+const YAML_READER_MODULE = "yaml"
 
 /** Longest cron expression we will look at before refusing it as hostile input. */
 const MAX_CRON_LENGTH = 128
@@ -911,6 +972,398 @@ export function loadJobs(payload: unknown): LoadedJobs {
   })
 
   return { jobs, invalid }
+}
+
+// ---------------------------------------------------------------------------
+// Markdown job files (ADR 0004)
+// ---------------------------------------------------------------------------
+
+/**
+ * One half of a markdown job file: the YAML frontmatter block and the body, which is the
+ * prompt.
+ */
+type Frontmatter = { frontmatter: string; body: string }
+
+/** A frontmatter block must open the file, on a line of its own. */
+const FRONTMATTER_FENCE = /^---[ \t]*\r?\n/
+
+/** ...and close on a line of its own too. */
+const FRONTMATTER_CLOSE = "---"
+
+/**
+ * Split a markdown job file into its frontmatter block and its body.
+ *
+ * The split is ours, not the reader's: a YAML reader handed a whole markdown document would
+ * either fail or invent a schema for prose, and "is this a job file at all" has to be
+ * answerable before any parsing happens.
+ *
+ * Only blank lines at the edges are removed (a blank line holds nothing but whitespace).
+ * Everything inside is preserved, which is the entire point of the format: a prompt is prose,
+ * and re-wrapping, dedenting or collapsing its inner blank lines would silently edit what the
+ * author wrote. Line endings are normalized to `\n`, because a `\r` carried into a prompt is
+ * invisible garbage and a Windows-authored job would otherwise dispatch differently from its
+ * LF twin.
+ */
+export function splitFrontmatter(text: string): Frontmatter | { reason: string } {
+  // A UTF-8 BOM is invisible in an editor and would otherwise hide the opening fence.
+  const source = text.charCodeAt(0) === 0xfeff ? text.slice(1) : text
+  const opening = FRONTMATTER_FENCE.exec(source)
+  if (opening === null) {
+    return { reason: "no YAML frontmatter: a job file must open with a `---` line" }
+  }
+  // The fences are *lines*, so the search starts on the line after the opening one and a
+  // closing fence is only a closing fence when nothing follows it on that line. Splitting on
+  // `\r?\n` is where the line-ending normalization happens: everything below joins with `\n`,
+  // so neither the frontmatter text nor the prompt can carry a stray `\r`.
+  const lines = source.slice(opening[0].length).split(/\r?\n/)
+  let bodyFrom = -1
+  for (const [index, line] of lines.entries()) {
+    if (line.trimEnd() === FRONTMATTER_CLOSE) {
+      bodyFrom = index + 1
+      break
+    }
+  }
+  if (bodyFrom === -1) {
+    return { reason: "unterminated YAML frontmatter: no closing `---` line" }
+  }
+  return {
+    frontmatter: lines.slice(0, bodyFrom - 1).join("\n"),
+    body: trimBlankEdges(lines.slice(bodyFrom).join("\n")),
+  }
+}
+
+/**
+ * Drop blank lines from both ends of a block of text, touching nothing else.
+ *
+ * A `split`/`join` pass rather than `trim()`: `trim()` also eats trailing spaces on the first
+ * and last *content* lines, which is an edit to prose nobody asked for.
+ */
+function trimBlankEdges(text: string): string {
+  const lines = text.split("\n")
+  let start = 0
+  let end = lines.length
+  while (start < end && (lines[start] ?? "").trim() === "") start++
+  while (end > start && (lines[end - 1] ?? "").trim() === "") end--
+  return lines.slice(start, end).join("\n")
+}
+
+/**
+ * The one function a YAML reader has to provide: parse a document, or throw.
+ *
+ * `options` carries our alias budget, which is asked for at every call site rather than baked
+ * into the resolved reader — so an injected reader gets the same bound as the built-in one. A
+ * reader that does not know the option ignores it, which is the whole contract. Nothing else
+ * about the reader is assumed: no schema, no tag set.
+ */
+export type YamlReader = (source: string, options?: { maxAliasCount?: number }) => unknown
+
+let injectedReader: YamlReader | undefined
+let readerResolved = false
+
+/**
+ * Supply the YAML reader, or state that there is none.
+ *
+ * This exists because of the distribution story, not for convenience. The plugin is copied as
+ * one file into `.opencode/plugins/`, where it cannot declare a dependency — so an embedder
+ * (or a test) that already has a YAML reader has no other way to hand it over. Passing
+ * `undefined` states "there is no reader" and stops the dynamic import from being tried, which
+ * is what makes the degradation testable on a machine that happens to have `yaml` installed.
+ */
+export function setYamlReader(reader: YamlReader | undefined): void {
+  injectedReader = reader
+  readerResolved = true
+}
+
+/**
+ * Resolve the YAML reader, or `undefined` when there is none.
+ *
+ * **This is the only place the plugin resolves a package name at all**, and it is deliberately
+ * unreachable from the JSON path: the import is dynamic, guarded, and inside a function, so a
+ * project with no `.opencode/tasks/` directory never resolves `yaml` (invariant 4). The
+ * specifier is held in a variable so no bundler tries to resolve it at build time — "this
+ * module may legitimately not exist" is the point.
+ *
+ * A failed import is a degradation, not an error: the caller refuses the markdown jobs by name
+ * and keeps serving the JSON surface (ADR 0004's "report it, do not fail the load").
+ */
+export async function loadYamlReader(): Promise<YamlReader | undefined> {
+  if (readerResolved) return injectedReader
+  readerResolved = true
+  const specifier = YAML_READER_MODULE
+  try {
+    const module = (await import(/* @vite-ignore */ specifier)) as {
+      parse?: unknown
+      default?: { parse?: unknown }
+    }
+    // `yaml` exposes `parse` as a named export; the `default` arm covers a CJS-interop build.
+    const parse = [module.parse, module.default?.parse].find(
+      (candidate): candidate is (source: string, options?: { maxAliasCount?: number }) => unknown =>
+        typeof candidate === "function",
+    )
+    if (parse === undefined) throw new Error(`${specifier} exposes no parse()`)
+    injectedReader = (source, options) => parse(source, options)
+    return injectedReader
+  } catch {
+    logOnce(
+      "no-yaml",
+      `no YAML reader: ${specifier} is not installed, so ${TASKS_DIR}/*.md jobs are refused and ` +
+        `${JOBS_FILE} jobs are unaffected. Install ${specifier} (an optionalDependency) to enable them.`,
+    )
+    return undefined
+  }
+}
+
+/**
+ * Path of one markdown job file, for messages: `.opencode/tasks/<name>`.
+ *
+ * Takes a *file name*, not an id, because it is also used for the files that were found but
+ * refused — whose name is exactly what the author has to look at.
+ */
+function markdownFilePath(name: string): string {
+  return `${TASKS_DIR}/${name}`
+}
+
+/**
+ * Name a parsed YAML value's *kind* for a refusal, never its content.
+ *
+ * Quoting the document would hand untrusted text straight back to whoever reads the error, so
+ * only the type survives.
+ */
+function describeValue(value: unknown): string {
+  if (Array.isArray(value)) return "a list"
+  if (value === null) return "null"
+  return typeof value
+}
+
+/**
+ * Read one markdown job file into a raw job entry, or the reason it is refused.
+ *
+ * Every failure is per file, never per directory (ADR 0001's rule: refuse one job, never the
+ * file). The returned `raw` is a plain record shaped exactly like a JSON job entry, so it goes
+ * through `validateJob` unchanged — one validation path, identical error strings, and a field
+ * added to `JobDefinition` later cannot be honoured by one surface and forgotten by the other.
+ */
+function readMarkdownJob(
+  name: string,
+  text: string,
+  reader: YamlReader | undefined,
+): { raw: Record<string, unknown>; notes: string[] } | { invalid: InvalidJob } {
+  const id = name.slice(0, -MARKDOWN_EXT.length)
+  const where = markdownFilePath(name)
+  const refuse = (reason: string): { invalid: InvalidJob } => ({
+    invalid: { id, schedule: undefined, reason: `${where}: ${reason}` },
+  })
+
+  const split = splitFrontmatter(text)
+  if ("reason" in split) return refuse(split.reason)
+
+  if (split.frontmatter.length > MAX_FRONTMATTER_CHARS) {
+    return refuse(
+      `frontmatter is ${split.frontmatter.length} characters, above the cap of ${MAX_FRONTMATTER_CHARS}`,
+    )
+  }
+  if (reader === undefined) {
+    return refuse(
+      `no YAML reader available (${YAML_READER_MODULE} is not installed and none was provided); ` +
+        `install it, or move this job to ${JOBS_FILE}`,
+    )
+  }
+
+  let parsed: unknown
+  try {
+    parsed = reader(split.frontmatter, { maxAliasCount: MAX_YAML_ALIASES })
+  } catch (error) {
+    // The reader's own message is the useful one ("unexpected end of the stream"), so it is
+    // quoted rather than replaced — clipped, because it is untrusted text of unknown length.
+    const message = error instanceof Error ? error.message : String(error)
+    return refuse(`frontmatter is not valid YAML (${clip(message, 200)})`)
+  }
+  // An empty block parses to null; that is a job with no fields, not a broken document, and it
+  // deserves the same "has no schedule" refusal a JSON job with no fields gets.
+  const fields = parsed === null || parsed === undefined ? {} : parsed
+  if (typeof fields !== "object" || Array.isArray(fields)) {
+    return refuse(`frontmatter must be a mapping of job fields, got ${describeValue(fields)}`)
+  }
+
+  const record = { ...(fields as Record<string, unknown>) }
+  const notes: string[] = []
+
+  // The filename stem is the id (ADR 0004). A frontmatter `id` cannot move a job — but a
+  // silently ignored one is a job that quietly never fires under the name its author expects,
+  // so the disagreement is reported next to the job it affected rather than dropped.
+  if (record.id !== undefined) {
+    const declared = typeof record.id === "string" ? record.id.trim() : String(record.id)
+    if (declared !== id) {
+      notes.push(
+        `${where}: frontmatter "id" "${clip(declared, 60)}" is ignored; the filename stem "${id}" is the job id`,
+      )
+    }
+  }
+  delete record.id
+
+  // The id is the stem — always, whether or not the frontmatter said so — so the record this
+  // hands to `validateJob` is shaped exactly like a JSON job entry and reports its refusals
+  // with the same words.
+  record.id = id
+
+  // The body is the prompt. It replaces anything the frontmatter called `prompt`: two prompts
+  // in one file is a contradiction, and the body is the one a human reads.
+  record.prompt = split.body
+
+  return { raw: record, notes }
+}
+
+/**
+ * Load every markdown job file in `directory` (which is `.opencode/tasks`) — never throws.
+ *
+ * A missing directory is **not** an error: it is the v1 state, a JSON-only project, and
+ * reporting it would put a spurious error in front of every such project. Everything else the
+ * directory can do wrong — unreadable, not a directory, a file that cannot be read — is
+ * reported.
+ */
+export async function loadMarkdownJobs(directory: string): Promise<LoadedJobs> {
+  let entries: Array<{ name: string; isDirectory(): boolean }>
+  try {
+    entries = readdirSync(directory, { withFileTypes: true })
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code
+    if (code === "ENOENT" || code === "ENOTDIR") return { jobs: [], invalid: [] }
+    return {
+      jobs: [],
+      invalid: [],
+      error: `${TASKS_DIR}: ${error instanceof Error ? error.message : String(error)}`,
+    }
+  }
+
+  // Sorted, and stat-checked, before anything is read. `readdir` order is filesystem-defined,
+  // so without the sort the order jobs appear in would depend on the inode layout — and job
+  // order is user-visible through `schedules_list`. The stat is also a safety check: only
+  // regular files are opened, because `readFileSync` on a FIFO blocks forever and would hang
+  // the server from inside a plugin (invariant 3).
+  const files: Array<{ name: string; size: number }> = []
+  for (const entry of entries) {
+    if (!entry.name.endsWith(MARKDOWN_EXT) || entry.isDirectory()) continue
+    try {
+      const stats = statSync(join(directory, entry.name))
+      if (stats.isFile()) files.push({ name: entry.name, size: stats.size })
+    } catch {
+      // A dangling symlink, or a file that vanished mid-listing: not a job.
+    }
+  }
+  files.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))
+  if (files.length === 0) return { jobs: [], invalid: [] }
+
+  // Resolved once per directory, and only now: a project with no markdown job never asks for a
+  // YAML reader at all (invariant 4).
+  const reader = await loadYamlReader()
+
+  const jobs: JobDefinition[] = []
+  const invalid: InvalidJob[] = []
+  let considered = 0
+  let skipped = 0
+
+  for (const file of files) {
+    const id = file.name.slice(0, -MARKDOWN_EXT.length)
+    // Counted per *file considered*, not per entry reported: one file can produce two reports
+    // (an ignored `id` and a refusal), and a note must not cost the directory a job slot.
+    if (considered >= MAX_MARKDOWN_JOBS) {
+      skipped++
+      continue
+    }
+    considered++
+    if (file.size > MAX_MARKDOWN_FILE_BYTES) {
+      invalid.push({
+        id,
+        schedule: undefined,
+        reason: `${markdownFilePath(file.name)}: file is ${file.size} bytes, above the cap of ${MAX_MARKDOWN_FILE_BYTES}`,
+      })
+      continue
+    }
+    let text: string
+    try {
+      text = readFileSync(join(directory, file.name), "utf8")
+    } catch (error) {
+      invalid.push({
+        id,
+        schedule: undefined,
+        reason: `${markdownFilePath(file.name)}: ${error instanceof Error ? error.message : String(error)}`,
+      })
+      continue
+    }
+
+    const outcome = readMarkdownJob(file.name, text, reader)
+    if ("invalid" in outcome) {
+      invalid.push(outcome.invalid)
+      continue
+    }
+    for (const note of outcome.notes) invalid.push({ id, schedule: undefined, reason: note })
+
+    // The *same* validation path as the JSON surface: no markdown-only rules, no second
+    // schema. A bad schedule, timezone, duration, session mode or permission set is refused
+    // with the identical string a JSON job with the same fields would produce.
+    const validated = validateJob(outcome.raw, 0)
+    if ("reason" in validated) {
+      invalid.push({ id, schedule: outcome.raw.schedule, reason: validated.reason })
+      continue
+    }
+    jobs.push(validated.job)
+  }
+
+  if (skipped > 0) {
+    invalid.push({
+      id: `${TASKS_DIR}/*.md`,
+      schedule: undefined,
+      reason: `${files.length} markdown job files found, above the cap of ${MAX_MARKDOWN_JOBS}; the rest were not read`,
+    })
+  }
+  return { jobs, invalid }
+}
+
+/**
+ * Merge the two config surfaces by id, with markdown winning (ADR 0004).
+ *
+ * Precedence is **per id**, not per source: a JSON array and a directory of `.md` files
+ * coexist, which is what makes a one-job-at-a-time migration possible. A shadowed JSON job is
+ * reported through the same `invalid` array the JSON surface already uses — the existing shape,
+ * not a parallel channel, because a tool that reports refusals in one place cannot be
+ * half-read.
+ */
+export function mergeJobSources(json: LoadedJobs, markdown: LoadedJobs): LoadedJobs {
+  const merged: JobDefinition[] = []
+  const positions = new Map<string, number>()
+  for (const job of json.jobs) {
+    if (positions.has(job.id)) continue
+    positions.set(job.id, merged.length)
+    merged.push(job)
+  }
+
+  const shadows: InvalidJob[] = []
+  for (const job of markdown.jobs) {
+    const at = positions.get(job.id)
+    if (at === undefined) {
+      positions.set(job.id, merged.length)
+      merged.push(job)
+      continue
+    }
+    // Keep the JSON file's position, so a migrating project does not reshuffle its whole job
+    // list the day its first task file lands.
+    merged[at] = job
+    const shadowed = json.jobs.find((entry) => entry.id === job.id)
+    shadows.push({
+      id: job.id,
+      schedule: shadowed?.schedule,
+      reason:
+        `${markdownFilePath(job.id + MARKDOWN_EXT)} shadows the job "${job.id}" in ${JOBS_FILE} ` +
+        `(markdown wins); delete one of them to stop being told about this`,
+    })
+  }
+
+  const errors = [json.error, markdown.error].filter((error): error is string => error !== undefined)
+  return {
+    jobs: merged,
+    invalid: [...json.invalid, ...markdown.invalid, ...shadows],
+    ...(errors.length > 0 ? { error: [...new Set(errors)].join("; ") } : {}),
+  }
 }
 
 /** The server's local IANA zone; the default for a job that names no timezone. */
@@ -1757,24 +2210,40 @@ const HISTORY_OUTPUT = {
   },
 }
 
-/** Read, validate and parse the job file; never throws. */
-function reloadJobs(ctx: PluginContext, directory: string, state: SchedulerState): void {
+/**
+ * Read, validate and merge both config surfaces; never throws.
+ *
+ * Asynchronous because the markdown surface resolves its YAML reader through a dynamic import
+ * — the one guarded, optional dependency in the file (ADR 0004). The JSON surface stays
+ * synchronous underneath: an `await` here changes when the merge completes, never what it
+ * accepts.
+ */
+async function reloadJobs(ctx: PluginContext, directory: string, state: SchedulerState): Promise<void> {
   let payload: unknown
   let failure: string | undefined
+  let jsonMissing = true
   try {
     payload = JSON.parse(readFileSync(join(directory, JOBS_FILE), "utf8"))
+    jsonMissing = false
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code
-    failure = code === "ENOENT" ? `no ${JOBS_FILE}` : `${JOBS_FILE}: ${error instanceof Error ? error.message : String(error)}`
+    jsonMissing = code === "ENOENT"
+    failure = jsonMissing ? `no ${JOBS_FILE}` : `${JOBS_FILE}: ${error instanceof Error ? error.message : String(error)}`
   }
 
-  if (payload === undefined) {
-    // Last-known-good is retained; only the reported error changes.
+  // Loaded independently and unconditionally: a broken .md file must not cost a project its
+  // JSON jobs, and a missing YAML reader must not cost it its schedules.json either.
+  const markdown = await loadMarkdownJobs(join(directory, TASKS_DIR))
+
+  if (payload === undefined && markdown.jobs.length === 0 && markdown.invalid.length === 0) {
+    // Nothing loaded at all: retain the last-known-good set and report only the reason.
+    // Tearing down running jobs because a file was deleted mid-edit would be worse than the
+    // bug it reports.
     state.fileError = failure
     return
   }
 
-  const loaded = loadJobs(payload)
+  const loaded = mergeJobSources(payload === undefined ? { jobs: [], invalid: [] } : loadJobs(payload), markdown)
   const specs = new Map<string, CronSpec>()
   for (const job of loaded.jobs) {
     // validateJob already parsed this successfully; a failure here would be a bug, and
@@ -1786,12 +2255,18 @@ function reloadJobs(ctx: PluginContext, directory: string, state: SchedulerState
     }
   }
 
+  // A *read* failure is reported when the file exists and is broken even if markdown jobs are
+  // carrying the schedule — silently ignoring a corrupt schedules.json is how a user spends an
+  // afternoon wondering why their edit did nothing. A merely *absent* one stays quiet as long
+  // as something else defines a job, which is the whole point of the union.
+  const readProblem = failure !== undefined && (!jsonMissing || loaded.jobs.length === 0) ? failure : undefined
+  const problems = [...(loaded.error !== undefined ? [loaded.error] : []), ...(readProblem !== undefined ? [readProblem] : [])]
+
   state.jobs = loaded.jobs
   state.specs = specs
   state.invalid = loaded.invalid
-  state.fileError = loaded.error ?? (failure !== undefined && loaded.jobs.length === 0 ? failure : undefined)
+  state.fileError = problems.length > 0 ? [...new Set(problems)].join("; ") : undefined
 }
-
 /** Resolve (creating on first use) the persistent session a job runs in. */
 /**
  * The session a job's next run should use.
@@ -2551,7 +3026,7 @@ const definition: PluginDefinition = {
     // Read the jobs *before* arbitrating. A globally-installed plugin loads in every
     // project, and claiming the writer lease (or littering a lockfile) in a project that
     // has no schedules would be wrong in every such project.
-    reloadJobs(ctx, directory, state)
+    await reloadJobs(ctx, directory, state)
     await loadStates(ctx, state)
     await loadAllHistory(ctx, state)
     state.oneOffs = await loadOneOffs(ctx)
@@ -2589,10 +3064,12 @@ const definition: PluginDefinition = {
       disposers.push(() => clearInterval(interval))
     } else if (!hasWork) {
       // The file existing but holding only disabled jobs is not the same as having no
-      // file at all, and the log is the only place that difference is visible.
+      // file at all, and the log is the only place that difference is visible. Both
+      // surfaces are named, because either can be the one holding the parked jobs.
+      const surfaces = `${JOBS_FILE} or ${TASKS_DIR}`
       logLine(
         state.fileError === undefined
-          ? `no enabled jobs in ${JOBS_FILE}; no timer armed`
+          ? `no enabled jobs in ${surfaces}; no timer armed`
           : `no enabled jobs (${state.fileError}); no timer armed`,
       )
     }

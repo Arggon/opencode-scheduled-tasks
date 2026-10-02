@@ -2,6 +2,7 @@ import { describe, expect, it, beforeEach, afterEach } from "vitest"
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import { spawnSync } from "node:child_process"
 
 import plugin, {
   CronError,
@@ -13,6 +14,10 @@ import plugin, {
   dayMatches,
   isLeaseLive,
   loadJobs,
+  loadMarkdownJobs,
+  mergeJobSources,
+  setYamlReader,
+  splitFrontmatter,
   missedOccurrences,
   nextOccurrence,
   normalizeState,
@@ -25,7 +30,11 @@ import plugin, {
   validateLoop,
   validateOneOff,
   wallParts,
+  MAX_FRONTMATTER_CHARS,
   MAX_HISTORY_LIMIT,
+  MAX_MARKDOWN_FILE_BYTES,
+  MAX_MARKDOWN_JOBS,
+  MAX_PERMISSION_ACTIONS,
   collectAsks,
   DEFAULT_LOOP_CAP,
   DEFAULT_LOOP_TTL_MS,
@@ -33,6 +42,7 @@ import plugin, {
   type HistoryEntry,
   type JobDefinition,
   type JobState,
+  type YamlReader,
 } from "../src/index.ts"
 
 // A DST-observing zone: Europe/Madrid springs forward on the last Sunday of March and
@@ -1672,6 +1682,699 @@ describe("session loops (T6, ADR 0006)", () => {
     } finally {
       ;(cleanup as () => void)?.()
       rmSync(dir, { recursive: true, force: true })
+    }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Markdown task files (T2, ADR 0004)
+// ---------------------------------------------------------------------------
+
+/**
+ * A YAML reader double.
+ *
+ * It is **not** a YAML implementation and does not try to be: it returns a canned field set,
+ * which is enough to pin the plumbing we own (what text reaches the reader, what a parse
+ * failure does, which options we ask for). Real YAML is `yaml`'s job, and the one test that
+ * uses the real reader runs only where the optional dependency is installed. Writing a subset
+ * parser here would be the exact thing ADR 0004 rejected.
+ */
+function readerReturning(fields: Record<string, unknown>): (source: string, options?: { maxAliasCount?: number }) => unknown {
+  return () => fields
+}
+
+/** A reader that fails the way a real one does, so the refusal path is exercised for real. */
+function readerThrowing(message: string): (source: string, options?: { maxAliasCount?: number }) => unknown {
+  return () => {
+    throw new Error(message)
+  }
+}
+
+/**
+ * The real `yaml` reader, when this tree has it.
+ *
+ * `yaml` is an *optional* dependency (ADR 0004), so the two tests that need a real parser are
+ * declared with `it.runIf` and simply do not exist in a tree that never installed it — rather
+ * than passing vacuously, and rather than every other markdown test being at the mercy of
+ * whether the checkout happens to have a package in `node_modules`.
+ */
+const yamlSpecifier = "yaml"
+const realYaml = ((await import(/* @vite-ignore */ yamlSpecifier).catch(() => undefined)) as { parse?: YamlReader })
+  ?.parse
+
+/** A markdown job file: frontmatter block, then the body. */
+function taskFile(frontmatter: string, body: string): string {
+  return `---\n${frontmatter}\n---\n\n${body}\n`
+}
+
+describe("splitFrontmatter — markdown job files (ADR 0004)", () => {
+  it("splits the block from the body and preserves inner formatting exactly", () => {
+    const text = taskFile(
+      'schedule: "0 3 * * *"\ntimezone: Europe/Madrid',
+      "Review the diff.\n\n    indented code\n\n  - a list\n\nLast line.",
+    )
+    const split = splitFrontmatter(text)
+    expect("reason" in split).toBe(false)
+    if ("reason" in split) return
+    expect(split.frontmatter).toBe('schedule: "0 3 * * *"\ntimezone: Europe/Madrid')
+    // Every inner blank line, every indent and every newline inside the body survives.
+    expect(split.body).toBe("Review the diff.\n\n    indented code\n\n  - a list\n\nLast line.")
+  })
+
+  it("trims the blank lines and the newline at the edges, and nothing else", () => {
+    const split = splitFrontmatter("---\nschedule: @daily\n---\n\n\nfirst\n\nlast\n\n\n")
+    if ("reason" in split) throw new Error(split.reason)
+    expect(split.body).toBe("first\n\nlast")
+  })
+
+  it("keeps trailing spaces on a content line — the last line is not a blank line", () => {
+    const split = splitFrontmatter("---\nschedule: @daily\n---\nanswer with: OK  \n")
+    if ("reason" in split) throw new Error(split.reason)
+    expect(split.body).toBe("answer with: OK  ")
+  })
+
+  it("normalizes CRLF and tolerates a BOM", () => {
+    // A `\r` carried into a prompt is invisible garbage, and a Windows-authored job must not
+    // dispatch differently from its LF twin.
+    const split = splitFrontmatter("﻿---\r\nschedule: @daily\r\n---\r\n\r\nline one\r\nline two\r\n")
+    if ("reason" in split) throw new Error(split.reason)
+    expect(split.frontmatter).toBe("schedule: @daily")
+    expect(split.body).toBe("line one\nline two")
+  })
+
+  it("refuses a file with no frontmatter, and one whose block never closes", () => {
+    expect(splitFrontmatter("just a prompt\n")).toMatchObject({
+      reason: expect.stringContaining("must open with a `---` line"),
+    })
+    expect(splitFrontmatter("---\nschedule: @daily\nstill going\n")).toMatchObject({
+      reason: expect.stringContaining("no closing `---` line"),
+    })
+  })
+
+  it("treats the fences as lines: trailing spaces close, trailing text does not", () => {
+    const closed = splitFrontmatter("---\nschedule: @daily\n---   \nbody\n")
+    if ("reason" in closed) throw new Error(closed.reason)
+    expect(closed.body).toBe("body")
+
+    // `--- extra` is YAML content, not a fence: the block stays open and the reader decides.
+    const open = splitFrontmatter("---\nnote: --- extra\n---\nbody\n")
+    if ("reason" in open) throw new Error(open.reason)
+    expect(open.frontmatter).toBe("note: --- extra")
+  })
+
+  it("stops at the first closing fence, so a `---` rule in the body is just prose", () => {
+    const split = splitFrontmatter("---\nschedule: @daily\n---\nabove\n\n---\n\nbelow\n")
+    if ("reason" in split) throw new Error(split.reason)
+    expect(split.body).toBe("above\n\n---\n\nbelow")
+  })
+})
+
+describe("invariant 4 — the plugin imports nothing but node builtins (ADR 0004)", () => {
+  /**
+   * Run a script in a child process whose ESM loader reports every specifier that is not a
+   * builtin. Nothing about the plugin is stubbed: it is imported and set up for real.
+   */
+  function runWatched(script: string): { code: number | null; stdout: string; stderr: string } {
+    const dir = mkdtempSync(join(tmpdir(), "st-invariant4-"))
+    // The loader hook is the whole test: it sees every resolution, so a package name that
+    // sneaks into a static import cannot hide from it.
+    const hook = join(dir, "hook.mjs")
+    writeFileSync(
+      hook,
+      [
+        "export async function resolve(specifier, context, next) {",
+        '  const builtin = specifier.startsWith("node:") || specifier.startsWith("file:")',
+        '  if (!builtin && !specifier.startsWith("/") && !specifier.startsWith(".")) {',
+        '    process.stderr.write(`EXTERNAL:${specifier}\\n`)',
+        "  }",
+        "  return next(specifier, context)",
+        "}",
+      ].join("\n"),
+    )
+    const entry = join(dir, "run.mjs")
+    writeFileSync(
+      entry,
+      [
+        `import { register } from "node:module"`,
+        `register(${JSON.stringify(hook)}, import.meta.url)`,
+        script.replaceAll("__PLUGIN__", JSON.stringify(new URL("../src/index.ts", import.meta.url).pathname)),
+      ].join("\n"),
+    )
+    const run = spawnSync(process.execPath, [entry], { encoding: "utf8", timeout: 120_000 })
+    return { code: run.status, stdout: run.stdout ?? "", stderr: run.stderr ?? "" }
+  }
+
+  /** A minimal project with a schedules.json, plus the plugin's setup wired to a fake ctx. */
+  const SETUP_JSON_ONLY = `
+    const { mkdtempSync, mkdirSync, writeFileSync } = await import("node:fs")
+    const { tmpdir } = await import("node:os")
+    const { join } = await import("node:path")
+    const plugin = (await import(__PLUGIN__)).default
+    const dir = mkdtempSync(join(tmpdir(), "st-json-only-"))
+    mkdirSync(join(dir, ".opencode"), { recursive: true })
+    process.env[(await import(__PLUGIN__)).DATA_DIR_ENV] = join(dir, "state")
+    writeFileSync(join(dir, ".opencode", "schedules.json"), JSON.stringify({ version: 1, jobs: [{ id: "j", schedule: "@daily", prompt: "p" }] }))
+    const added = []
+    const cleanup = await plugin.setup({
+      location: { directory: dir, project: { id: "watched" } },
+      storage: { get: async () => undefined, set: async () => {}, remove: async () => {} },
+      session: { create: async () => ({ id: "ses_1" }), prompt: async () => ({ id: "inbox_1" }) },
+      tool: { transform: async (cb) => { cb({ add: (t) => added.push(t) }); return { dispose() {} } } },
+    })
+    const list = added.find((t) => t.name === "list")
+    const out = await list.execute({}, {})
+    if (out.output.jobs.length !== 1) { console.error("NO-JOBS"); process.exit(2) }
+    console.log("LOADED")
+    ;(cleanup || (() => {}))()
+  `
+
+  it("every static import in the plugin is a node builtin", () => {
+    // The cheap half of the pin, and the one a reviewer reads: neither `import … from "yaml"`
+    // nor a bare `import "yaml"` can be added without this failing first. The `from` clause
+    // is optional in the pattern so a side-effect import is caught too, and the filler class
+    // excludes quotes so a bare import cannot be swallowed into the next statement's
+    // specifier. A dynamic `import(x)` never matches: `^` requires the line to start with it.
+    const source = readFileSync(new URL("../src/index.ts", import.meta.url), "utf8")
+    const statics = [...source.matchAll(/^\s*import\s+(?:[^"';]*?\bfrom\s*)?["']([^"']+)["']/gm)].map((m) => m[1]!)
+    expect(statics.sort()).toEqual(["node:fs", "node:os", "node:path"])
+  })
+
+  it("loads and runs a JSON-only project without resolving any package", () => {
+    const run = runWatched(SETUP_JSON_ONLY)
+    expect(run.stderr).not.toContain("EXTERNAL:")
+    expect(run.stdout).toContain("LOADED")
+    expect(run.code).toBe(0)
+  })
+
+  it("reaches for the YAML reader only when a markdown job exists", () => {
+    // The other half of the pin: the guarded dynamic import is real, reachable, and gated on
+    // the markdown path — not a dead branch that would have failed to resolve anyway.
+    const run = runWatched(
+      SETUP_JSON_ONLY
+        .replace(
+          `writeFileSync(join(dir, ".opencode", "schedules.json"),`,
+          `mkdirSync(join(dir, ".opencode", "tasks"), { recursive: true })
+    writeFileSync(join(dir, ".opencode", "tasks", "nightly.md"), "---\\nschedule: @daily\\n---\\n\\nreview\\n")
+    writeFileSync(join(dir, ".opencode", "schedules.json"),`,
+        )
+        .replace(`if (out.output.jobs.length !== 1)`, `if (out.output.jobs.length !== 1)`),
+    )
+    // The plugin still loads and still serves its JSON job — and now, and only now, it has
+    // asked for a package.
+    expect(run.stdout).toContain("LOADED")
+    expect(run.stderr).toContain("EXTERNAL:yaml")
+  })
+})
+
+describe("loadMarkdownJobs — one refusal per file, never per directory (ADR 0004)", () => {
+  let dir: string
+  let tasks: string
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "st-tasks-"))
+    tasks = join(dir, ".opencode", "tasks")
+    mkdirSync(tasks, { recursive: true })
+  })
+  afterEach(() => {
+    // The reader is process-global by design (resolve once); leaving one installed would leak
+    // into every later test.
+    setYamlReader(undefined)
+    rmSync(dir, { recursive: true, force: true })
+  })
+
+  const write = (name: string, content: string): void => writeFileSync(join(tasks, name), content)
+
+  it("loads a job whose body is the prompt, with every frontmatter field applied", async () => {
+    write(
+      "nightly.md",
+      taskFile(
+        'schedule: "0 3 * * *"\ntimezone: Europe/Madrid\nmodel: opencode/space-bunny-free\nsession: fresh\nrunTimeout: 30m',
+        "Review the diff since the last tag.",
+      ),
+    )
+    setYamlReader(
+      readerReturning({
+        schedule: "0 3 * * *",
+        timezone: "Europe/Madrid",
+        model: "opencode/space-bunny-free",
+        session: "fresh",
+        runTimeout: "30m",
+      }),
+    )
+    const { jobs, invalid } = await loadMarkdownJobs(tasks)
+    expect(invalid).toEqual([])
+    expect(jobs).toHaveLength(1)
+    expect(jobs[0]).toMatchObject({
+      id: "nightly",
+      schedule: "0 3 * * *",
+      timezone: "Europe/Madrid",
+      session: "fresh",
+      // T1's duration parser, reached through the same field the JSON surface uses.
+      runTimeoutMs: 30 * MINUTE_MS,
+      prompt: "Review the diff since the last tag.",
+      misfire: "skip",
+      enabled: true,
+    })
+  })
+
+  it("hands the reader the frontmatter text and nothing else, and asks for a bounded alias count", async () => {
+    const seen: Array<{ source: string; options?: { maxAliasCount?: number } }> = []
+    setYamlReader((source, options) => {
+      seen.push({ source, options })
+      return { schedule: "@daily" }
+    })
+    write("j.md", taskFile('schedule: "@daily"\n# a comment', "prompt body"))
+    await loadMarkdownJobs(tasks)
+    expect(seen).toHaveLength(1)
+    expect(seen[0]!.source).toBe('schedule: "@daily"\n# a comment')
+    // Aliases are the format's own expansion bomb; the bound has to be ours, not a default.
+    expect(typeof seen[0]!.options?.maxAliasCount).toBe("number")
+  })
+
+it("the body is the prompt: frontmatter cannot override it, and is never interpolated into it", async () => {
+    write(
+      "j.md",
+      taskFile("schedule: @daily\nagent: build\nprompt: I am the frontmatter", "Agent: {{agent}}; prompt: I am the body"),
+    )
+    setYamlReader(readerReturning({ schedule: "@daily", agent: "build", prompt: "I am the frontmatter" }))
+    const { jobs } = await loadMarkdownJobs(tasks)
+    // A frontmatter value is data *about* the run, never text inside it. Substituting one
+    // would open a prompt-injection seam: the field would reach the model as though the author
+    // had typed it there.
+    expect(jobs[0]!.prompt).toBe("Agent: {{agent}}; prompt: I am the body")
+    expect(jobs[0]!.agent).toBe("build")
+  })
+
+  it("bounds the cardinality of a collection the frontmatter declares", async () => {
+    // The size cap bounds unknown fields structurally; a collection we *know* about gets its
+    // own bound, reached through the same validation path as the JSON surface.
+    const actions: Record<string, string> = {}
+    for (let n = 0; n <= MAX_PERMISSION_ACTIONS; n += 1) actions[`act${n}`] = "allow"
+    write("wide.md", taskFile("schedule: @daily", "p"))
+    setYamlReader(readerReturning({ schedule: "@daily", permissions: actions }))
+    const { jobs, invalid } = await loadMarkdownJobs(tasks)
+    expect(jobs).toEqual([])
+    expect(invalid[0]!.reason).toMatch(new RegExp(`above the cap of ${MAX_PERMISSION_ACTIONS}`))
+    // Byte-identical to the JSON surface's refusal for the same fields, once more.
+    expect(invalid[0]!.reason).toBe(
+      loadJobs({ version: 1, jobs: [{ id: "wide", schedule: "@daily", prompt: "p", permissions: actions }] }).invalid[0]!.reason,
+    )
+  })
+
+  it("takes the id from the filename stem and reports a disagreeing frontmatter id", async () => {
+    write("nightly.md", taskFile("schedule: @daily\nid: something-else", "p"))
+    setYamlReader(readerReturning({ schedule: "@daily", id: "something-else" }))
+    const { jobs, invalid } = await loadMarkdownJobs(tasks)
+    expect(jobs[0]!.id).toBe("nightly")
+    // Reported, because a silently ignored id is a job that never fires under the name its
+    // author expects.
+    expect(invalid[0]!.reason).toMatch(/frontmatter "id" "something-else" is ignored/)
+  })
+
+  it("refuses bad YAML by name and keeps every other job", async () => {
+    write("good.md", taskFile("schedule: @daily", "fine"))
+    write("broken.md", "---\nschedule: \"unclosed\n---\n\nbody\n")
+    setYamlReader(
+      (source) => {
+        if (source.includes("unclosed")) throw new Error("unexpected end of the stream")
+        return { schedule: "@daily" }
+      },
+    )
+    const { jobs, invalid } = await loadMarkdownJobs(tasks)
+    expect(jobs.map((job) => job.id)).toEqual(["good"])
+    expect(invalid).toHaveLength(1)
+    expect(invalid[0]).toMatchObject({ id: "broken" })
+    expect(invalid[0]!.reason).toMatch(/\.opencode\/tasks\/broken\.md: frontmatter is not valid YAML \(unexpected end of the stream\)/)
+  })
+
+  it("refuses a missing schedule with byte-identical wording to the JSON surface", async () => {
+    // The acceptance criterion for ADR 0004: one validation path, so the reason an author
+    // reads is the same one either surface would have produced.
+    write("nightly.md", taskFile("timezone: UTC", "review"))
+    setYamlReader(readerReturning({ timezone: "UTC" }))
+    const { invalid } = await loadMarkdownJobs(tasks)
+    const json = loadJobs({ version: 1, jobs: [{ id: "nightly", timezone: "UTC", prompt: "review" }] })
+    expect(invalid[0]!.reason).toBe(json.invalid[0]!.reason)
+    expect(invalid[0]!.reason).toBe('job "nightly" has no schedule')
+  })
+
+  it("refuses a bad id, a missing body, and frontmatter that is not a mapping", async () => {
+    write("Bad Name.md", taskFile("schedule: @daily", "p"))
+    write("nobody.md", taskFile("schedule: @daily", "   \n\n"))
+    write("list.md", "---\n- one\n- two\n---\n\nbody\n")
+    setYamlReader((source) => (source.startsWith("-") ? ["one", "two"] : { schedule: "@daily" }))
+    const { jobs, invalid } = await loadMarkdownJobs(tasks)
+    expect(jobs).toEqual([])
+    const byId = new Map(invalid.map((entry) => [entry.id, entry.reason]))
+    expect(byId.get("Bad Name")).toMatch(/must match \^\[a-z0-9\]/)
+    expect(byId.get("nobody")).toBe('job "nobody" has no prompt')
+    expect(byId.get("list")).toMatch(/frontmatter must be a mapping of job fields, got a list/)
+  })
+
+  it("bounds an oversized file and an oversized frontmatter block, before parsing", async () => {
+    let asked = 0
+    setYamlReader(() => {
+      asked++
+      return { schedule: "@daily" }
+    })
+    write("huge.md", taskFile("schedule: @daily", "x".repeat(MAX_MARKDOWN_FILE_BYTES + 1)))
+    write("wide.md", taskFile(`note: "${"y".repeat(MAX_FRONTMATTER_CHARS + 1)}"`, "p"))
+    const { jobs, invalid } = await loadMarkdownJobs(tasks)
+    expect(jobs).toEqual([])
+    // Neither file reached the reader: the bounds are on the way in, not after parsing.
+    expect(asked).toBe(0)
+    expect(invalid.map((entry) => entry.id)).toEqual(["huge", "wide"])
+    expect(invalid[0]!.reason).toMatch(new RegExp(`above the cap of ${MAX_MARKDOWN_FILE_BYTES}`))
+    expect(invalid[1]!.reason).toMatch(new RegExp(`above the cap of ${MAX_FRONTMATTER_CHARS}`))
+  })
+
+  it("ignores what is not a markdown job file, and never blocks on a fifo", async () => {
+    writeFileSync(join(tasks, "notes.txt"), "not a job")
+    writeFileSync(join(tasks, "archive.md"), "not a job")
+    mkdirSync(join(tasks, "nested.md"))
+    write("real.md", taskFile("schedule: @daily", "p"))
+    if (process.platform !== "win32") {
+      // `readFileSync` on a fifo blocks forever. A plugin that hangs the server is the worst
+      // possible failure (invariant 3), so only regular files are opened. Node has no fifo
+      // binding of its own, so the platform tool makes one.
+      spawnSync("mkfifo", [join(tasks, "pipe.md")])
+    }
+    setYamlReader(readerReturning({ schedule: "@daily" }))
+    const { jobs, invalid } = await loadMarkdownJobs(tasks)
+    // It returned at all: reading the fifo would have hung the suite rather than failed it.
+    expect(jobs.map((job) => job.id)).toEqual(["real"])
+    // `notes.txt` and the `nested.md` directory are not job files and are not mentioned.
+    // `archive.md` *is* a `.md` in the jobs directory, so it is refused by name rather than
+    // skipped in silence — "not a job file" and "a job file we cannot read" are different
+    // answers, and only the second one should ever happen by accident.
+    expect(invalid.map((entry) => entry.id)).toEqual(["archive"])
+    expect(invalid[0]!.reason).toMatch(/must open with a `---` line/)
+  })
+
+  it("loads files in filename order and reports the excess above the cap", async () => {
+    for (let n = 0; n < MAX_MARKDOWN_JOBS + 2; n += 1) write(`job-${String(n).padStart(3, "0")}.md`, taskFile("schedule: @daily", "p"))
+    setYamlReader(readerReturning({ schedule: "@daily" }))
+    const { jobs, invalid } = await loadMarkdownJobs(tasks)
+    expect(jobs).toHaveLength(MAX_MARKDOWN_JOBS)
+    expect(jobs[0]!.id).toBe("job-000")
+    expect(jobs[MAX_MARKDOWN_JOBS - 1]!.id).toBe(`job-${String(MAX_MARKDOWN_JOBS - 1).padStart(3, "0")}`)
+    expect(invalid).toHaveLength(1)
+    expect(invalid[0]!.reason).toMatch(new RegExp(`above the cap of ${MAX_MARKDOWN_JOBS}`))
+  })
+
+  it("a missing directory is the v1 state, not an error", async () => {
+    // A JSON-only project must never see an error about a directory it was never asked for.
+    const loaded = await loadMarkdownJobs(join(dir, ".opencode", "tasks"))
+    expect(loaded).toEqual({ jobs: [], invalid: [] })
+  })
+
+  it("refuses every markdown job by name when there is no YAML reader, and says why", async () => {
+    // ADR 0004's degradation: JSON-only operation, reported, never a failed load.
+    write("nightly.md", taskFile("schedule: @daily", "p"))
+    setYamlReader(undefined)
+    const { jobs, invalid } = await loadMarkdownJobs(tasks)
+    expect(jobs).toEqual([])
+    expect(invalid).toHaveLength(1)
+    expect(invalid[0]!.reason).toMatch(/no YAML reader available \(yaml is not installed and none was provided\)/)
+    expect(invalid[0]!.reason).toMatch(/schedules\.json/)
+  })
+})
+
+describe("mergeJobSources — markdown wins, per id (ADR 0004)", () => {
+  const job = (id: string, prompt: string, schedule = "@daily"): JobDefinition => ({
+    id,
+    schedule,
+    timezone: "UTC",
+    prompt,
+    enabled: true,
+    misfire: "skip",
+    maxCatchUp: DEFAULT_MAX_CATCH_UP,
+    runTimeoutMs: MINUTE_MS,
+    session: "reuse",
+  })
+
+  it("yields exactly one job and one reported shadow for a duplicate id", () => {
+    const merged = mergeJobSources(
+      { jobs: [job("nightly", "from json", "0 4 * * *")], invalid: [] },
+      { jobs: [job("nightly", "from markdown", "0 3 * * *")], invalid: [] },
+    )
+    expect(merged.jobs).toHaveLength(1)
+    expect(merged.jobs[0]!.prompt).toBe("from markdown")
+    expect(merged.invalid).toHaveLength(1)
+    // The existing `invalid` shape, reused: the shadow is reported, never silently dropped.
+    expect(merged.invalid[0]).toEqual({
+      id: "nightly",
+      schedule: "0 4 * * *",
+      reason: expect.stringContaining("shadows the job \"nightly\" in .opencode/schedules.json (markdown wins)"),
+    })
+  })
+
+  it("keeps the JSON file's order when a job is shadowed, so a migration does not reshuffle", () => {
+    const merged = mergeJobSources(
+      { jobs: [job("a", "json a"), job("b", "json b"), job("c", "json c")], invalid: [] },
+      { jobs: [job("b", "md b")], invalid: [] },
+    )
+    expect(merged.jobs.map((entry) => entry.id)).toEqual(["a", "b", "c"])
+    expect(merged.jobs[1]!.prompt).toBe("md b")
+  })
+
+  it("lets the two surfaces coexist — that is what makes migration one job at a time", () => {
+    const merged = mergeJobSources(
+      { jobs: [job("json-only", "j")], invalid: [{ id: "broken", schedule: undefined, reason: "bad" }] },
+      { jobs: [job("md-only", "m")], invalid: [{ id: "also-broken", schedule: undefined, reason: "worse" }] },
+    )
+    expect(merged.jobs.map((entry) => entry.id)).toEqual(["json-only", "md-only"])
+    expect(merged.invalid.map((entry) => entry.id)).toEqual(["broken", "also-broken"])
+  })
+
+  it("reports both surfaces' errors rather than dropping one", () => {
+    const merged = mergeJobSources(
+      { jobs: [], invalid: [], error: "unsupported job file version 99" },
+      { jobs: [], invalid: [], error: ".opencode/tasks: EACCES" },
+    )
+    expect(merged.error).toBe("unsupported job file version 99; .opencode/tasks: EACCES")
+  })
+})
+
+describe("markdown task files end to end (T2, ADR 0004)", () => {
+  let dir: string
+  let tasks: string
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "st-t2-"))
+    tasks = join(dir, ".opencode", "tasks")
+    mkdirSync(tasks, { recursive: true })
+  })
+  afterEach(() => {
+    setYamlReader(undefined)
+    rmSync(dir, { recursive: true, force: true })
+  })
+
+  type Added = Array<Record<string, unknown>>
+
+  /** Set up the plugin against `dir` and hand back its registered tools and prompts. */
+  async function run(): Promise<{
+    tools: Added
+    prompts: Record<string, unknown>[]
+    cleanup: () => void
+    list: () => Promise<Record<string, unknown>>
+  }> {
+    const added: Added = []
+    const prompts: Record<string, unknown>[] = []
+    process.env[DATA_DIR_ENV] = join(dir, "state")
+    const cleanup = await plugin.setup({
+      location: { directory: dir, project: { id: "t2" } },
+      storage: { get: async () => undefined, set: async () => {}, remove: async () => {} },
+      session: {
+        create: async () => ({ id: "ses_1" }),
+        prompt: async (input: Record<string, unknown>) => {
+          prompts.push(input)
+          return { id: "inbox_1" }
+        },
+      },
+      tool: {
+        transform: async (cb: (editor: { add?: (tool: unknown) => void }) => void) => {
+          cb({ add: (tool) => void added.push(tool as Record<string, unknown>) })
+          return { dispose() {} }
+        },
+      },
+    } as never)
+    const tool = (name: string): Record<string, unknown> => {
+      const found = added.find((entry) => entry.name === name)
+      if (found === undefined) throw new Error(`tool ${name} was not registered`)
+      return found
+    }
+    return {
+      tools: added,
+      prompts,
+      cleanup: cleanup as () => void,
+      list: async () =>
+        ((await (tool("list").execute as (i: unknown) => Promise<{ output: Record<string, unknown> }>)({})).output),
+    }
+  }
+
+  it("loads, lists and fires a markdown-only project — no schedules.json at all", async () => {
+    writeFileSync(
+      join(tasks, "nightly.md"),
+      taskFile('schedule: "0 3 * * *"\ntimezone: UTC', "Review the diff since the last tag.\n\n- be careful"),
+    )
+    setYamlReader(readerReturning({ schedule: "0 3 * * *", timezone: "UTC" }))
+
+    const { cleanup, list, tools, prompts } = await run()
+    try {
+      const listing = await list()
+      expect(listing.error).toBeUndefined()
+      expect((listing.jobs as Record<string, unknown>[]).map((job) => job.id)).toEqual(["nightly"])
+      // A markdown-only project has real work, so it arbitrates and arms like any other.
+      expect(listing.leaseHeld).toBe(true)
+
+      const run = tools.find((tool) => tool.name === "run")!
+      const out = await (run.execute as (i: Record<string, unknown>) => Promise<{ output: Record<string, unknown> }>)({
+        id: "nightly",
+      })
+      expect(out.output.error).toBeUndefined()
+      // The body reached the session verbatim, inner formatting included.
+      expect(prompts[0]).toMatchObject({
+        text: "Review the diff since the last tag.\n\n- be careful",
+        delivery: "queue",
+      })
+    } finally {
+      cleanup()
+    }
+  })
+
+  it("reports a shadowed id through schedules_list rather than replacing it silently", async () => {
+    writeFileSync(
+      join(dir, ".opencode", "schedules.json"),
+      JSON.stringify({
+        version: 1,
+        jobs: [
+          { id: "nightly", schedule: "0 4 * * *", prompt: "from json", timezone: "UTC" },
+          { id: "json-only", schedule: "@daily", prompt: "still here" },
+        ],
+      }),
+    )
+    writeFileSync(join(tasks, "nightly.md"), taskFile('schedule: "0 3 * * *"\ntimezone: UTC', "from markdown"))
+    setYamlReader(readerReturning({ schedule: "0 3 * * *", timezone: "UTC" }))
+
+    const { cleanup, list } = await run()
+    try {
+      const listing = await list()
+      const jobs = listing.jobs as Record<string, unknown>[]
+      // One job per id, markdown winning, and the JSON-only job untouched.
+      expect(jobs.map((job) => job.id)).toEqual(["nightly", "json-only"])
+      expect(jobs[0]).toMatchObject({ schedule: "0 3 * * *" })
+      const invalid = listing.invalid as Array<{ id: string; reason: string }>
+      expect(invalid).toHaveLength(1)
+      expect(invalid[0]).toMatchObject({ id: "nightly" })
+      expect(invalid[0]!.reason).toMatch(/shadows/)
+    } finally {
+      cleanup()
+    }
+  })
+
+  it("with no YAML reader, markdown jobs are refused by name and the JSON ones still fire", async () => {
+    writeFileSync(
+      join(dir, ".opencode", "schedules.json"),
+      JSON.stringify({ version: 1, jobs: [{ id: "json-job", schedule: "@daily", prompt: "still works" }] }),
+    )
+    writeFileSync(join(tasks, "nightly.md"), taskFile("schedule: @daily", "never dispatched"))
+    setYamlReader(undefined)
+
+    const { cleanup, list, tools, prompts } = await run()
+    try {
+      const listing = await list()
+      expect((listing.jobs as Record<string, unknown>[]).map((job) => job.id)).toEqual(["json-job"])
+      const invalid = listing.invalid as Array<{ id: string; reason: string }>
+      expect(invalid.map((entry) => entry.id)).toEqual(["nightly"])
+      expect(invalid[0]!.reason).toMatch(/no YAML reader available/)
+
+      const run = tools.find((tool) => tool.name === "run")!
+      await (run.execute as (i: Record<string, unknown>) => Promise<unknown>)({ id: "json-job" })
+      expect(prompts).toHaveLength(1)
+      expect(prompts[0]).toMatchObject({ text: "still works" })
+    } finally {
+      cleanup()
+    }
+  })
+
+  it("still reports a corrupt schedules.json when markdown jobs are carrying the schedule", async () => {
+    // v1 only reported a read failure when nothing loaded at all. With a second surface, a
+    // broken file that is being masked by working markdown jobs has to be reported anyway —
+    // otherwise an author's edit appears to do nothing.
+    writeFileSync(join(dir, ".opencode", "schedules.json"), "{ not json")
+    writeFileSync(join(tasks, "nightly.md"), taskFile("schedule: @daily", "review"))
+    setYamlReader(readerReturning({ schedule: "@daily" }))
+
+    const { cleanup, list } = await run()
+    try {
+      const listing = await list()
+      expect((listing.jobs as Record<string, unknown>[]).map((job) => job.id)).toEqual(["nightly"])
+      expect(listing.error).toMatch(/schedules\.json/)
+    } finally {
+      cleanup()
+    }
+  })
+
+it.runIf(realYaml !== undefined)(
+    "parses real YAML frontmatter end to end — the reader is the only parser here",
+    async () => {
+      setYamlReader(realYaml)
+      writeFileSync(
+        join(tasks, "nightly.md"),
+        taskFile(
+          'schedule: "0 3 * * *"  # a comment after a quoted cron\ntimezone: Europe/Madrid\nsession: fresh          # reuse (default) | fresh\nrunTimeout: 1h30m\npermissions:\n  bash:\n    "*": deny\n    "git diff *": allow\n  edit: deny',
+          "Review the diff.",
+        ),
+      )
+      const { cleanup, list } = await run()
+      try {
+        const listing = await list()
+        expect(listing.invalid).toEqual([])
+        const jobs = listing.jobs as Record<string, unknown>[]
+        expect(jobs[0]).toMatchObject({
+          id: "nightly",
+          schedule: "0 3 * * *",
+          timezone: "Europe/Madrid",
+          session: "fresh",
+          runTimeoutMs: 90 * MINUTE_MS,
+          askAsDeny: [],
+        })
+        // The nested resource map is the reader's work, not ours, and it arrives intact.
+        expect(jobs[0]!.permissions).toEqual({ bash: { "*": "deny", "git diff *": "allow" }, edit: "deny" })
+      } finally {
+        cleanup()
+      }
+    },
+  )
+
+  it.runIf(realYaml !== undefined)("refuses a YAML alias bomb, by name", async () => {
+    // Anchors and aliases are the format's own expansion bomb: a few hundred bytes describe a
+    // graph that costs gigabytes to materialize. The budget we ask for is what stops it.
+    setYamlReader(realYaml)
+    writeFileSync(
+      join(tasks, "bomb.md"),
+      taskFile(
+        [
+          'a: &a [x,x,x,x,x,x,x,x]',
+          "b: &b [*a,*a,*a,*a,*a,*a,*a,*a]",
+          "c: &c [*b,*b,*b,*b,*b,*b,*b,*b]",
+          "d: [*c,*c,*c,*c]",
+          'schedule: "@daily"',
+        ].join("\n"),
+        "body",
+      ),
+    )
+    writeFileSync(join(tasks, "fine.md"), taskFile('schedule: "@daily"', "body"))
+    const { cleanup, list } = await run()
+    try {
+      const listing = await list()
+      expect((listing.jobs as Record<string, unknown>[]).map((job) => job.id)).toEqual(["fine"])
+      const invalid = listing.invalid as Array<{ id: string; reason: string }>
+      expect(invalid).toHaveLength(1)
+      expect(invalid[0]!.reason).toMatch(/Excessive alias count/)
+    } finally {
+      cleanup()
     }
   })
 })
