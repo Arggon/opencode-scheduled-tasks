@@ -51,15 +51,20 @@ cp src/index.ts .opencode/plugins/scheduled-tasks/index.ts
 opencode reload
 ```
 
-### From npm or git (once published)
+### From git (available now)
 
 ```sh
-opencode plugin add opencode-scheduled-tasks            # npm
-opencode plugin add github:Arggon/opencode-scheduled-tasks   # git
+opencode plugin add github:Arggon/opencode-scheduled-tasks
 ```
 
 `opencode plugin add` writes to the **global** config and installs into
 `~/.config/opencode/`, so it is the same thing as the copy above, done for you.
+
+### From npm
+
+Not yet published. The name `opencode-scheduled-tasks` is already taken on npm by
+[`jdormit/opencode-tasks`](https://github.com/jdormit/opencode-tasks), so publishing here
+needs a different name first.
 
 ### Jobs are per project, the plugin is not
 
@@ -217,6 +222,16 @@ shipping an OS daemon (ADR 0001). The implementations are ours and differ in eng
 storage and API surface. See
 [ADR 0007](ArggonManager/docs/adr/0007-attribution-and-lineage.md) for the full account,
 including the search that should have found this project first.
+
+## Status
+
+v1 shipped: declarative jobs, tick loop, per-job sessions, cost-bounded misfire handling,
+cross-process single-writer lease, DST-correct cron. v2 in progress — markdown task files,
+per-job permissions, one-off tasks and session loops. ADRs and specs live under
+`ArggonManager/docs/`.
+
+Known limitation: **jobs only run while an OpenCode server is up.** For a job that must fire
+regardless, drive `opencode run` from OS scheduling (see below).
 
 ## Design
 
