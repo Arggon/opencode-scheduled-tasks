@@ -1281,6 +1281,150 @@ export function acquireLease(path: string, options: { now?: () => number; ttlMs?
 }
 
 // ---------------------------------------------------------------------------
+// One-off tasks (ADR 0006)
+// ---------------------------------------------------------------------------
+
+/**
+ * An ephemeral single-run task.
+ *
+ * Deliberately **not** a `JobDefinition`: a one-off has an absolute instant and no
+ * recurrence, and it never reaches a job file. Keeping the two types apart is what makes
+ * ADR 0001's "recurring jobs are file-only" guarantee testable.
+ */
+export type OneOffTask = {
+  id: string
+  /** Absolute instant, epoch ms. */
+  dueAt: number
+  prompt: string
+  agent?: string
+  model?: ModelRef
+  runTimeoutMs: number
+  permissions?: PermissionSet
+  createdAt: number
+}
+
+/** Most one-offs a project may hold pending at once. */
+export const DEFAULT_ONEOFF_CAP = 50
+
+/** Hard ceiling on pending one-offs, whatever the cap is configured to. */
+export const MAX_ONEOFF_CAP = 200
+
+/** Ceiling on one-off prompt length; job data is untrusted. */
+const ONEOFF_PROMPT_MAX = 20_000
+
+const ONEOFF_PREFIX = `${STORAGE_PREFIX}oneoff/`
+
+/**
+ * A past instant inside this window is accepted and fires on the next tick rather than
+ * being refused. Refusing outright would make "schedule it 30s ago" impossible; running it
+ * silently much later would be dishonest. Everything beyond the window is refused.
+ */
+export const ONEOFF_GRACE_MS = 5 * MINUTE_MS
+
+export type OneOffValidation =
+  | { task: Omit<OneOffTask, "id" | "createdAt"> }
+  | { reason: string }
+
+/**
+ * Validate a `schedules_schedule` request.
+ *
+ * `nowMs` is injected so the grace window is testable without a clock.
+ */
+export function validateOneOff(
+  input: Record<string, unknown>,
+  nowMs: number,
+): OneOffValidation {
+  const prompt = typeof input.prompt === "string" ? input.prompt.trim() : ""
+  if (prompt === "") return { reason: "prompt is required" }
+  if (prompt.length > ONEOFF_PROMPT_MAX) {
+    return { reason: `prompt longer than ${ONEOFF_PROMPT_MAX} characters` }
+  }
+
+  const dueAt = typeof input.dueAt === "number" ? input.dueAt : Number.NaN
+  if (!Number.isFinite(dueAt)) {
+    const parsed = parseDuration(input.dueIn)
+    if (parsed === undefined || "reason" in parsed) {
+      return { reason: "dueAt (epoch ms) or dueIn (a duration from now) is required" }
+    }
+    return finish(input, prompt, nowMs + parsed.ms)
+  }
+  if (dueAt < nowMs - ONEOFF_GRACE_MS) {
+    return {
+      reason: `dueAt is more than ${Math.round(ONEOFF_GRACE_MS / 1000)}s in the past; pass a future instant`,
+    }
+  }
+  return finish(input, prompt, dueAt)
+}
+
+function finish(
+  input: Record<string, unknown>,
+  prompt: string,
+  dueAt: number,
+): OneOffValidation {
+  const agent = asString(input.agent)
+  const model = parseModelRef(input.model)
+  if (model !== undefined && "reason" in model) return { reason: model.reason }
+  const timeout = parseDuration(input.runTimeout)
+  if (timeout !== undefined && "reason" in timeout) return { reason: timeout.reason }
+  let permissions: PermissionSet | undefined
+  if (input.permissions !== undefined) {
+    const parsed = validatePermissions(input.permissions)
+    if ("reason" in parsed) return { reason: parsed.reason }
+    permissions = parsed.permissions
+  }
+  return {
+    task: {
+      dueAt,
+      prompt,
+      ...(agent !== undefined ? { agent } : {}),
+      ...(model !== undefined && "model" in model ? { model: model.model } : {}),
+      runTimeoutMs:
+        timeout !== undefined && "ms" in timeout
+          ? boundedInt(timeout.ms, DEFAULT_RUN_TIMEOUT_MS, MINUTE_MS, 24 * 60 * MINUTE_MS)
+          : DEFAULT_RUN_TIMEOUT_MS,
+      ...(permissions !== undefined ? { permissions } : {}),
+    },
+  }
+}
+
+/** Ids are random because they are created and consumed by an agent, not authored. */
+function oneOffId(): string {
+  return `oneoff_${Math.random().toString(36).slice(2, 10)}${Date.now().toString(36)}`
+}
+
+/** Read pending one-offs, dropping malformed entries rather than failing the load. */
+async function loadOneOffs(ctx: PluginContext): Promise<OneOffTask[]> {
+  const stored = await storageGet(ctx, `${ONEOFF_PREFIX}pending`)
+  if (!Array.isArray(stored)) return []
+  const out: OneOffTask[] = []
+  for (const raw of stored) {
+    if (raw === null || typeof raw !== "object") continue
+    const record = raw as Record<string, unknown>
+    const id = asString(record.id)
+    const prompt = asString(record.prompt)
+    if (id === undefined || prompt === undefined) continue
+    if (typeof record.dueAt !== "number" || !Number.isFinite(record.dueAt)) continue
+    if (typeof record.createdAt !== "number") continue
+    const model = parseModelRef(record.model)
+    out.push({
+      id,
+      dueAt: record.dueAt,
+      prompt,
+      createdAt: record.createdAt,
+      runTimeoutMs: boundedInt(record.runTimeoutMs, DEFAULT_RUN_TIMEOUT_MS, MINUTE_MS, 24 * 60 * MINUTE_MS),
+      ...(asString(record.agent) !== undefined ? { agent: asString(record.agent) as string } : {}),
+      ...(model !== undefined && "model" in model ? { model: model.model } : {}),
+      ...(record.permissions !== undefined ? { permissions: record.permissions as PermissionSet } : {}),
+    })
+  }
+  return out
+}
+
+async function saveOneOffs(ctx: PluginContext, tasks: readonly OneOffTask[]): Promise<void> {
+  await storageSet(ctx, `${ONEOFF_PREFIX}pending`, tasks.slice(0, MAX_ONEOFF_CAP))
+}
+
+// ---------------------------------------------------------------------------
 // OpenCode V2 plugin context (structural types — no `@opencode/plugin` import)
 // ---------------------------------------------------------------------------
 
@@ -1434,6 +1578,8 @@ type SchedulerState = {
   sessions: Map<string, string>
   /** Bounded per-job run history, oldest-first. */
   history: Map<string, HistoryEntry[]>
+  /** Pending one-off tasks. Runtime-only; never written to a job file (ADR 0006). */
+  oneOffs: OneOffTask[]
   inFlight: Set<string>
   fileError?: string
   invalid: InvalidJob[]
@@ -1462,6 +1608,16 @@ const RUN_OUTPUT = {
 const FORMAT_OUTPUT = {
   type: "object",
   properties: { reference: { type: "string" } },
+}
+
+const SCHEDULE_OUTPUT = {
+  type: "object",
+  properties: { id: { type: "string" }, dueAt: { type: "string" }, pending: { type: "number" } },
+}
+
+const CANCEL_OUTPUT = {
+  type: "object",
+  properties: { id: { type: "string" }, cancelled: { type: "boolean" }, pending: { type: "number" } },
 }
 
 const HISTORY_OUTPUT = {
@@ -1587,13 +1743,76 @@ async function saveHistory(ctx: PluginContext, state: SchedulerState, jobId: str
 }
 
 /**
+ * Dispatch a one-off: same target-application (agent, model, permissions) and the same
+ * bounded run record as a recurring job, but no cron and no job-file entry.
+ *
+ * Reuses `applyJobTarget` deliberately — a one-off gets the same permission discipline as a
+ * scheduled job, so it cannot become a loophole.
+ */
+async function runOneOff(
+  ctx: PluginContext,
+  state: SchedulerState,
+  task: OneOffTask,
+): Promise<RunStatus> {
+  if (typeof ctx.session?.create !== "function") {
+    logOnce("no-session-create", "ctx.session.create is unavailable; runs cannot be dispatched")
+    return "failed"
+  }
+  if (typeof ctx.session?.prompt !== "function") {
+    logOnce("no-prompt", "ctx.session.prompt is unavailable; one-offs cannot be dispatched")
+    return "failed"
+  }
+  let outcome: RunStatus = "failed"
+  let model = "unknown"
+  let sessionID: string | undefined
+  try {
+    const created = await ctx.session.create({ title: `scheduled: ${task.id}` })
+    sessionID = sessionIdOf(created)
+    if (sessionID === undefined) return "failed"
+    model = await applyJobTarget(ctx, task, sessionID)
+    logLine(`running one-off ${task.id} (due ${new Date(task.dueAt).toISOString()}, model ${model})`)
+    await ctx.session.prompt({ sessionID, text: task.prompt, delivery: "queue" })
+    outcome = "ok"
+  } catch (error) {
+    const message = clip(error instanceof Error ? error.message : String(error), 300)
+    logLine(`one-off ${task.id} failed: ${message}`)
+    state.history.set(
+      task.id,
+      pushHistory(state.history.get(task.id) ?? [], {
+        dueAt: task.dueAt,
+        startedAt: Date.now(),
+        outcome: "failed",
+        model,
+        ...(sessionID !== undefined ? { sessionID } : {}),
+        error: message,
+      }),
+    )
+    await saveHistory(ctx, state, task.id)
+  }
+  return outcome
+}
+
+/**
  * Point the target session at the job's agent and model before dispatching.
  *
  * A job that names no model **inherits the session default**, which for an unattended
  * recurring job is usually a paid model. That is why the resolved model is echoed in the
  * `running` line: the log is where you see which model is being billed.
  */
-async function applyJobTarget(ctx: PluginContext, job: JobDefinition, sessionID: string): Promise<string> {
+/**
+ * The part of a task that decides *how* it is dispatched.
+ *
+ * Structural rather than `JobDefinition`, so a one-off and a recurring job share this path
+ * without either being cast into the other.
+ */
+type DispatchTarget = {
+  id: string
+  agent?: string
+  model?: ModelRef
+  permissions?: PermissionSet
+}
+
+async function applyJobTarget(ctx: PluginContext, job: DispatchTarget, sessionID: string): Promise<string> {
   if (job.agent !== undefined && typeof ctx.session?.switchAgent === "function") {
     await ctx.session.switchAgent({ sessionID, agent: job.agent })
   }
@@ -1739,6 +1958,37 @@ async function tick(ctx: PluginContext, state: SchedulerState, lease: Lease, max
     decisions.push(decision)
   }
 
+  // One-offs are drained after recurring jobs so a one-off never starves a schedule.
+  const due = state.oneOffs.filter((task) => task.dueAt <= now)
+  if (due.length > 0) {
+    const claimed = due.slice(0, Math.max(0, maxConcurrent - state.inFlight.size - decisions.length))
+    if (claimed.length === 0 && due.length > 0) {
+      logLine(`skipping ${due.length} one-off task(s): concurrency cap reached (${maxConcurrent})`)
+    }
+    // Removed before running, so a crash cannot replay a one-off forever: the same rule the
+    // recurring cursor uses.
+    state.oneOffs = state.oneOffs.filter((task) => !claimed.includes(task))
+    await saveOneOffs(ctx, state.oneOffs)
+    for (const task of claimed) {
+      const entry = task.id
+      void runOneOff(ctx, state, task).then(async (outcome) => {
+        // A completed one-off survives only in history, then is gone (ADR 0006).
+        if (outcome === "ok") {
+          state.history.set(
+            entry,
+            pushHistory(state.history.get(entry) ?? [], {
+              dueAt: task.dueAt,
+              startedAt: Date.now(),
+              outcome,
+              model: task.model === undefined ? "session default" : `${task.model.providerID}/${task.model.id}`,
+            }),
+          )
+          await saveHistory(ctx, state, entry)
+        }
+      })
+    }
+  }
+
   for (const decision of decisions) {
     state.inFlight.add(decision.job.id)
     void runJob(ctx, state, decision.job, decision.occurrence.dueAt)
@@ -1788,12 +2038,102 @@ function buildTools(ctx: PluginContext, state: SchedulerState, lease: Lease, tic
             }
           }),
           invalid: state.invalid,
+          // Pending one-offs are runtime state, listed separately from the file-defined
+          // jobs so the two are never mistaken for one another.
+          oneOffs: [...state.oneOffs]
+            .sort((a, b) => a.dueAt - b.dueAt)
+            .map((task) => ({
+              id: task.id,
+              dueAt: new Date(task.dueAt).toISOString(),
+              prompt: clip(task.prompt, 200),
+              model: task.model === undefined ? "session default" : `${task.model.providerID}/${task.model.id}`,
+            })),
+          oneOffCap: DEFAULT_ONEOFF_CAP,
           ...(state.fileError !== undefined ? { error: state.fileError } : {}),
           leaseHeld: lease.held,
           leaseForeign: lease.foreign,
           tickMs,
         },
       }),
+    },
+    {
+      name: "schedule",
+      description:
+        "Schedule a one-off prompt for a specific time. Runtime-only and ephemeral: it never becomes a recurring job and never touches a job file.",
+      input: {
+        type: "object",
+        properties: {
+          prompt: { type: "string", description: "Text dispatched at the due time." },
+          dueAt: { type: "number", description: "Absolute epoch ms. Optional when dueIn is given." },
+          dueIn: { type: "string", description: "Duration from now, e.g. \"30m\" or \"2h\"." },
+          model: { type: "string", description: "provider/model. Set it: a one-off still costs a model call." },
+          agent: { type: "string" },
+          runTimeout: { type: "string", description: "Duration, e.g. \"15m\"." },
+          permissions: { type: "object", description: "Permission rules in opencode's own schema." },
+        },
+        required: ["prompt"],
+        additionalProperties: false,
+      },
+      output: SCHEDULE_OUTPUT,
+      options: { namespace: TOOL_NAMESPACE, codemode: true },
+      execute: async (input) => {
+        const now = Date.now()
+        const validated = validateOneOff(input, now)
+        if ("reason" in validated) return { output: { error: validated.reason } }
+        const pending = state.oneOffs.filter((task) => task.dueAt > now).length
+        if (pending >= DEFAULT_ONEOFF_CAP) {
+          // Reported, not silently enforced: the agent can cancel or wait.
+          return {
+            output: {
+              error: `at the cap of ${DEFAULT_ONEOFF_CAP} pending one-off tasks; cancel one or wait for one to run`,
+              pending,
+            },
+          }
+        }
+        const task: OneOffTask = { ...validated.task, id: oneOffId(), createdAt: now }
+        state.oneOffs = [...state.oneOffs, task]
+        await saveOneOffs(ctx, state.oneOffs)
+        logLine(`scheduled one-off ${task.id} for ${new Date(task.dueAt).toISOString()}`)
+        return {
+          output: {
+            id: task.id,
+            dueAt: new Date(task.dueAt).toISOString(),
+            pending: state.oneOffs.length,
+          },
+        }
+      },
+    },
+    {
+      name: "cancel",
+      description: "Cancel a pending one-off task by id.",
+      input: {
+        type: "object",
+        properties: { id: { type: "string", description: "One-off id, as returned by schedules_schedule." } },
+        required: ["id"],
+        additionalProperties: false,
+      },
+      output: CANCEL_OUTPUT,
+      options: { namespace: TOOL_NAMESPACE, codemode: true },
+      execute: async (input) => {
+        const id = asString(input.id)
+        if (id === undefined) return { output: { error: "id is required" } }
+        const before = state.oneOffs.length
+        const target = state.oneOffs.find((task) => task.id === id)
+        if (target === undefined) {
+          // Naming the id matters: "no such one-off" and "already ran" are different
+          // answers, and an agent retrying needs to know which happened.
+          return {
+            output: {
+              error: `no pending one-off with id "${id}" (it may have already run; check schedules_history)`,
+              pending: before,
+            },
+          }
+        }
+        state.oneOffs = state.oneOffs.filter((task) => task.id !== id)
+        await saveOneOffs(ctx, state.oneOffs)
+        logLine(`cancelled one-off ${id}`)
+        return { output: { id, cancelled: true, pending: state.oneOffs.length } }
+      },
     },
     {
       name: "history",
@@ -1914,6 +2254,7 @@ const definition: PluginDefinition = {
       states: {},
       sessions: new Map(),
       history: new Map(),
+      oneOffs: [],
       inFlight: new Set(),
       invalid: [],
       storageAvailable: typeof ctx.storage?.get === "function",
@@ -1944,6 +2285,7 @@ const definition: PluginDefinition = {
     reloadJobs(ctx, directory, state)
     await loadStates(ctx, state)
     await loadAllHistory(ctx, state)
+    state.oneOffs = await loadOneOffs(ctx)
 
     const hasWork = state.jobs.some((job) => job.enabled)
 

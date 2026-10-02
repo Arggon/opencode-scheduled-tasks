@@ -22,9 +22,11 @@ import plugin, {
   pushHistory,
   resolveDue,
   validateJob,
+  validateOneOff,
   wallParts,
   MAX_HISTORY_LIMIT,
   collectAsks,
+  DEFAULT_ONEOFF_CAP,
   type HistoryEntry,
   type JobDefinition,
   type JobState,
@@ -564,7 +566,7 @@ describe("plugin setup — context wiring and failure isolation", () => {
 
     expect(calls).toHaveLength(1)
     const names = calls[0]!.added.map((tool) => tool.name)
-    expect(names).toEqual(["list", "history", "format", "run"])
+    expect(names).toEqual(["list", "schedule", "cancel", "history", "format", "run"])
     for (const tool of calls[0]!.added) {
       expect((tool.options as Record<string, unknown>).namespace).toBe("schedules")
       expect((tool.options as Record<string, unknown>).codemode).toBe(true)
@@ -1315,6 +1317,170 @@ describe("per-job permissions (T4)", () => {
       expect(asks.askAsDeny).toEqual(["edit"])
       expect(asks.permissions).toEqual({ edit: "ask", read: "deny" })
       expect(out.output.jobs.find((j) => j.id === "plain")!.permissions).toBe("session default")
+    } finally {
+      ;(cleanup as () => void)?.()
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+})
+
+describe("one-off tasks (T5, ADR 0006)", () => {
+  const now = Date.UTC(2026, 4, 10, 12, 0, 0)
+
+  it("accepts an absolute instant", () => {
+    const out = validateOneOff({ prompt: "p", dueAt: now + 60_000 }, now)
+    expect(out).toHaveProperty("task")
+    expect((out as { task: { dueAt: number } }).task.dueAt).toBe(now + 60_000)
+  })
+
+  it("accepts a relative duration instead", () => {
+    const out = validateOneOff({ prompt: "p", dueIn: "2h" }, now)
+    expect((out as { task: { dueAt: number } }).task.dueAt).toBe(now + 2 * 60 * MINUTE_MS)
+  })
+
+  it("accepts a slightly past instant inside the grace window", () => {
+    expect(validateOneOff({ prompt: "p", dueAt: now - 60_000 }, now)).toHaveProperty("task")
+  })
+
+  it("refuses an instant well beyond the grace window rather than running it silently", () => {
+    const out = validateOneOff({ prompt: "p", dueAt: now - 60 * MINUTE_MS }, now)
+    expect(out).toHaveProperty("reason")
+    expect((out as { reason: string }).reason).toMatch(/in the past/)
+  })
+
+  it("requires a prompt and a time", () => {
+    expect(validateOneOff({ dueAt: now }, now)).toHaveProperty("reason")
+    expect(validateOneOff({ prompt: "p" }, now)).toHaveProperty("reason")
+    expect(validateOneOff({ prompt: "p", dueIn: "bogus" }, now)).toHaveProperty("reason")
+  })
+
+  it("validates the optional fields with the same rules as a job", () => {
+    expect(validateOneOff({ prompt: "p", dueAt: now + 1, model: "nope" }, now)).toHaveProperty("reason")
+    expect(validateOneOff({ prompt: "p", dueAt: now + 1, permissions: { edit: "maybe" } }, now)).toHaveProperty(
+      "reason",
+    )
+    const ok = validateOneOff({ prompt: "p", dueAt: now + 1, model: "opencode/space-bunny-free" }, now)
+    expect((ok as { task: { model: { id: string } } }).task.model.id).toBe("space-bunny-free")
+  })
+
+  it("bounds a one-off prompt", () => {
+    expect(validateOneOff({ prompt: "x".repeat(20_001), dueAt: now + 1 }, now)).toHaveProperty("reason")
+  })
+
+  it("creates, lists and cancels without ever touching a job file", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "st-oneoff-"))
+    mkdirSync(join(dir, ".opencode"), { recursive: true })
+    const jobsFile = join(dir, ".opencode", "schedules.json")
+    writeFileSync(jobsFile, JSON.stringify({ version: 1, jobs: [] }))
+    const jobsBefore = readFileSync(jobsFile, "utf8")
+    let added: Array<Record<string, unknown>> = []
+    const ctx = {
+      location: { directory: dir, project: { id: "oneoff" } },
+      session: { create: async () => ({ id: "s" }), prompt: async () => ({ id: "i" }) },
+      tool: {
+        transform: async (cb: (e: { add?: (tool: unknown) => void }) => void) => {
+          cb({ add: (tool) => added.push(tool as Record<string, unknown>) })
+          return { dispose: () => {} }
+        },
+      },
+    }
+    const cleanup = await plugin.setup(ctx as never)
+    try {
+      const schedule = added.find((tool) => tool.name === "schedule")!
+      const cancel = added.find((tool) => tool.name === "cancel")!
+      const list = added.find((tool) => tool.name === "list")!
+      const sExec = schedule.execute as (i: Record<string, unknown>) => Promise<{ output: Record<string, unknown> }>
+      const cExec = cancel.execute as (i: Record<string, unknown>) => Promise<{ output: Record<string, unknown> }>
+      const lExec = list.execute as (i: unknown) => Promise<{ output: Record<string, unknown> }>
+
+      const created = await sExec({ prompt: "run the migration check", dueIn: "2h" })
+      expect(created.output.id).toMatch(/^oneoff_/)
+      expect(created.output.pending).toBe(1)
+
+      const listed = await lExec({})
+      expect((listed.output.oneOffs as unknown[]).length).toBe(1)
+      expect(listed.output.oneOffCap).toBe(50)
+
+      const id = created.output.id as string
+      const cancelled = await cExec({ id })
+      expect(cancelled.output).toMatchObject({ id, cancelled: true, pending: 0 })
+
+      // ADR 0006's guarantee, asserted rather than asserted-in-prose.
+      expect(readFileSync(jobsFile, "utf8")).toBe(jobsBefore)
+    } finally {
+      ;(cleanup as () => void)?.()
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it("reports a typed error naming an unknown or already-run one-off", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "st-oneoff2-"))
+    mkdirSync(join(dir, ".opencode"), { recursive: true })
+    writeFileSync(join(dir, ".opencode", "schedules.json"), JSON.stringify({ version: 1, jobs: [] }))
+    let added: Array<Record<string, unknown>> = []
+    const ctx = {
+      location: { directory: dir, project: { id: "oneoff2" } },
+      session: { create: async () => ({ id: "s" }), prompt: async () => ({ id: "i" }) },
+      tool: {
+        transform: async (cb: (e: { add?: (tool: unknown) => void }) => void) => {
+          cb({ add: (tool) => added.push(tool as Record<string, unknown>) })
+          return { dispose: () => {} }
+        },
+      },
+    }
+    const cleanup = await plugin.setup(ctx as never)
+    try {
+      const cancel = added.find((tool) => tool.name === "cancel")!
+      const out = await (cancel.execute as (i: Record<string, unknown>) => Promise<{ output: Record<string, unknown> }>)({
+        id: "oneoff_missing",
+      })
+      expect(out.output.error).toMatch(/no pending one-off with id "oneoff_missing"/)
+      expect(out.output.error).toMatch(/may have already run/)
+    } finally {
+      ;(cleanup as () => void)?.()
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it("reports the cap instead of silently refusing", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "st-oneoff3-"))
+    mkdirSync(join(dir, ".opencode"), { recursive: true })
+    writeFileSync(join(dir, ".opencode", "schedules.json"), JSON.stringify({ version: 1, jobs: [] }))
+    const store = new Map<string, unknown>()
+    // Pre-seed the cap so the next create must refuse.
+    const seeded = Array.from({ length: 50 }, (_, n) => ({
+      id: `oneoff_seed${n}`,
+      dueAt: Date.now() + 10 * MINUTE_MS,
+      prompt: "p",
+      createdAt: Date.now(),
+      runTimeoutMs: MINUTE_MS,
+    }))
+    store.set("scheduled-tasks/oneoff/pending", seeded)
+    let added: Array<Record<string, unknown>> = []
+    const ctx = {
+      location: { directory: dir, project: { id: "oneoff3" } },
+      storage: {
+        get: async (k: string) => store.get(k),
+        set: async (k: string, v: unknown) => void store.set(k, v),
+        remove: async (k: string) => void store.delete(k),
+      },
+      session: { create: async () => ({ id: "s" }), prompt: async () => ({ id: "i" }) },
+      tool: {
+        transform: async (cb: (e: { add?: (tool: unknown) => void }) => void) => {
+          cb({ add: (tool) => added.push(tool as Record<string, unknown>) })
+          return { dispose: () => {} }
+        },
+      },
+    }
+    const cleanup = await plugin.setup(ctx as never)
+    try {
+      const schedule = added.find((tool) => tool.name === "schedule")!
+      const out = await (schedule.execute as (i: Record<string, unknown>) => Promise<{ output: Record<string, unknown> }>)({
+        prompt: "p",
+        dueIn: "1h",
+      })
+      expect(out.output.error).toMatch(/at the cap of 50/)
+      expect(out.output.pending).toBe(50)
     } finally {
       ;(cleanup as () => void)?.()
       rmSync(dir, { recursive: true, force: true })
