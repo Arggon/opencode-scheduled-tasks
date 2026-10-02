@@ -4,6 +4,7 @@ status: in_progress
 id: bug-run-timeout-never-enforced
 title: "runTimeout bounds nothing: a hung run latches the concurrency cap and lets a second instance double-fire"
 assignee: arggon
+branch: fix/bug-run-timeout-never-enforced
 parent: ephemeral-tasks-one-offs-and-session-loops
 labels: []
 priority: p0
