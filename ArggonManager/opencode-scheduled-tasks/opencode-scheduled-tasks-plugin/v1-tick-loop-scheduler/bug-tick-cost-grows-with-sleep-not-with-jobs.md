@@ -4,6 +4,7 @@ status: in_progress
 id: bug-tick-cost-grows-with-sleep-not-with-jobs
 title: "One tick costs O(occurrences), not O(jobs): a long sleep walks 1000 occurrences to log a number nobody reads"
 assignee: arggon
+branch: fix/bug-tick-cost-grows-with-sleep-not-with-jobs
 parent: v1-tick-loop-scheduler
 labels: []
 priority: p1
