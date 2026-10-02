@@ -62,9 +62,10 @@ opencode plugin add github:Arggon/opencode-scheduled-tasks
 
 ### From npm
 
-Not yet published. The name `opencode-scheduled-tasks` is already taken on npm by
-[`jdormit/opencode-tasks`](https://github.com/jdormit/opencode-tasks), so publishing here
-needs a different name first.
+Not yet published. The name `opencode-scheduled-tasks` is taken on npm by
+[`jdormit/opencode-tasks`](https://github.com/jdormit/opencode-tasks), so this package publishes
+as **`arggon-opencode2-scheduled-tasks`**. The `opencode2` infix is deliberate: it distinguishes the
+V2 plugin surface from the V1-era packages, and it is why the repository and the npm name differ.
 
 ### Jobs are per project, the plugin is not
 
