@@ -1,13 +1,15 @@
 ---
 type: bug
-status: todo
+status: in_progress
 id: bug-tick-cost-grows-with-sleep-not-with-jobs
 title: "One tick costs O(occurrences), not O(jobs): a long sleep walks 1000 occurrences to log a number nobody reads"
+assignee: arggon
 parent: v1-tick-loop-scheduler
 labels: []
 priority: p1
 created: "2026-10-02"
 updated: "2026-10-02"
+claimed_at: "2026-10-02T23:17:22.320Z"
 depends_on: [bug-backfill-collapses-to-one-run-and-never-reports-truncation]
 ---
 <!--
