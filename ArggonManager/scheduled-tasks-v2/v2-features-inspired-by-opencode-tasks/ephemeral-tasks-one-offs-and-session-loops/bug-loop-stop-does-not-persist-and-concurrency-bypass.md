@@ -158,3 +158,6 @@ on the next macrotask, so a finished post no longer looks in flight) and `failWr
 ### handoff 2026-10-02 @ses_f0273ba47ffe8nSj6fb5n88RMi (session: ses_f0273ba47ffe8nSj6fb5n88RMi) — next: Code-review the branch, then open a PR referencing the item id; 191 tests green, all six boxes ticked with notes.
 - branch: fix/bug-loop-stop-does-not-persist-and-concurrency-bypass
 - open questions: Drain order (loops before one-offs) means a one-off can be skipped for a loop at cap 1 - policy call?; runTimeoutMs is stored but unenforced for one-offs too; loop history shares the history/ key spa…
+
+### 2026-10-02 @ses_f037cc89cffeOo07JPEJShqzJw
+**Live confirmation that loop stop persists** (v2.0.22, deployed build): the `loop2` project log shows `started loop …` → `stopped loop …` → `stopped all loops in session ses_abc` → `no enabled jobs, pending one-off or loop left; timer stopped and the writer lease released`, with no resurrection on the next `start_loop`. The concurrency-cap and `applyJobTarget` halves are covered by the suite; the persistence half is now also confirmed on the real host.
