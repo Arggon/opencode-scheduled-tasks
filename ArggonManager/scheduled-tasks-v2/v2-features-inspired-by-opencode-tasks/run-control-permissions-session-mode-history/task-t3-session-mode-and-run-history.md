@@ -1,12 +1,14 @@
 ---
 type: task
-status: todo
+status: in_progress
 id: task-t3-session-mode-and-run-history
 title: Session mode (reuse/fresh) and bounded run history
+assignee: arggon
 parent: run-control-permissions-session-mode-history
 labels: []
 created: "2026-10-02"
 updated: "2026-10-02"
+claimed_at: "2026-10-02T15:05:45.683Z"
 depends_on: [task-t1-durations-and-format-tool]
 ---
 <!--
