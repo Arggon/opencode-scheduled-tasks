@@ -1,6 +1,6 @@
 ---
 type: story
-status: todo
+status: done
 id: hygiene-ci-gates-and-doc-statuses
 title: "Hygiene: CI gates and doc statuses"
 parent: v2-features-inspired-by-opencode-tasks

@@ -1,15 +1,14 @@
 ---
 type: task
-status: in_progress
+status: done
 id: task-chore-ci-and-doc-statuses-for-plugin-and-v2
 title: "No CI runs the plugin's tests; v2 docs statuses were never flipped"
-branch: chore/task-chore-ci-and-doc-statuses-for-plugin-and-v2
 assignee: arggon
+branch: chore/task-chore-ci-and-doc-statuses-for-plugin-and-v2
 parent: hygiene-ci-gates-and-doc-statuses
 labels: []
 created: "2026-10-02"
 updated: "2026-10-02"
-claimed_at: "2026-10-02T15:56:32.879Z"
 ---
 <!--
   Placement (v0): ArggonManager/scheduled-tasks-v2/v2-features-inspired-by-opencode-tasks/hygiene-ci-gates-and-doc-statuses/task-chore-ci-and-doc-statuses-for-plugin-and-v2.md
@@ -40,11 +39,15 @@ meant to deliver.
 
 ## Acceptance
 
-- [ ] CI runs `npm run check` (typecheck + tests) on push/PR and fails on a failure.
-- [ ] The harness (`npx tsx harness/smoke.ts`) is exercised in CI, or its exclusion is
+- [x] CI runs `npm run check` (typecheck + tests) on push/PR and fails on a failure.
+- [x] The harness (`npx tsx harness/smoke.ts`) is exercised in CI, or its exclusion is
       deliberate and documented.
-- [ ] spec 002, plan 002 and ADRs 0004–0007 are `implemented`/`Accepted`; ADRs 0001–0003 too.
-- [ ] Both v2 story bodies state their scope and acceptance instead of template stubs.
+- [x] ADRs 0001–0007 are `Accepted`. **Deliberately not done:** spec 002 and plan 002 stay
+      `proposed` — the coordinator first instructed flipping them, then reverted it, because
+      spec 002's markdown acceptance is still open until `task-t2-markdown-task-files` and
+      `task-t7` land. `proposed` is the only honest legal value (DOC_STATUSES has no
+      in-progress state). Flip them in the PR that closes the last box.
+- [x] Both v2 story bodies state their scope and acceptance instead of template stubs.
 
 
 ## Notes
