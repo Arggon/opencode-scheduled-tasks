@@ -4,6 +4,7 @@ status: in_progress
 id: bug-tool-boundary-throws-and-ask-not-recorded
 title: "schedules_run throws out of the tool, and the ask-report misses the run record"
 assignee: arggon
+branch: fix/bug-tool-boundary-throws-and-ask-not-recorded
 parent: run-control-permissions-session-mode-history
 labels: []
 created: "2026-10-02"
