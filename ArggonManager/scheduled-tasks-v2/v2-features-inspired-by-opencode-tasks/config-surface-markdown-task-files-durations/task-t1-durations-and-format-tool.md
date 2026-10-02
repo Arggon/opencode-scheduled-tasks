@@ -1,14 +1,14 @@
 ---
 type: task
-status: in_progress
+status: done
 id: task-t1-durations-and-format-tool
 title: Duration parsing and the schedules_format tool
 assignee: arggon
+branch: feat/task-t1-durations-and-format-tool
 parent: config-surface-markdown-task-files-durations
 labels: []
 created: "2026-10-02"
 updated: "2026-10-02"
-claimed_at: "2026-10-02T14:33:53.407Z"
 ---
 <!--
   Placement (v0): ArggonManager/scheduled-tasks-v2/v2-features-inspired-by-opencode-tasks/config-surface-markdown-task-files-durations/task-t1-durations-and-format-tool.md
@@ -29,13 +29,13 @@ See plan 002 §T1 and spec 002 § "Durations".
 
 ## Acceptance
 
-- [ ] A table-driven test pins every accepted duration form and every rejection.
-- [ ] A malformed or non-positive duration is refused with a named reason, never silently
+- [x] A table-driven test pins every accepted duration form and every rejection.
+- [x] A malformed or non-positive duration is refused with a named reason, never silently
       defaulted.
-- [ ] `runTimeoutMs` behaves exactly as in v1 (additive, non-breaking).
-- [ ] `schedules_format` returns the job-file reference, naming **both** config surfaces and the
+- [x] `runTimeoutMs` behaves exactly as in v1 (additive, non-breaking).
+- [x] `schedules_format` returns the job-file reference, naming **both** config surfaces and the
       markdown-wins precedence rule.
-- [ ] `schedules_format` documents the per-job `model` field, so an agent cannot author a job
+- [x] `schedules_format` documents the per-job `model` field, so an agent cannot author a job
       that silently inherits a paid model.
 
 
