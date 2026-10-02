@@ -1,5 +1,5 @@
 import { describe, expect, it, beforeEach, afterEach } from "vitest"
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync } from "node:fs"
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync, existsSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { spawnSync } from "node:child_process"
@@ -39,6 +39,10 @@ import plugin, {
   DEFAULT_LOOP_CAP,
   DEFAULT_LOOP_TTL_MS,
   DEFAULT_ONEOFF_CAP,
+  hasWork,
+  leasePath,
+  normalizeLoops,
+  MAX_LOOP_SCAN_KEYS,
   type HistoryEntry,
   type JobDefinition,
   type JobState,
@@ -56,6 +60,30 @@ function local(instantMs: number, timeZone: string): string {
   const parts = wallParts(instantMs, timeZone)
   const pad = (n: number): string => String(n).padStart(2, "0")
   return `${parts.year}-${pad(parts.month)}-${pad(parts.day)}T${pad(parts.hour)}:${pad(parts.minute)}`
+}
+
+/**
+ * Poll until `predicate` holds, on real timers.
+ *
+ * The tick dispatches with `void runOneOff(...)`, so "the scheduler admitted a prompt" is a
+ * statement about wall-clock progress, not about a returned promise. Asserting on it
+ * synchronously would test the microtask queue instead of the scheduler.
+ */
+// The predicate is awaited, deliberately. An async predicate wrapped without `await` would be
+// a Promise — always truthy — so `waitFor` would return on its first poll and the assertion
+// after it would check a state that had not settled yet. Two lease-release tests were written
+// that way and were silently vacuous; the typecheck caught them, not the test run.
+async function waitFor(
+  predicate: () => boolean | Promise<boolean>,
+  label: string,
+  timeoutMs = 4_000,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (await predicate()) return
+    await new Promise((resolve) => setTimeout(resolve, 10))
+  }
+  throw new Error(`timed out after ${timeoutMs}ms waiting for ${label}`)
 }
 
 describe("parseCron — fields", () => {
@@ -2376,5 +2404,604 @@ it.runIf(realYaml !== undefined)(
     } finally {
       cleanup()
     }
+  })
+})
+// ---------------------------------------------------------------------------
+// What arms the tick (bug-ephemeral-work-never-arms-tick)
+// ---------------------------------------------------------------------------
+
+describe("hasWork — the predicate that decides whether the tick is armed", () => {
+  const loops = (counts: number[]): Map<string, unknown[]> =>
+    new Map(counts.map((n, i) => [`ses_${i}`, Array.from({ length: n }, () => ({}))]))
+
+  it("counts an enabled file job", () => {
+    expect(hasWork({ jobs: [{ enabled: true }], oneOffs: [], loops: new Map() })).toBe(true)
+  })
+
+  it("does not count a parked job — enabled: false is work with the timer switched off", () => {
+    expect(hasWork({ jobs: [{ enabled: false }], oneOffs: [], loops: new Map() })).toBe(false)
+  })
+
+  it("counts pending one-offs, which is the whole point of the fix", () => {
+    // Both ephemeral drains live *inside* `tick`. A project with no job file and one pending
+    // one-off has work, and it is work the tick is the only thing that can perform.
+    expect(hasWork({ jobs: [], oneOffs: [{}], loops: new Map() })).toBe(true)
+  })
+
+  it("counts a loop in any session, and ignores an empty session entry", () => {
+    expect(hasWork({ jobs: [], oneOffs: [], loops: loops([0, 1]) })).toBe(true)
+    expect(hasWork({ jobs: [], oneOffs: [], loops: loops([0, 0]) })).toBe(false)
+  })
+
+  it("reports nothing to do only when every source is empty", () => {
+    expect(hasWork({ jobs: [], oneOffs: [], loops: new Map() })).toBe(false)
+    expect(hasWork({ jobs: [{ enabled: false }], oneOffs: [], loops: loops([0]) })).toBe(false)
+  })
+})
+
+describe("normalizeLoops — one validation path for every stored loop record", () => {
+  const stored = [
+    {
+      id: "loop_1",
+      prompt: "check the deploy",
+      intervalMs: 5 * MINUTE_MS,
+      nextRunAt: 1_000,
+      expiresAt: 2_000,
+      createdAt: 500,
+    },
+  ]
+
+  it("stamps the owning session on every loop it returns", () => {
+    const loops = normalizeLoops(stored, "ses_abc")
+    expect(loops).toHaveLength(1)
+    // The session comes from the *caller*, never from the record: a loop is scoped by the
+    // key it was filed under, and a record cannot move itself into another session.
+    expect(loops[0]!.sessionID).toBe("ses_abc")
+    expect(loops[0]).toMatchObject({ id: "loop_1", intervalMs: 5 * MINUTE_MS, createdAt: 500 })
+  })
+
+  it("defaults createdAt to nextRunAt when it is absent", () => {
+    const [loop] = normalizeLoops([{ ...stored[0], createdAt: undefined }], "ses_abc")
+    expect(loop!.createdAt).toBe(loop!.nextRunAt)
+  })
+
+  it("drops malformed entries instead of failing the load", () => {
+    expect(
+      normalizeLoops([null, "x", {}, { id: "loop_x" }, { ...stored[0], intervalMs: "5m" }], "ses_abc"),
+    ).toEqual([])
+    expect(normalizeLoops("not an array", "ses_abc")).toEqual([])
+  })
+})
+
+describe("arming the tick — ephemeral work is work (bug-ephemeral-work-never-arms-tick)", () => {
+  let dir: string
+  let restoreEnv: string | undefined
+  const outstanding: Array<() => void> = []
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "st-arm-"))
+    mkdirSync(join(dir, ".opencode"), { recursive: true })
+    restoreEnv = process.env[DATA_DIR_ENV]
+    process.env[DATA_DIR_ENV] = join(dir, "state")
+  })
+
+  afterEach(() => {
+    for (const dispose of outstanding.splice(0).reverse()) {
+      try {
+        dispose()
+      } catch {
+        // A failing teardown must not mask the assertion that ran before it.
+      }
+    }
+    if (restoreEnv === undefined) delete process.env[DATA_DIR_ENV]
+    else process.env[DATA_DIR_ENV] = restoreEnv
+    rmSync(dir, { recursive: true, force: true })
+  })
+
+  type Tool = {
+    execute: (
+      input: Record<string, unknown>,
+      context?: { sessionID?: unknown },
+    ) => Promise<{ output: Record<string, unknown> }>
+  }
+
+  type Harness = {
+    tools: Array<Record<string, unknown>>
+    prompts: Record<string, unknown>[]
+    store: Map<string, unknown>
+    tool: (name: string) => Tool
+    list: () => Promise<Record<string, unknown>>
+    cleanup: () => void
+  }
+
+  /** A `get`/`set`/`remove` double, with the host's prefix `scan` only when asked for. */
+  function storageDouble(store: Map<string, unknown>, withScan: boolean): Record<string, unknown> {
+    const base: Record<string, unknown> = {
+      get: async (key: string) => store.get(key),
+      set: async (key: string, value: unknown) => void store.set(key, value),
+      remove: async (key: string) => void store.delete(key),
+    }
+    if (withScan) {
+      // Mirrors the host surface verified on 2.0.22: `{ entries: [{ key, value }], next? }`,
+      // keys already relative to the plugin's own namespace, `next` absent on the last page.
+      base.scan = async (input: { prefix?: string; after?: string; limit?: number }) => {
+        const keys = [...store.keys()].filter((key) => key.startsWith(input.prefix ?? "")).sort()
+        const start = input.after === undefined ? 0 : Math.max(0, keys.indexOf(input.after) + 1)
+        const limit = input.limit ?? 100
+        const page = keys.slice(start, start + limit)
+        const entries = page.map((key) => ({ key, value: store.get(key) }))
+        const consumed = start + page.length
+        return consumed < keys.length ? { entries, next: page[page.length - 1]! } : { entries }
+      }
+    }
+    return base
+  }
+
+  /** One pending one-off as `setup` would find it in storage. */
+  const pendingOneOff = (over: Record<string, unknown> = {}): Record<string, unknown> => ({
+    id: "oneoff_probe",
+    dueAt: Date.now() - 1_000,
+    prompt: "the probe prompt",
+    createdAt: Date.now() - 60_000,
+    runTimeoutMs: MINUTE_MS,
+    ...over,
+  })
+
+  /** One stored loop, due now and unexpired. */
+  const storedLoop = (over: Record<string, unknown> = {}): Record<string, unknown> => ({
+    id: "loop_stored",
+    prompt: "the loop prompt",
+    intervalMs: MINUTE_MS,
+    nextRunAt: Date.now() - 1_000,
+    expiresAt: Date.now() + 60 * MINUTE_MS,
+    createdAt: Date.now() - 60_000,
+    ...over,
+  })
+
+  async function harness(
+    options: {
+      jobs?: unknown[]
+      seed?: Record<string, unknown>
+      scan?: boolean
+      storage?: boolean
+      pluginOptions?: Record<string, unknown>
+      projectID?: string
+    } = {},
+  ): Promise<Harness> {
+    const store = new Map<string, unknown>(Object.entries(options.seed ?? {}))
+    if (options.jobs !== undefined) {
+      writeFileSync(
+        join(dir, ".opencode", "schedules.json"),
+        JSON.stringify({ version: 1, jobs: options.jobs }),
+      )
+    }
+    const tools: Array<Record<string, unknown>> = []
+    const prompts: Record<string, unknown>[] = []
+    const ctx: Record<string, unknown> = {
+      ...(options.pluginOptions === undefined ? {} : { options: options.pluginOptions }),
+      location: { directory: dir, project: { id: options.projectID ?? "arm" } },
+      ...(options.storage === false ? {} : { storage: storageDouble(store, options.scan ?? false) }),
+      session: {
+        create: async () => ({ id: "ses_created" }),
+        prompt: async (input: Record<string, unknown>) => {
+          prompts.push(input)
+          return { id: `inbox_${prompts.length}` }
+        },
+      },
+      tool: {
+        transform: async (cb: (editor: { add?: (tool: unknown) => void }) => void) => {
+          cb({ add: (tool) => void tools.push(tool as Record<string, unknown>) })
+          return { dispose() {} }
+        },
+      },
+    }
+    const resolved = await plugin.setup(ctx as never)
+    const cleanup = (): void => {
+      ;(resolved as () => void)?.()
+    }
+    outstanding.push(cleanup)
+    const tool = (name: string): Tool => {
+      const found = tools.find((entry) => entry.name === name)
+      if (found === undefined) throw new Error(`tool ${name} was not registered`)
+      return found as unknown as Tool
+    }
+    return {
+      tools,
+      prompts,
+      store,
+      tool,
+      cleanup,
+      list: async () => (await tool("list").execute({})).output,
+    }
+  }
+
+  // ---------------------------------------------------------------------
+  // Probe 1, reproduced exactly: a pending one-off, no jobs, and no timer.
+  // ---------------------------------------------------------------------
+
+  it(
+    "fires a one-off left pending by a previous run in a project with no jobs (the reviewer's probe)",
+    async () => {
+      // `jobs: []` plus a pending one-off in storage is the state the reviewer seeded, and the
+      // old code armed nothing at all: `hasWork` read the job array only, so the tick never
+      // existed and `schedules_schedule` had already returned success.
+      const { prompts, store, list } = await harness({
+        jobs: [],
+        seed: { "scheduled-tasks/oneoff/pending": [pendingOneOff()] },
+        pluginOptions: { tickMs: 5_000 },
+      })
+
+      await new Promise((resolve) => setTimeout(resolve, 7_000))
+
+      expect(prompts.length).toBeGreaterThan(0)
+      expect(prompts[0]).toMatchObject({ text: "the probe prompt", delivery: "queue" })
+      // And it is gone from the pending list, not merely dispatched: a one-off that stays
+      // pending is how the original deferral bug presented.
+      expect((await list()).oneOffs).toEqual([])
+      expect(store.get("scheduled-tasks/oneoff/pending")).toEqual([])
+    },
+    20_000,
+  )
+
+  it("takes the writer lease for ephemeral work, and takes it before the work runs", async () => {
+    // Proof the lease was taken *because* of the ephemeral task: it was not held at setup,
+    // where there was nothing to arbitrate.
+    const { list } = await harness({
+      jobs: [],
+      seed: { "scheduled-tasks/oneoff/pending": [pendingOneOff({ dueAt: Date.now() + 30 * MINUTE_MS })] },
+    })
+    const listing = await list()
+    expect(listing.leaseHeld).toBe(true)
+    expect(listing.leaseForeign).toBe(false)
+  })
+
+  // ---------------------------------------------------------------------
+  // Idle → armed: the tool call is minutes after `setup` decided there was nothing.
+  // ---------------------------------------------------------------------
+
+  it("arms from idle the moment the first ephemeral task is created — no reload, no restart", async () => {
+    const { tool, list, prompts, store } = await harness({ jobs: [] })
+
+    // Idle: no jobs, no one-offs, no loops — so no lease and no timer.
+    const idle = await list()
+    expect(idle.leaseHeld).toBe(false)
+    expect(idle.oneOffs).toEqual([])
+
+    // `dueAt` one second in the past is inside the documented grace window, so this is a
+    // legitimate "run it now" and not a refused stale instant.
+    const created = await tool("schedule").execute({
+      prompt: "armed by a tool call",
+      dueAt: Date.now() - 1_000,
+    })
+    expect(created.output.id).toMatch(/^oneoff_/)
+
+    // The lease was acquired *after* setup, by the tool, because the answer changed.
+    expect((await list()).leaseHeld).toBe(true)
+    await waitFor(() => prompts.length > 0, "the tool-created one-off to be dispatched")
+    expect(prompts[0]).toMatchObject({ text: "armed by a tool call" })
+    expect(store.get("scheduled-tasks/oneoff/pending")).toEqual([])
+  })
+
+  it("arms a real timer, so work due later still fires without another tool call", async () => {
+    const { tool, prompts, list } = await harness({ jobs: [], pluginOptions: { tickMs: 5_000 } })
+
+    await tool("schedule").execute({ prompt: "due on a later tick", dueAt: Date.now() + 1_000 })
+    // Arming evaluates immediately; nothing was due yet, so nothing was dispatched. That is
+    // what proves the dispatch below came from the *timer*, not from the arming call.
+    expect(prompts).toEqual([])
+
+    await waitFor(() => prompts.length > 0, "the interval to pick up the later one-off", 9_000)
+    expect(prompts[0]).toMatchObject({ text: "due on a later tick" })
+    await waitFor(
+      async () => (await list()).leaseHeld === false,
+      "the lease to be handed back once the work is done",
+    )
+    // The wait above is the mechanism; this is the assertion. Asserted on the lockfile, not
+    // on `leaseHeld` - see the sibling test for why the in-memory flag cannot see a release.
+    expect(existsSync(leasePath(dir, "arm"))).toBe(false)
+  }, 15_000)
+
+  it("hands the lease back once the last ephemeral task is done", async () => {
+    // ADR 0003 says the lease is taken only when there is work; deciding once at setup made
+    // that true only for the first instant of the process's life.
+    const { tool, list } = await harness({ jobs: [] })
+    await tool("schedule").execute({ prompt: "short-lived", dueAt: Date.now() - 1_000 })
+    expect((await list()).leaseHeld).toBe(true)
+    // The end of the tick re-decides, so the timer stops and the lease is released.
+    await waitFor(
+      async () => (await list()).leaseHeld === false,
+      "the lease to be handed back",
+      6_000,
+    )
+    // `leaseHeld` reads the in-memory lease object, so it cannot tell whether release()
+    // actually ran - `disarm` clears the local either way, and a mutation that deletes the
+    // `lease.release()` call still satisfies it. The lockfile is the thing being released,
+    // so the lockfile is what has to be asserted. (Verified: removing `release()` fails
+    // this line and leaves the `leaseHeld` assertion green.)
+    expect(existsSync(leasePath(dir, "arm"))).toBe(false)
+  }, 10_000)
+
+  it("stays armed while a recurring job keeps it in work", async () => {
+    const { list } = await harness({ jobs: [{ id: "nightly", schedule: "@daily", prompt: "p" }] })
+    expect((await list()).leaseHeld).toBe(true)
+  })
+
+  it("stays inert — no lease, no timer — when nothing is scheduled at all", async () => {
+    const { list, prompts } = await harness({ jobs: [{ id: "parked", schedule: "@daily", prompt: "p", enabled: false }] })
+    expect((await list()).leaseHeld).toBe(false)
+    await new Promise((resolve) => setTimeout(resolve, 200))
+    expect(prompts).toEqual([])
+  })
+
+  // ---------------------------------------------------------------------
+  // ADR 0003 under lazy arming: a second instance must still stay inert.
+  // ---------------------------------------------------------------------
+
+  it("stays inert for ephemeral work when another instance holds the lease", async () => {
+    const path = leasePath(dir, "arm")
+    mkdirSync(join(path, ".."), { recursive: true })
+    writeFileSync(path, JSON.stringify({ pid: process.pid + 1, heartbeat: Date.now() }))
+
+    const { list, prompts } = await harness({
+      jobs: [],
+      seed: { "scheduled-tasks/oneoff/pending": [pendingOneOff()] },
+    })
+    try {
+      const listing = await list()
+      expect(listing.leaseForeign).toBe(true)
+      expect(listing.leaseHeld).toBe(false)
+      // The pending one-off is still reported — refusing to double-fire is not "pretending
+      // the work does not exist".
+      expect((listing.oneOffs as unknown[]).length).toBe(1)
+      await new Promise((resolve) => setTimeout(resolve, 300))
+      expect(prompts).toEqual([])
+    } finally {
+      rmSync(path, { force: true })
+    }
+  })
+
+  it("stays inert when a tool hands the first ephemeral work to a project another instance owns", async () => {
+    // The lazy-arming path has to pass through ADR 0003 too, not just the setup path: this
+    // instance is idle (so it holds no lease and has no timer), a foreign holder exists, and
+    // an agent then hands it a one-off. Arming must arbitrate and decline.
+    const path = leasePath(dir, "arm")
+    mkdirSync(join(path, ".."), { recursive: true })
+    writeFileSync(path, JSON.stringify({ pid: process.pid + 1, heartbeat: Date.now() }))
+
+    const { tool, list, prompts } = await harness({ jobs: [] })
+    try {
+      expect((await list()).leaseHeld).toBe(false)
+      await tool("schedule").execute({ prompt: "should not run", dueAt: Date.now() - 1_000 })
+      const listing = await list()
+      expect(listing.leaseForeign).toBe(true)
+      expect(listing.leaseHeld).toBe(false)
+      // The work is reported, not pretended away: refusing to double-fire is not silence.
+      expect((listing.oneOffs as unknown[]).length).toBe(1)
+      await new Promise((resolve) => setTimeout(resolve, 300))
+      expect(prompts).toEqual([])
+    } finally {
+      rmSync(path, { force: true })
+    }
+  })
+
+  // ---------------------------------------------------------------------
+  // M1: a stored loop has to come back with the process.
+  // ---------------------------------------------------------------------
+
+  it("restores a stored session loop at setup and posts it into its own session", async () => {
+    // The load that never happened: `setup` read jobs, states, history and one-offs, so a
+    // stored, due loop simply stopped after a restart while the tool's own comment claimed it
+    // survived a reload.
+    const { list, prompts, store } = await harness({
+      jobs: [],
+      scan: true,
+      seed: { "scheduled-tasks/loop/ses_abc": [storedLoop()] },
+    })
+
+    expect((await list()).loops).toEqual([
+      {
+        id: "loop_stored",
+        sessionID: "ses_abc",
+        nextRunAt: new Date(store.get("scheduled-tasks/loop/ses_abc") === undefined ? 0 : Date.now()).toISOString().slice(0, 0) || expect.any(String),
+        expiresAt: expect.any(String),
+        intervalMs: MINUTE_MS,
+      },
+    ])
+    await waitFor(() => prompts.length > 0, "the restored loop to post")
+    // A loop posts into the session that owns it and nowhere else.
+    expect(prompts[0]).toMatchObject({ sessionID: "ses_abc", text: "the loop prompt" })
+  })
+
+  it("discovers loops across several sessions and several pages", async () => {
+    const { list } = await harness({
+      jobs: [],
+      scan: true,
+      seed: {
+        "scheduled-tasks/loop/ses_a": [storedLoop({ id: "loop_a" })],
+        "scheduled-tasks/loop/ses_b": [storedLoop({ id: "loop_b" })],
+        // Not loop keys: a job state and a history entry must not be mistaken for one.
+        "scheduled-tasks/nightly": { version: STATE_VERSION },
+        "scheduled-tasks/history/nightly": [],
+      },
+    })
+    const loops = (await list()).loops as Array<Record<string, unknown>>
+    expect(loops.map((loop) => [loop.sessionID, loop.id])).toEqual([
+      ["ses_a", "loop_a"],
+      ["ses_b", "loop_b"],
+    ])
+  })
+
+  it("arms the tick for a stored loop, so it needs no tool call to resume", async () => {
+    // A loop restored at setup is work found by `hasWork`, so it must take the lease.
+    const { list } = await harness({
+      jobs: [],
+      scan: true,
+      seed: { "scheduled-tasks/loop/ses_abc": [storedLoop({ nextRunAt: Date.now() + 30 * MINUTE_MS })] },
+    })
+    expect((await list()).leaseHeld).toBe(true)
+  })
+
+  it("arms from idle when the first loop is started, and posts it when it comes due", async () => {
+    const { tool, list, prompts } = await harness({ jobs: [] })
+    expect((await list()).leaseHeld).toBe(false)
+
+    const started = await tool("start_loop").execute({ prompt: "fresh loop", every: "1m" }, { sessionID: "ses_new" })
+    expect(started.output.id).toMatch(/^loop_/)
+    expect((await list()).leaseHeld).toBe(true)
+    // Nothing is due yet, so arming must not post it early.
+    expect(prompts).toEqual([])
+  })
+
+  it("says so plainly when ctx.storage.scan is absent, and restores nothing", async () => {
+    // The honest degradation: no scan means the sessions that own a loop cannot be
+    // enumerated, and pretending otherwise would be a reload path that does not work.
+    const { list, prompts } = await harness({
+      jobs: [],
+      scan: false,
+      seed: { "scheduled-tasks/loop/ses_abc": [storedLoop()] },
+    })
+    expect((await list()).loops).toEqual([])
+    expect((await list()).leaseHeld).toBe(false)
+    await new Promise((resolve) => setTimeout(resolve, 200))
+    expect(prompts).toEqual([])
+  })
+
+  it("ignores a scan result it cannot read, and a scan that throws", async () => {
+    for (const scan of [
+      async () => "nonsense",
+      async () => ({ entries: "nonsense" }),
+      async () => null,
+      async () => {
+        throw new Error("scan is down")
+      },
+    ]) {
+      const tools: Array<Record<string, unknown>> = []
+      const resolved = await plugin.setup({
+        location: { directory: dir, project: { id: "arm" } },
+        storage: {
+          get: async (key: string) =>
+            key === "scheduled-tasks/loop/ses_abc" ? [storedLoop()] : undefined,
+          set: async () => {},
+          remove: async () => {},
+          scan: scan as never,
+        },
+        session: { create: async () => ({ id: "s" }), prompt: async () => ({ id: "i" }) },
+        tool: {
+          transform: async (cb: (editor: { add?: (tool: unknown) => void }) => void) => {
+            cb({ add: (tool) => void tools.push(tool as Record<string, unknown>) })
+            return { dispose() {} }
+          },
+        },
+      } as never)
+      try {
+        const list = tools.find((tool) => tool.name === "list") as unknown as Tool
+        const out = await list.execute({})
+        expect(out.output.loops).toEqual([])
+      } finally {
+        ;(resolved as () => void)?.()
+      }
+    }
+  })
+
+  it("stops enumerating at the scan cap rather than restoring an unbounded namespace", async () => {
+    // A loop is filed per session, so the cardinality of storage decides the cost of startup.
+    // Seeding more sessions than the cap proves the walk is bounded, not proportional.
+    const seed: Record<string, unknown> = {}
+    for (let n = 0; n < MAX_LOOP_SCAN_KEYS + 5; n += 1) {
+      seed[`scheduled-tasks/loop/ses_${String(n).padStart(4, "0")}`] = [storedLoop({ id: `loop_${n}` })]
+    }
+    const { list } = await harness({ jobs: [], scan: true, seed })
+    const loops = (await list()).loops as Array<Record<string, unknown>>
+    expect(loops).toHaveLength(MAX_LOOP_SCAN_KEYS)
+  })
+
+  // ---------------------------------------------------------------------
+  // M3: a due one-off with no free slot is skipped and recorded, never queued.
+  // ---------------------------------------------------------------------
+
+  it(
+    "skips and records a due one-off that finds no free slot, instead of retrying it forever",
+    async () => {
+      // One slot, one due recurring job: the job takes it, so the one-off owing the same
+      // instant cannot run. Under the old code it stayed pending and was re-decided every
+      // tick, logging "skipping 1 one-off task(s)" each time and running whenever the
+      // scheduler happened to be idle — unbounded deferral, not a skip.
+      const { prompts, store, list } = await harness({
+        jobs: [{ id: "busy", schedule: "* * * * *", timezone: "UTC", prompt: "the job prompt" }],
+        seed: {
+          "scheduled-tasks/busy": {
+            version: STATE_VERSION,
+            lastRun: Date.now() - 5 * MINUTE_MS,
+          },
+          "scheduled-tasks/oneoff/pending": [pendingOneOff({ prompt: "the one-off prompt" })],
+        },
+        pluginOptions: { tickMs: 5_000, maxConcurrentRuns: 1 },
+      })
+
+      await waitFor(() => prompts.length > 0, "the recurring job to take the slot")
+
+      // Skipped and *recorded*: the occurrence is spent, and the record says why.
+      await waitFor(
+        () => Array.isArray(store.get("scheduled-tasks/history/oneoff_probe")),
+        "the skip to be recorded in history",
+      )
+      const history = store.get("scheduled-tasks/history/oneoff_probe") as Array<Record<string, unknown>>
+      expect(history).toHaveLength(1)
+      expect(history[0]).toMatchObject({ outcome: "skipped", dueAt: expect.any(Number) })
+      expect(String(history[0]!.error)).toMatch(/concurrency cap 1/)
+
+      // And it never ran, and never stays queued: not in the pending list, not dispatched.
+      expect(prompts.filter((entry) => entry.text === "the one-off prompt")).toEqual([])
+      expect((await list()).oneOffs).toEqual([])
+
+      // The load-bearing half: a further tick must not reconsider the same due instant.
+      const before = store.get("scheduled-tasks/oneoff/pending")
+      await new Promise((resolve) => setTimeout(resolve, 6_000))
+      expect(store.get("scheduled-tasks/oneoff/pending")).toEqual(before)
+      expect(store.get("scheduled-tasks/history/oneoff_probe")).toHaveLength(1)
+      expect(prompts.filter((entry) => entry.text === "the one-off prompt")).toEqual([])
+    },
+    25_000,
+  )
+
+  it("runs the one-offs it can and records skips only for the ones it cannot", async () => {
+    const { prompts, store } = await harness({
+      jobs: [],
+      seed: {
+        "scheduled-tasks/oneoff/pending": [
+          pendingOneOff({ id: "oneoff_a", prompt: "first" }),
+          pendingOneOff({ id: "oneoff_b", prompt: "second" }),
+        ],
+      },
+      pluginOptions: { tickMs: 5_000, maxConcurrentRuns: 1 },
+    })
+
+    await waitFor(() => prompts.length > 0, "the first one-off to run")
+    await waitFor(
+      () => Array.isArray(store.get("scheduled-tasks/history/oneoff_b")),
+      "the surplus one-off to be recorded as skipped",
+    )
+    // Fairness, not luck: the head of the queue runs and the tail is spent, so the backlog
+    // cannot reorder itself behind a permanently busy scheduler.
+    expect(prompts.some((entry) => entry.text === "first")).toBe(true)
+    expect(prompts.some((entry) => entry.text === "second")).toBe(false)
+    expect(store.get("scheduled-tasks/history/oneoff_b")).toMatchObject([
+      { outcome: "skipped" },
+    ])
+  })
+
+  it("does not skip a due one-off when a slot is free", async () => {
+    const { prompts, store } = await harness({
+      jobs: [],
+      seed: { "scheduled-tasks/oneoff/pending": [pendingOneOff()] },
+      pluginOptions: { maxConcurrentRuns: 1 },
+    })
+    await waitFor(() => prompts.length > 0, "the one-off to run")
+    await waitFor(
+      () => Array.isArray(store.get("scheduled-tasks/history/oneoff_probe")),
+      "the run to be recorded",
+    )
+    const history = store.get("scheduled-tasks/history/oneoff_probe") as Array<Record<string, unknown>>
+    expect(history[0]!.outcome).toBe("ok")
   })
 })
