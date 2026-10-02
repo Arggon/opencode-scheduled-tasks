@@ -59,3 +59,23 @@ catch, and the tick recorded only `ok`. The success path also stamped `startedAt
 ## Notes
 
 Filed by the coordinator from the T3–T6 lead-architect review.
+
+### 2026-10-02 @ses_f037cc89cffeOo07JPEJShqzJw
+**Live reproduction on the real host** (v2.0.22, deployed build, run from a session), which confirms B4 exactly as the reviewer predicted:
+
+`schedules.schedule({ prompt: "E2E probe…", dueIn: "20s" })` → `oneoff_sn7ndgh4murd4ea5`.
+
+The run **happened** — the scheduler log records:
+
+```
+19:35:37.103  running one-off oneoff_sn7ndgh4murd4ea5 (due 2026-10-02T19:35:27.085Z, model session default, runTimeout 15m)
+```
+
+…but reading it back fails:
+
+```
+schedules_history({ id: "oneoff_sn7ndgh4murd4ea5" })
+→ { error: 'no job with id "oneoff_sn7ndgh4murd4ea5"', ids: ["dogfood-smoke"] }
+```
+
+So the history was written under the one-off's own id while `schedules_history` resolves only `state.jobs`. This is now confirmed against a real host, not only under a fake `ctx`, and it makes two published statements false: the README ("a completed one-off survives only in `schedules_history`") and the `cancel` error message ("check schedules_history"). It also confirms `storage.remove` is never called, so every one-off leaves a permanent key.
