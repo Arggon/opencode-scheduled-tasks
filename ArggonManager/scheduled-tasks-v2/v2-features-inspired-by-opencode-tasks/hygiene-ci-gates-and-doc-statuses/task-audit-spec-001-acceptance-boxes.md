@@ -1,13 +1,15 @@
 ---
 type: task
-status: todo
+status: in_progress
 id: task-audit-spec-001-acceptance-boxes
 title: spec 001 claims implemented with 0 of 39 acceptance boxes ticked
+assignee: arggon
 parent: hygiene-ci-gates-and-doc-statuses
 labels: []
 priority: p1
 created: "2026-10-02"
 updated: "2026-10-02"
+claimed_at: "2026-10-02T22:00:57.196Z"
 depends_on: [task-tick-drain-order-oneoffs-before-loops]
 ---
 <!--
