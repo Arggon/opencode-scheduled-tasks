@@ -8,6 +8,7 @@ labels: []
 priority: p1
 created: "2026-10-02"
 updated: "2026-10-02"
+depends_on: [task-tick-drain-order-oneoffs-before-loops]
 ---
 <!--
   Placement (v0): ArggonManager/scheduled-tasks-v2/v2-features-inspired-by-opencode-tasks/hygiene-ci-gates-and-doc-statuses/task-audit-spec-001-acceptance-boxes.md
