@@ -20,11 +20,37 @@ depends_on: [bug-loop-stop-does-not-persist-and-concurrency-bypass]
 
 ## Context
 
-<!-- What went wrong / how to reproduce. -->
+Review findings B4 + M4 + M5 against `26be6d5`, verdict **changes requested**.
 
+**B4 — one-off history is written but can never be read, and keys accumulate.** History was written
+under `task.id` (src/index.ts:2131-2141) but `schedules_history` resolved only `state.jobs`
+(src/index.ts:2424-2429). Reproduced: `schedules_history` on a completed one-off returns
+`no job with id "oneoff_…"`. Two published statements were therefore false — the README ("a
+completed one-off survives only in `schedules_history`") and the `cancel` error message ("check
+schedules_history"). `storage.remove` was never called anywhere, so every one-off left a permanent
+key.
 
+**M4 — bounds are write-side only.** `loadOneOffs` (1396-1421) and `loadLoops` (1498-1522)
+returned the whole stored array uncapped; `loadHistory` (1845-1866) capped cardinality but copied
+`error`/`model` unclipped — the clip lives only in `pushHistory` (1123), so its "bounded on read as
+well as on write" comment overstates. `MAX_LOOP_CAP` (1454) was exported and never used while its
+comment claimed a hard ceiling.
+
+**M5 — silent failure paths record nothing.** The early returns at 1884-1891 and 1898 bypassed the
+catch, and the tick recorded only `ok`. The success path also stamped `startedAt` at *completion*
+(2136) rather than dispatch.
+
+## Acceptance
+
+- [ ] `schedules_history` reads a completed one-off, and the README + `cancel` message become true.
+- [ ] One-off history keys are removed once read or superseded, or namespaced so they are bounded.
+- [ ] `loadOneOffs` / `loadLoops` cap on read as well as on write; `MAX_LOOP_CAP` is used or
+      removed.
+- [ ] Every one-off path — missing prompt surface, missing session, throw, success — records a
+      history entry.
+- [ ] `startedAt` is the dispatch instant, not the completion instant.
+- [ ] Tests assert each, including a hand-edited oversized stored record.
 
 ## Notes
 
-Filed by the coordinator from the T3–T6 lead-architect review; the reviewer's
-verdict and probe evidence are in this body.
+Filed by the coordinator from the T3–T6 lead-architect review.
