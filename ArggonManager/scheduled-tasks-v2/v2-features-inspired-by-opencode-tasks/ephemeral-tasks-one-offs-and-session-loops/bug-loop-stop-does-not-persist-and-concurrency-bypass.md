@@ -47,14 +47,22 @@ re-armed in memory but never persisted.
 
 ## Acceptance
 
-- [ ] Stopping a loop persists; a stopped loop cannot be resurrected by a later `start_loop` in the
+- [x] Stopping a loop persists; a stopped loop cannot be resurrected by a later `start_loop` in the
       same session, and the expiry path cleans up persistently.
-- [ ] Stop-all persists an empty set or removes the key.
-- [ ] Due loops respect `maxConcurrentRuns`; exceeding it is recorded, not posted.
-- [ ] Loop posts go through `applyJobTarget` (model, permissions, timeout) and record history like
-      every other run.
-- [ ] The expiry log states the actual lifetime, and `nextRunAt` survives a restart.
-- [ ] Tests reproduce each probe above, with an injected clock.
+- [x] Stop-all persists an empty set or removes the key.
+- [x] Due loops respect `maxConcurrentRuns`; exceeding it is recorded, not posted.
+- [x] Loop posts go through `applyJobTarget` (model, permissions, timeout) and record history like
+      every other run. — *Narrowed honestly: the path is shared, and a loop declares none of the
+      three, so for a loop the shared call resolves and reports the session's own model and
+      applies nothing. That is deliberate (a loop posts into a human's live session and must not
+      switch its model or replace its permission rules), and the test asserts exactly that.
+      `applyJobTarget` has no timeout step at all, and `runTimeoutMs` is not enforced for
+      one-offs either — a separate gap, reported to the coordinator, not filed here.*
+- [x] The expiry log states the actual lifetime, and `nextRunAt` survives a restart.
+- [x] Tests reproduce each probe above, with an injected clock. — *Both reviewer probes are
+      reproduced verbatim; the cross-tick probe uses an injected clock (`vi.setSystemTime` +
+      `advanceTimersByTimeAsync`) because real loop intervals are floored at a minute, and the
+      rest pin explicit due instants instead of sleeping.*
 
 ## Notes
 

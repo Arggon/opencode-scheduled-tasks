@@ -1,4 +1,4 @@
-import { describe, expect, it, beforeEach, afterEach } from "vitest"
+import { describe, expect, it, beforeEach, afterEach, vi } from "vitest"
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync, existsSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -34,6 +34,7 @@ import plugin, {
   MAX_HISTORY_LIMIT,
   MAX_MARKDOWN_FILE_BYTES,
   MAX_MARKDOWN_JOBS,
+  MIN_TICK_MS,
   MAX_PERMISSION_ACTIONS,
   collectAsks,
   DEFAULT_LOOP_CAP,
@@ -2476,6 +2477,8 @@ describe("normalizeLoops — one validation path for every stored loop record", 
 describe("arming the tick — ephemeral work is work (bug-ephemeral-work-never-arms-tick)", () => {
   let dir: string
   let restoreEnv: string | undefined
+  let consoleLines: string[] = []
+  let realConsoleError: typeof console.error
   const outstanding: Array<() => void> = []
 
   beforeEach(() => {
@@ -2483,6 +2486,11 @@ describe("arming the tick — ephemeral work is work (bug-ephemeral-work-never-a
     mkdirSync(join(dir, ".opencode"), { recursive: true })
     restoreEnv = process.env[DATA_DIR_ENV]
     process.env[DATA_DIR_ENV] = join(dir, "state")
+    // The plugin reports through `console.error`, so a log claim ("expired after 2h") has to
+    // be asserted against captured lines rather than against nothing.
+    realConsoleError = console.error
+    consoleLines = []
+    console.error = (...args: unknown[]): void => void consoleLines.push(args.map(String).join(" "))
   })
 
   afterEach(() => {
@@ -2493,6 +2501,7 @@ describe("arming the tick — ephemeral work is work (bug-ephemeral-work-never-a
         // A failing teardown must not mask the assertion that ran before it.
       }
     }
+    console.error = realConsoleError
     if (restoreEnv === undefined) delete process.env[DATA_DIR_ENV]
     else process.env[DATA_DIR_ENV] = restoreEnv
     rmSync(dir, { recursive: true, force: true })
@@ -2509,17 +2518,54 @@ describe("arming the tick — ephemeral work is work (bug-ephemeral-work-never-a
     tools: Array<Record<string, unknown>>
     prompts: Record<string, unknown>[]
     store: Map<string, unknown>
+    /** Every `switchModel` / `switchAgent` / `permission.rules` call the plugin made. */
+    targetCalls: Record<string, unknown>[]
+    /** Let a held prompt settle. */
+    release: () => void
     tool: (name: string) => Tool
     list: () => Promise<Record<string, unknown>>
     cleanup: () => void
   }
 
-  /** A `get`/`set`/`remove` double, with the host's prefix `scan` only when asked for. */
-  function storageDouble(store: Map<string, unknown>, withScan: boolean): Record<string, unknown> {
+  /**
+   * A `get`/`set`/`remove` double, with the host's prefix `scan` only when asked for.
+   *
+   * `remove` is optional on the real surface, so it can be withheld here to exercise the host
+   * that has no delete — the one where "nothing is stored" has to be written as an empty
+   * record or a stopped loop comes back.
+   */
+  function storageDouble(
+    store: Map<string, unknown>,
+    withScan: boolean,
+    withRemove = true,
+    failWrites = false,
+    slowWrites = false,
+  ): Record<string, unknown> {
+    // A loop record written on the next macrotask settles after every pending microtask has run,
+    // so a loop post that has already finished no longer *looks* in flight by the time the
+    // next drain runs. That is how a real store behaves, and it is what makes "the budget
+    // this tick decided" different from "whatever still happens to be in flight".
+    const settle = async (key: string): Promise<void> => {
+      if (slowWrites && key.startsWith("scheduled-tasks/loop/")) {
+        await new Promise((resolve) => setTimeout(resolve, 0))
+      }
+    }
     const base: Record<string, unknown> = {
       get: async (key: string) => store.get(key),
-      set: async (key: string, value: unknown) => void store.set(key, value),
-      remove: async (key: string) => void store.delete(key),
+      set: async (key: string, value: unknown) => {
+        await settle(key)
+        if (failWrites) throw new Error("storage write failed")
+        store.set(key, value)
+      },
+      ...(withRemove
+        ? {
+            remove: async (key: string) => {
+              await settle(key)
+              if (failWrites) throw new Error("storage delete failed")
+              store.delete(key)
+            },
+          }
+        : {}),
     }
     if (withScan) {
       // Mirrors the host surface verified on 2.0.22: `{ entries: [{ key, value }], next? }`,
@@ -2564,6 +2610,16 @@ describe("arming the tick — ephemeral work is work (bug-ephemeral-work-never-a
       seed?: Record<string, unknown>
       scan?: boolean
       storage?: boolean
+      /** Withhold `storage.remove`, as a host without the optional delete API would. */
+      storageRemove?: boolean
+      /** Make every storage write fail, so only what this process remembers survives. */
+      failWrites?: boolean
+      /** Settle a *loop record* write on the next macrotask, as a slow store would. */
+      slowWrites?: boolean
+      /** Hold every admitted prompt until `release()`, so a run can be caught in flight. */
+      hold?: boolean
+      /** Make every admitted prompt fail with this message. */
+      promptError?: string
       pluginOptions?: Record<string, unknown>
       projectID?: string
     } = {},
@@ -2577,16 +2633,38 @@ describe("arming the tick — ephemeral work is work (bug-ephemeral-work-never-a
     }
     const tools: Array<Record<string, unknown>> = []
     const prompts: Record<string, unknown>[] = []
+    // Every target-application call the plugin makes, so "did a loop touch the human's
+    // session configuration?" is answerable rather than assumed.
+    const targetCalls: Record<string, unknown>[] = []
+    let openTheGate: () => void = () => {}
+    const gate = options.hold === true ? new Promise<void>((resolve) => void (openTheGate = resolve)) : undefined
     const ctx: Record<string, unknown> = {
       ...(options.pluginOptions === undefined ? {} : { options: options.pluginOptions }),
       location: { directory: dir, project: { id: options.projectID ?? "arm" } },
-      ...(options.storage === false ? {} : { storage: storageDouble(store, options.scan ?? false) }),
+      ...(options.storage === false
+        ? {}
+        : {
+            storage: storageDouble(
+              store,
+              options.scan ?? false,
+              options.storageRemove ?? true,
+              options.failWrites ?? false,
+              options.slowWrites ?? false,
+            ),
+          }),
       session: {
         create: async () => ({ id: "ses_created" }),
         prompt: async (input: Record<string, unknown>) => {
           prompts.push(input)
+          if (options.promptError !== undefined) throw new Error(options.promptError)
+          if (gate !== undefined) await gate
           return { id: `inbox_${prompts.length}` }
         },
+        switchModel: async (input: Record<string, unknown>) => void targetCalls.push({ switchModel: input }),
+        switchAgent: async (input: Record<string, unknown>) => void targetCalls.push({ switchAgent: input }),
+      },
+      permission: {
+        rules: async (input: Record<string, unknown>) => void targetCalls.push({ rules: input }),
       },
       tool: {
         transform: async (cb: (editor: { add?: (tool: unknown) => void }) => void) => {
@@ -2598,6 +2676,9 @@ describe("arming the tick — ephemeral work is work (bug-ephemeral-work-never-a
     const resolved = await plugin.setup(ctx as never)
     const cleanup = (): void => {
       ;(resolved as () => void)?.()
+      // Never leave a held prompt pending: a test that ends mid-run must not strand the
+      // plugin's dispatch promise into the next test.
+      openTheGate()
     }
     outstanding.push(cleanup)
     const tool = (name: string): Tool => {
@@ -2611,6 +2692,8 @@ describe("arming the tick — ephemeral work is work (bug-ephemeral-work-never-a
       store,
       tool,
       cleanup,
+      targetCalls,
+      release: openTheGate,
       list: async () => (await tool("list").execute({})).output,
     }
   }
@@ -3003,5 +3086,400 @@ describe("arming the tick — ephemeral work is work (bug-ephemeral-work-never-a
     )
     const history = store.get("scheduled-tasks/history/oneoff_probe") as Array<Record<string, unknown>>
     expect(history[0]!.outcome).toBe("ok")
+  })
+
+  // =====================================================================
+  // Session loops: stopping them, capping them, and what a loop post may do
+  // (bug-loop-stop-does-not-persist-and-concurrency-bypass)
+  // =====================================================================
+  describe("session loops — stop, cap, dispatch", () => {
+    const key = (sessionID: string): string => `scheduled-tasks/loop/${sessionID}`
+    const storedIds = (store: Map<string, unknown>, sessionID: string): unknown =>
+      (store.get(key(sessionID)) as Array<Record<string, unknown>> | undefined)?.map((loop) => loop.id)
+    const listedIds = (out: Record<string, unknown>): unknown =>
+      (out.loops as Array<Record<string, unknown>>).map((loop) => loop.id)
+    const storedHistory = (store: Map<string, unknown>, id: string): Array<Record<string, unknown>> =>
+      store.get(`scheduled-tasks/history/${id}`) as Array<Record<string, unknown>>
+
+    // ---------------------------------------------------------------------
+    // B2: stopping a loop persists, and a stopped loop cannot come back.
+    // ---------------------------------------------------------------------
+
+    it("does not resurrect a stopped loop from its own stale record (the reviewer's repro)", async () => {
+      const { tool, list, store } = await harness({ jobs: [] })
+      const call = { sessionID: "ses_abc" }
+
+      const a = (await tool("start_loop").execute({ prompt: "a", every: "1h" }, call)).output
+      const b = (await tool("start_loop").execute({ prompt: "b", every: "1h" }, call)).output
+      expect(storedIds(store, "ses_abc")).toEqual([a.id, b.id])
+
+      // Stop one: persisted, not merely filtered in memory.
+      const one = await tool("stop_loop").execute({ id: a.id }, call)
+      expect(one.output.loops).toEqual([{ id: b.id, nextRunAt: expect.any(String) }])
+      expect(storedIds(store, "ses_abc")).toEqual([b.id])
+
+      // Stop all: the emptied set is persisted as "nothing here".
+      const all = await tool("stop_loop").execute({}, call)
+      expect(all.output.loops).toEqual([])
+      expect(store.has(key("ses_abc"))).toBe(false)
+
+      // The probe's last step: starting a new loop used to bring the old ones back with it.
+      const c = (await tool("start_loop").execute({ prompt: "c", every: "1h" }, call)).output
+      expect(listedIds(await list())).toEqual([c.id])
+      expect(storedIds(store, "ses_abc")).toEqual([c.id])
+    })
+
+    it("treats what it already decided as final, even when the stop could not be written", async () => {
+      // The storage read is a fallback for "this session's loops are not in memory yet", never
+      // an override of a decision this process already made. Seeded stale, stopped in memory,
+      // and the write fails — so the record really is still there and reading it back is
+      // exactly the resurrection this must not perform.
+      const { tool, list, store } = await harness({
+        jobs: [],
+        scan: true,
+        failWrites: true,
+        seed: {
+          [key("ses_abc")]: [
+            storedLoop({ id: "loop_stale", nextRunAt: Date.now() + 30 * MINUTE_MS }),
+          ],
+        },
+      })
+      const call = { sessionID: "ses_abc" }
+
+      expect(listedIds(await list())).toEqual(["loop_stale"])
+      const all = await tool("stop_loop").execute({}, call)
+      expect(all.output.loops).toEqual([])
+      expect(listedIds(await list())).toEqual([])
+      // The write did fail, so the stale record is still what a naive re-read would find.
+      expect(storedIds(store, "ses_abc")).toEqual(["loop_stale"])
+
+      const c = (await tool("start_loop").execute({ prompt: "c", every: "1h" }, call)).output
+      expect(listedIds(await list())).toEqual([c.id])
+    })
+
+    it("persists the stop on a host with no storage.remove, by writing the empty set", async () => {
+      // `remove` is optional on the plugin storage surface. Where it is missing the plugin
+      // cannot state "nothing here" by deleting, so it has to say it in the record itself —
+      // otherwise this host alone keeps resurrecting stopped loops.
+      const { tool, list, store } = await harness({ jobs: [], storageRemove: false })
+      const call = { sessionID: "ses_abc" }
+
+      const a = (await tool("start_loop").execute({ prompt: "a", every: "1h" }, call)).output
+      await tool("start_loop").execute({ prompt: "b", every: "1h" }, call)
+      await tool("stop_loop").execute({ id: a.id }, call)
+      await tool("stop_loop").execute({}, call)
+
+      expect(store.get(key("ses_abc"))).toEqual([])
+      const c = (await tool("start_loop").execute({ prompt: "c", every: "1h" }, call)).output
+      expect(listedIds(await list())).toEqual([c.id])
+    })
+
+    it("expires a loop persistently, and states the lifetime it was actually given", async () => {
+      const { list, store } = await harness({
+        jobs: [],
+        scan: true,
+        seed: {
+          // Two hours of life, already spent. The old line said "expired after 3 days"
+          // whatever `ttl` said, which is only true when nobody passed one.
+          [key("ses_abc")]: [
+            storedLoop({ id: "loop_old", createdAt: Date.now() - 2 * 60 * MINUTE_MS, expiresAt: Date.now() - 1_000 }),
+          ],
+        },
+      })
+
+      await waitFor(() => !store.has(key("ses_abc")), "the expired loop to be removed from storage")
+      expect((await list()).loops).toEqual([])
+      const lines = consoleLines.filter((line) => line.includes("loop loop_old"))
+      expect(lines).toHaveLength(1)
+      expect(lines[0]).toMatch(/expired after 2h and was disabled/)
+    })
+
+    it("survives a restart with a stop applied — the persisted answer, not the in-memory one", async () => {
+      // Two instances over one storage double, because in-memory emptiness was never the
+      // property that had to hold. Only what storage says survives the process boundary.
+      const store = new Map<string, unknown>()
+      let tools: Array<Record<string, unknown>> = []
+      const context = (): Record<string, unknown> => ({
+        location: { directory: dir, project: { id: "restart" } },
+        storage: {
+          get: async (k: string) => store.get(k),
+          set: async (k: string, v: unknown) => void store.set(k, v),
+          remove: async (k: string) => void store.delete(k),
+          scan: async (input: { prefix?: string }) => ({
+            entries: [...store.entries()]
+              .filter(([k]) => k.startsWith(input.prefix ?? ""))
+              .map(([k, value]) => ({ key: k, value })),
+          }),
+        },
+        session: { create: async () => ({ id: "s" }), prompt: async () => ({ id: "i" }) },
+        tool: {
+          transform: async (cb: (e: { add?: (tool: unknown) => void }) => void) => {
+            cb({ add: (tool) => void tools.push(tool as Record<string, unknown>) })
+            return { dispose() {} }
+          },
+        },
+      })
+      const toolIn = (name: string): Tool => {
+        const found = tools.find((entry) => entry.name === name)
+        if (found === undefined) throw new Error(`tool ${name} was not registered`)
+        return found as unknown as Tool
+      }
+
+      const first = await plugin.setup(context() as never)
+      try {
+        const call = { sessionID: "ses_abc" }
+        const started = await toolIn("start_loop").execute({ prompt: "doomed", every: "1h" }, call)
+        expect((await toolIn("list").execute({})).output.loops).toHaveLength(1)
+        await toolIn("stop_loop").execute({ id: started.output.id }, call)
+        expect(store.has(key("ses_abc"))).toBe(false)
+      } finally {
+        ;(first as () => void)?.()
+      }
+
+      tools = []
+      const second = await plugin.setup(context() as never)
+      try {
+        // Nothing restored: the storage scan cannot find a loop that is not there any more.
+        expect((await toolIn("list").execute({})).output.loops).toEqual([])
+        expect((await toolIn("list").execute({})).output.leaseHeld).toBe(false)
+        // And the loop this session starts now is the only one it has.
+        await toolIn("start_loop").execute({ prompt: "fresh", every: "1h" }, { sessionID: "ses_abc" })
+        expect(listedIds(await toolIn("list").execute({}).then((r) => r.output))).toHaveLength(1)
+      } finally {
+        ;(second as () => void)?.()
+      }
+    })
+
+    // ---------------------------------------------------------------------
+    // Dispatch discipline: the same path, the same record, the same cap.
+    // ---------------------------------------------------------------------
+
+    it("records a loop post in history, names the model it spent, and leaves the session alone", async () => {
+      const { prompts, store, targetCalls } = await harness({
+        jobs: [],
+        scan: true,
+        seed: { [key("ses_abc")]: [storedLoop({ id: "loop_one" })] },
+      })
+
+      await waitFor(() => prompts.length > 0, "the due loop to post")
+      await waitFor(() => Array.isArray(store.get("scheduled-tasks/history/loop_one")), "the post to be recorded")
+
+      // Recorded like every other run: due instant, outcome, resolved model, owning session.
+      const history = storedHistory(store, "loop_one")
+      expect(history).toHaveLength(1)
+      expect(history[0]).toMatchObject({
+        outcome: "ok",
+        model: "session default",
+        sessionID: "ses_abc",
+        dueAt: expect.any(Number),
+      })
+      // The resolved model is reported in the log, exactly as a job run reports it.
+      expect(consoleLines.filter((line) => line.includes("loop loop_one posting"))).toEqual([
+        expect.stringMatching(/posting into its own session \(every 1m, model session default\)/),
+      ])
+      // Posted into the owning session, queued so it cannot interleave with the human.
+      expect(prompts[0]).toMatchObject({ sessionID: "ses_abc", text: "the loop prompt", delivery: "queue" })
+      // And it reconfigured nothing: a loop declares no target, so a human's live model, agent
+      // and permission rules are left exactly as they were.
+      expect(targetCalls).toEqual([])
+
+      // L2: the re-armed `nextRunAt` is persisted, so a restart cannot replay the occurrence.
+      const stored = store.get(key("ses_abc")) as Array<Record<string, unknown>>
+      expect(stored).toHaveLength(1)
+      expect(stored[0]!.nextRunAt as number).toBeGreaterThan(Date.now() + 30_000)
+    })
+
+    it("records a failed loop post instead of letting it escape the tick", async () => {
+      const { list, store, prompts } = await harness({
+        jobs: [],
+        scan: true,
+        promptError: "prompt is down",
+        seed: { [key("ses_abc")]: [storedLoop({ id: "loop_broken" })] },
+      })
+
+      await waitFor(
+        () => Array.isArray(store.get("scheduled-tasks/history/loop_broken")),
+        "the failed post to be recorded",
+      )
+      expect(prompts).toHaveLength(1)
+      const history = storedHistory(store, "loop_broken")
+      expect(history).toHaveLength(1)
+      expect(history[0]).toMatchObject({ outcome: "failed", sessionID: "ses_abc" })
+      expect(String(history[0]!.error)).toMatch(/prompt is down/)
+      // A failed post does not kill the loop: the next interval still belongs to it.
+      expect((await list()).loops).toHaveLength(1)
+    })
+
+    it(
+      "admits only maxConcurrentRuns due loops and records the rest as skipped (the reviewer's probe)",
+      async () => {
+        // The probe: 3 due loops, `maxConcurrentRuns: 1` — and 3 prompts in one tick.
+        const { prompts, store } = await harness({
+          jobs: [],
+          scan: true,
+          seed: {
+            [key("ses_abc")]: [0, 1, 2].map((n) =>
+              storedLoop({ id: `loop_${n}`, prompt: `prompt ${n}` }),
+            ),
+          },
+          pluginOptions: { tickMs: 5_000, maxConcurrentRuns: 1 },
+        })
+
+        await waitFor(() => prompts.length > 0, "the first due loop to post")
+        await waitFor(
+          () => Array.isArray(store.get("scheduled-tasks/history/loop_2")),
+          "the surplus loops to be decided",
+        )
+
+        expect(prompts).toHaveLength(1)
+        expect(prompts[0]).toMatchObject({ sessionID: "ses_abc", text: "prompt 0" })
+        for (const id of ["loop_1", "loop_2"]) {
+          const history = storedHistory(store, id)
+          expect(history).toHaveLength(1)
+          expect(history[0]).toMatchObject({ outcome: "skipped", sessionID: "ses_abc" })
+          expect(String(history[0]!.error)).toMatch(/concurrency cap 1/)
+        }
+
+        // The occurrence is consumed, not deferred: a further tick must not reconsider it. If
+        // the skip left the due instant where it was, the second tick would post instead —
+        // which is the deferral the one-off path already gave up.
+        await new Promise((resolve) => setTimeout(resolve, 6_000))
+        expect(prompts).toHaveLength(1)
+        expect(storedHistory(store, "loop_1")).toHaveLength(1)
+      },
+      25_000,
+    )
+
+    it("admits every due loop the cap allows, so the bound is not over-applied", async () => {
+      const { prompts, store } = await harness({
+        jobs: [],
+        scan: true,
+        seed: {
+          [key("ses_abc")]: [0, 1, 2].map((n) =>
+            storedLoop({ id: `loop_${n}`, prompt: `prompt ${n}` }),
+          ),
+        },
+        pluginOptions: { maxConcurrentRuns: 2 },
+      })
+
+      await waitFor(() => prompts.length > 0, "the due loops to post")
+      await waitFor(
+        () => Array.isArray(store.get("scheduled-tasks/history/loop_2")),
+        "the third loop to be decided",
+      )
+      expect(prompts).toHaveLength(2)
+      expect(prompts.map((entry) => entry.text)).toEqual(["prompt 0", "prompt 1"])
+      expect(storedHistory(store, "loop_2")[0]).toMatchObject({ outcome: "skipped" })
+    })
+
+    it(
+      "spends the same per-tick budget as a recurring job",
+      async () => {
+        // One slot, a due job and a due loop. The job is decided first, so the loop must find
+        // the budget already spent — otherwise "one run at a time" is only true for jobs.
+        const { prompts, store } = await harness({
+          jobs: [{ id: "busy", schedule: "* * * * *", timezone: "UTC", prompt: "the job prompt" }],
+          scan: true,
+          seed: {
+            "scheduled-tasks/busy": { version: STATE_VERSION, lastRun: Date.now() - 5 * MINUTE_MS },
+            [key("ses_abc")]: [storedLoop({ id: "loop_a" })],
+          },
+          pluginOptions: { tickMs: 5_000, maxConcurrentRuns: 1 },
+        })
+
+        await waitFor(() => prompts.length > 0, "the recurring job to take the slot")
+        await waitFor(
+          () => Array.isArray(store.get("scheduled-tasks/history/loop_a")),
+          "the loop to find no free slot",
+        )
+        expect(prompts).toHaveLength(1)
+        expect(prompts[0]).toMatchObject({ text: "the job prompt" })
+        const history = storedHistory(store, "loop_a")
+        expect(history).toHaveLength(1)
+        expect(history[0]).toMatchObject({ outcome: "skipped" })
+        expect(String(history[0]!.error)).toMatch(/concurrency cap 1/)
+      },
+      20_000,
+    )
+
+    it(
+      "spends the tick's single slot on the loop, and records the one-off behind it as skipped",
+      async () => {
+        // The loop drain runs before the one-off drain, so with one slot the loop takes it and
+        // the one-off is spent and recorded rather than queued. Pinned because it is a
+        // deliberate order, not an accident. `slowWrites` makes the loop record settle on a
+        // later macrotask, so the loop's post has already finished by the time the one-off
+        // drain looks: the cap that holds here is the budget *this tick decided*, not whatever
+        // still happens to be in flight — a tick that re-read the live counter would hand the
+        // same slot back.
+        const { prompts, store } = await harness({
+          jobs: [],
+          scan: true,
+          slowWrites: true,
+          seed: {
+            [key("ses_abc")]: [storedLoop({ id: "loop_first" })],
+            "scheduled-tasks/oneoff/pending": [pendingOneOff({ prompt: "the one-off prompt" })],
+          },
+          pluginOptions: { maxConcurrentRuns: 1 },
+        })
+
+        await waitFor(() => prompts.length > 0, "the loop to take the only slot")
+        await waitFor(
+          () => Array.isArray(store.get("scheduled-tasks/history/oneoff_probe")),
+          "the one-off to find no free slot",
+        )
+        expect(prompts).toHaveLength(1)
+        expect(prompts[0]).toMatchObject({ text: "the loop prompt" })
+        const history = store.get("scheduled-tasks/history/oneoff_probe") as Array<Record<string, unknown>>
+        expect(history).toHaveLength(1)
+        expect(history[0]).toMatchObject({ outcome: "skipped" })
+        expect(String(history[0]!.error)).toMatch(/concurrency cap 1/)
+      },
+      20_000,
+    )
+
+    it(
+      "keeps counting an outstanding loop post against the cap on later ticks",
+      async () => {
+        // Cross-tick accounting, on an injected clock. A loop post that has been admitted but
+        // has not settled still occupies its slot, so the *next* occurrence is skipped rather
+        // than posted alongside it. Real intervals are floored at a minute, which no test can
+        // wait out, so the interval comes from the injected time instead.
+        vi.useFakeTimers()
+        try {
+          const start = Date.now()
+          vi.setSystemTime(start)
+          const { prompts, store, release } = await harness({
+            jobs: [],
+            scan: true,
+            hold: true,
+            seed: {
+              [key("ses_abc")]: [
+                storedLoop({ id: "loop_hold", intervalMs: MIN_TICK_MS, nextRunAt: start - 1_000 }),
+              ],
+            },
+            pluginOptions: { tickMs: MIN_TICK_MS, maxConcurrentRuns: 1 },
+          })
+
+          // Arming evaluates immediately, so the first occurrence is already in flight.
+          await vi.advanceTimersByTimeAsync(0)
+          expect(prompts).toHaveLength(1)
+
+          // One interval later the loop owes another occurrence, and the first has not settled.
+          await vi.advanceTimersByTimeAsync(MIN_TICK_MS + 1_000)
+          expect(prompts).toHaveLength(1)
+          const history = storedHistory(store, "loop_hold")
+          expect(history.length).toBeGreaterThanOrEqual(1)
+          for (const entry of history) {
+            expect(entry).toMatchObject({ outcome: "skipped", sessionID: "ses_abc" })
+            expect(String(entry.error)).toMatch(/concurrency cap 1/)
+          }
+          release()
+        } finally {
+          vi.useRealTimers()
+        }
+      },
+      20_000,
+    )
   })
 })
