@@ -173,3 +173,15 @@ Log samples were regenerated from `src/index.ts:2010`, which emits
 ### handoff 2026-10-02 @ses_f02aa69caffekIqM24LV3k4JbW (session: ses_f02aa69caffekIqM24LV3k4JbW) — next: Code-review commit 41b5b0d, then push and open the PR; item is done on merge (coordinator flips status).
 - branch: main
 - open questions: README collides with task-t7 — sequence them; spec 002 implemented overstates markdown union (task-t2 still todo); config-surface story is todo not done
+
+### 2026-10-02 @ses_f02aa69caffekIqM24LV3k4JbW
+**Correction to the handoff above:** its `- branch: main` line is wrong — `arggon handoff`
+auto-detects the branch from the git context it runs in, which is the primary checkout, not my
+worktree. The work is on `chore/task-chore-ci-and-doc-statuses-for-plugin-and-v2` at commit
+`41b5b0d`, in worktree `../opencode-scheduled-tasks-task-chore-ci-and-doc-statuses-for-plugin`.
+Not pushed and no PR yet — both are the coordinator's to make.
+
+Also worth knowing: `arggon comment`/`handoff` **auto-commit to the primary's `main`**, so this
+item now carries two commits there (`c38276f`, `7bcf9cc`) that are not on my branch. My commit
+does not touch this item file, so the merge is a fast-forward on that path — but the primary is
+2 ahead of `origin/main` because of these records.
