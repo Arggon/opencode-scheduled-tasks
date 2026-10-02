@@ -23,30 +23,52 @@ adds one — declarative cron jobs that dispatch agent prompts on a running serv
 
 ## Install
 
-As a package:
+### Globally (this machine, every project)
+
+The plugin is a **single dependency-free file**, so there is nothing to build and no
+`node_modules`:
 
 ```sh
-opencode plugin add opencode-scheduled-tasks
+mkdir -p ~/.config/opencode/plugins/scheduled-tasks
+cp src/index.ts ~/.config/opencode/plugins/scheduled-tasks/index.ts
+opencode reload          # the plugins directory is scanned at startup
 ```
 
-Or vendored — the plugin is a **single dependency-free file**, so a copy works with no
-`node_modules` at all:
+Verify:
+
+```sh
+opencode plugin list     # scheduled-tasks  local  ~/.config/opencode/plugins/scheduled-tasks/index.ts
+```
+
+`opencode reload` matters: a plugin directory added after the server started is not picked
+up until then.
+
+### In one project
 
 ```sh
 mkdir -p .opencode/plugins/scheduled-tasks
 cp src/index.ts .opencode/plugins/scheduled-tasks/index.ts
-```
-
-Then add `.opencode/schedules.json` and reload:
-
-```sh
 opencode reload
 ```
 
-`opencode reload` matters: the plugin directory is scanned at startup, so a newly added file
-is not picked up by a server that was already running.
+### From npm or git (once published)
 
-## Job reference
+```sh
+opencode plugin add opencode-scheduled-tasks            # npm
+opencode plugin add github:Arggon/opencode-scheduled-tasks   # git
+```
+
+`opencode plugin add` writes to the **global** config and installs into
+`~/.config/opencode/`, so it is the same thing as the copy above, done for you.
+
+### Jobs are per project, the plugin is not
+
+The plugin can be installed globally, but it reads
+`<project>/.opencode/schedules.json` from the **session's project directory**. So one global
+install serves every repo, each with its own schedules. A project with no job file loads the
+plugin, logs `no enabled jobs`, arms no timer, and takes no writer lease.
+
+## Job reference## Job reference
 
 | Field | Default | Meaning |
 | --- | --- | --- |

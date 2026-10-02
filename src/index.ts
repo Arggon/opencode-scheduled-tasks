@@ -921,6 +921,15 @@ function readLease(path: string): { pid: number; heartbeat: number } | undefined
  * **degrade** to running without a lease rather than disabling the scheduler — the
  * `held: false` result is recorded so the loss of arbitration is visible, not silent.
  */
+/** A lease for a project with no enabled jobs: nothing to arbitrate, nothing to release. */
+const IDLE_LEASE: Lease = {
+  path: "(none)",
+  held: false,
+  foreign: false,
+  heartbeat: () => {},
+  release: () => {},
+}
+
 export function acquireLease(path: string, options: { now?: () => number; ttlMs?: number } = {}): Lease {
   const now = (): number => options.now?.() ?? Date.now()
   const ttlMs = options.ttlMs ?? DEFAULT_LEASE_TTL_MS
@@ -1489,29 +1498,30 @@ const definition: PluginDefinition = {
       return () => {}
     }
 
-    // ADR 0003: a foreign lease leaves the plugin loaded and its tools readable, but the
-    // tick loop unarmed — a second server must not double-fire every job.
     const projectID = asString(ctx.location?.project?.id) ?? directory
     activeLogPath = logPath(directory, projectID)
-    const lease = acquireLease(leasePath(directory, projectID))
-    if (lease.foreign) {
-      logLine(`another OpenCode instance holds the writer lease at ${lease.path}; staying inert`)
-      if (directory !== undefined) reloadJobs(ctx, directory, state)
-      await loadStates(ctx, state)
-      registerTools(ctx, state, lease, tickMs)
-      return () => {}
-    }
-    if (!lease.held) {
-      logLine(`writer lease unavailable at ${lease.path}; running without arbitration`)
-    }
 
+    // Read the jobs *before* arbitrating. A globally-installed plugin loads in every
+    // project, and claiming the writer lease (or littering a lockfile) in a project that
+    // has no schedules would be wrong in every such project.
     reloadJobs(ctx, directory, state)
     await loadStates(ctx, state)
+
+    const hasWork = state.jobs.some((job) => job.enabled)
+
+    // ADR 0003: a foreign lease leaves the plugin loaded and its tools readable, but the
+    // tick loop unarmed — a second server must not double-fire every job.
+    const lease = hasWork ? acquireLease(leasePath(directory, projectID)) : IDLE_LEASE
+    if (lease.foreign) {
+      logLine(`another OpenCode instance holds the writer lease at ${lease.path}; staying inert`)
+    } else if (hasWork && !lease.held) {
+      logLine(`writer lease unavailable at ${lease.path}; running without arbitration`)
+    }
 
     const registered = registerTools(ctx, state, lease, tickMs)
     if (registered) disposers.push(registered)
 
-    if (state.jobs.some((job) => job.enabled)) {
+    if (hasWork && !lease.foreign) {
       let running = false
       const interval = setInterval(() => {
         // Never re-enter: a tick still in flight is skipped, not queued (spec 001).
@@ -1528,8 +1538,14 @@ const definition: PluginDefinition = {
       // Never hold the server process open just to poll a schedule.
       interval.unref?.()
       disposers.push(() => clearInterval(interval))
-    } else {
-      logLine(`no enabled jobs (${state.fileError ?? "empty job file"}); no timer armed`)
+    } else if (!hasWork) {
+      // The file existing but holding only disabled jobs is not the same as having no
+      // file at all, and the log is the only place that difference is visible.
+      logLine(
+        state.fileError === undefined
+          ? `no enabled jobs in ${JOBS_FILE}; no timer armed`
+          : `no enabled jobs (${state.fileError}); no timer armed`,
+      )
     }
 
     return () => {
