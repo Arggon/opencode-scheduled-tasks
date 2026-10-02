@@ -230,8 +230,36 @@ job set.**
 
 > **Ticked** — audit `task-audit-spec-001-acceptance-boxes`, 2026-10-02: `test/index.test.ts` → “skips when the global concurrency cap is reached” (`{ kind: "skip", suppression: { reason: "concurrency" } }`), and globally: “spends the same per-tick budget as a recurring job”, “spends one budget across all three drains, so reordering neither of them buys a slot”.
 
-- [ ] One tick costs O(jobs): `nextRun` is advanced arithmetically, so cost never grows with
-      how long the server was asleep.
+- [ ] One tick costs O(jobs): `nextRun` is advanced arithmetically, and the dropped-backlog count a
+      due job owes is bounded by `MAX_BACKLOG_SCAN` (1000) occurrences — so the cost does not grow
+      with how long the server was asleep past that ceiling, and it is paid **once per backlog**,
+      not once per tick.
+
+> **Bound established** — `bug-tick-cost-grows-with-sleep-not-with-jobs`, 2026-10-02: the box as
+> previously worded was false in its first clause and left its second untested; it is reworded above
+> to the invariant that actually holds and is now pinned. `missedOccurrences` still *enumerates*
+> rather than counting arithmetically — deliberately: cron occurrences are a function of a timezone,
+> a calendar and DST, so an exact count is a search — but `MAX_BACKLOG_SCAN` caps how far that
+> search goes, which is what makes the cost a function of jobs. Measured (`resolveDue`, one
+> `* * * * *` job, counting `Intl.DateTimeFormat#formatToParts` as the work unit): **24 h, 720 h,
+> 8760 h, 87600 h and 876000 h of sleep all cost the identical 6012 lookups (~22–27 ms)** — the walk
+> saturates, so cost is flat in sleep length past ~16.7 h. The tick that finds a backlog pays it
+> once: the cursor moves to `now`, and a `backfill` remainder moves into the durable `catchUp`
+> plan, so the following ticks cost 12 lookups (~0.07 ms) and each `backfill` replay costs 6.
+> Aggregate ceiling for one tick at `DEFAULT_MAX_JOBS` (100 jobs, each owing a capped backlog, which
+> needs ≥17 h asleep): ~602 000 lookups / ~2.3 s **once**; the next ten ticks over the same 100 jobs
+> total ~15 000 lookups / ~59 ms. Named tests: “stops at the bound instead of at the backlog: a year
+> of sleep costs the same as a day”, “charges the walk to the tick that finds the backlog, not to
+> every tick after it”, “replays a `backfill` backlog off the plan, so each replay tick costs one
+> search too”, “scales with the number of jobs, not with the number of occurrences each one owes”,
+> “keeps a backlog smaller than the bound exact, so `droppedCapped` stays honest”. Every bound is
+> asserted as a **work count**, never a duration: raising `MAX_BACKLOG_SCAN` to 5000 fails 6 tests,
+> removing the bound fails 6, and making the tick re-derive the backlog every tick fails the
+> amortization test.
+>
+> The audit's premise below — “produce a number no caller reads” — no longer applies: the count is
+> load-bearing since `bug-backfill-collapses-to-one-run-and-never-reports-truncation` (log **and**
+> every run record), which is why the walk was kept rather than deleted.
 
 > **False** — audit `task-audit-spec-001-acceptance-boxes`, 2026-10-02: The tick’s cost does grow with how long the server was asleep. `missedOccurrences` counts the dropped remainder whenever it filled its limit — and under `skip` the limit is 1, so **every** due `skip` job walks up to `MAX_BACKLOG_SCAN` (1000) `nextOccurrence` calls to produce a number no caller reads. Measured (`resolveDue`, one `0 * * * *` job, real clock): 1 h asleep 15.5 ms (mostly JIT), 8 h 1.2 ms, 24 h 1.9 ms, 720 h 48.8 ms, 8760 h 39.6 ms with `dropped: 1000, droppedCapped: true`. The *following* tick is 0.09 ms, so it is one walk per backlog, not per tick — bounded, but not O(jobs) and not constant in sleep length, which is what the box claims.
 

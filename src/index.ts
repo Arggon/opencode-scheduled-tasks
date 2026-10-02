@@ -1521,9 +1521,21 @@ export type MissedOccurrences = {
 }
 
 /**
- * Ceiling on the walk that counts a dropped backlog. Counting a `* * * * *` job across a
- * year asleep would otherwise cost half a million `nextOccurrence` calls to produce a number
- * nobody acts on, so past this bound the count is reported as a lower bound.
+ * Ceiling on the walk that counts a dropped backlog — and the reason a tick's cost is bounded.
+ *
+ * The count is **not** derived arithmetically, and deliberately so: cron occurrences are a
+ * function of a timezone, a calendar and DST, so an exact count *is* a search. What is bounded is
+ * how far the search goes — past this many occurrences it stops and reports a lower bound
+ * (`droppedCapped`). That is what makes a tick cost a function of the number of **jobs** rather
+ * than of how long the server was asleep. Measured on this file (2026-10-02): a `* * * * *` job
+ * costs the same 6012 timezone lookups (~23 ms) for a backlog of 24 hours and for one of 100
+ * years, and pays that once — the tick that finds the backlog consumes the window and a `backfill`
+ * remainder moves into the durable plan, so the next tick costs one occurrence search (~0.07 ms).
+ * A later tick over 100 such jobs costs ~6 ms.
+ *
+ * **Not exported on purpose.** The bound is asserted as a literal in `test/index.test.ts`, so
+ * raising it breaks a cost assertion in the open rather than being followed silently by a test
+ * that reads the constant.
  */
 const MAX_BACKLOG_SCAN = 1000
 
@@ -1531,6 +1543,14 @@ const MAX_BACKLOG_SCAN = 1000
  * Every occurrence of `spec` in `(afterMs, untilMs]`, capped at `limit`, oldest first.
  *
  * `dropped` reports what the cap swallowed rather than silently discarding it (ADR 0002).
+ *
+ * **Cost**: at most `limit + MAX_BACKLOG_SCAN + 1` occurrence searches, whatever the window holds
+ * — the `limit` instants handed back, `MAX_BACKLOG_SCAN` occurrences counted, and one probe past
+ * the bound that tells "exactly at the bound" from "beyond it". The scheduler's own `limit` is
+ * `maxCatchUp` (≤ 50, from `validateJob`) or 1 under `skip`, so one job's count cannot exceed a
+ * fixed ~1050 searches however long the server slept. `limit` is the one input that could still
+ * make this unbounded, which is why its ceiling lives in `validateJob` and not here: clamping it
+ * here would silently answer a different question than the caller asked.
  */
 export function missedOccurrences(
   spec: CronSpec,
@@ -1579,6 +1599,10 @@ export function missedOccurrences(
  * instead of run move into `state.catchUp` first, so consuming the window loses nothing — a backlog
  * replays across the following ticks rather than replaying inside the tick that found it, which is
  * what keeps one tick's cost to one run and leaves the shared per-tick budget in charge of the rest.
+ *
+ * Consuming the window is also what pays for the count below: **the walk that reports a dropped
+ * backlog happens once per backlog, not once per tick**, and a `backfill` replay spends the durable
+ * plan instead of re-counting it. See `MAX_BACKLOG_SCAN` for the bound and the measurement.
  */
 export function resolveDue(
   job: JobDefinition,
