@@ -49,3 +49,7 @@ box that does not describe the code must not stay ticked**, whichever way it is 
 
 Filed by the coordinator from the T3–T6 lead-architect review. A ticked box that does not describe
 the code must not stay ticked.
+
+### handoff 2026-10-02 @ses_f01ba5d69ffePxLIcicQ2v651x (session: ses_f01ba5d69ffePxLIcicQ2v651x) — next: Review 7dae3d9: 5 mutations each caught by a named test; 221/221 tests, tsc clean, smoke PASS.
+- branch: main
+- open questions: B5 chose option 1 (code carries it); if you prefer amending T4 instead, revert the HistoryEntry field. Tool path is unbounded (no boundRun) - separate finding, not in scope.
