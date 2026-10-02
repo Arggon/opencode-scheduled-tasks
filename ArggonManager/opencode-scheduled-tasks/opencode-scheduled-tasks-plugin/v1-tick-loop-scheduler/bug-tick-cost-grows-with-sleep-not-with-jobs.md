@@ -72,3 +72,7 @@ Filed by the coordinator from the spec 001 audit. Deliberately **not** merged in
 this is a cost-invariant violation and would be lost inside a correctness fix. If it turns out the
 two share a root cause — a collapse path that computes and discards — say so in your report and the
 coordinator will sequence them together.
+
+### handoff 2026-10-02 @ses_f01169724ffecGiuYkio61NMWf (session: ses_f01169724ffecGiuYkio61NMWf) — next: Coordinator: code-review 4e22019 and merge. Verdict is (a) - cost measured acceptable, count left as an enumeration; no behaviour change to review.
+- branch: fix/bug-tick-cost-grows-with-sleep-not-with-jobs
+- open questions: Aggregate worst case is ~2.3s once for 100 jobs all backlogged (needs 17h+ sleep) - accept, or should tick yield between jobs?; item text still says O(occurrences) not O(jobs) in its H1 - retitle?
