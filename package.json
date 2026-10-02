@@ -3,6 +3,25 @@
   "version": "0.1.0",
   "description": "Cron-style scheduled agent tasks for OpenCode V2: declarative job file, tick loop, persistent per-job sessions, cost-bounded misfire handling.",
   "license": "MIT",
+  "author": "Arggon",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Arggon/opencode-scheduled-tasks.git"
+  },
+  "homepage": "https://github.com/Arggon/opencode-scheduled-tasks#readme",
+  "bugs": {
+    "url": "https://github.com/Arggon/opencode-scheduled-tasks/issues"
+  },
+  "keywords": [
+    "automation",
+    "cron",
+    "opencode",
+    "opencode-plugin",
+    "opencode-v2",
+    "schedule",
+    "scheduler",
+    "scheduler-plugin"
+  ],
   "type": "module",
   "main": "./src/index.ts",
   "exports": {
@@ -11,13 +30,6 @@
   "files": [
     "src/index.ts",
     "README.md"
-  ],
-  "keywords": [
-    "opencode",
-    "opencode-plugin",
-    "cron",
-    "schedule",
-    "scheduler"
   ],
   "scripts": {
     "test": "vitest run",
