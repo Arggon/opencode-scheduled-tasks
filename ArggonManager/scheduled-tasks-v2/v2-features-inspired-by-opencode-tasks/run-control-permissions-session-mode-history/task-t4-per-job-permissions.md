@@ -7,6 +7,7 @@ parent: run-control-permissions-session-mode-history
 labels: []
 created: "2026-10-02"
 updated: "2026-10-02"
+depends_on: [task-t3-session-mode-and-run-history]
 ---
 <!--
   Placement (v0): ArggonManager/scheduled-tasks-v2/v2-features-inspired-by-opencode-tasks/run-control-permissions-session-mode-history/task-t4-per-job-permissions.md
