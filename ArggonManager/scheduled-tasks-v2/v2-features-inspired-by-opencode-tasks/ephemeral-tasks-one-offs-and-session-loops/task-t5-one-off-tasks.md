@@ -1,14 +1,14 @@
 ---
 type: task
-status: in_progress
+status: done
 id: task-t5-one-off-tasks
 title: One-off tasks
 assignee: arggon
+branch: feat/task-t5-one-off-tasks
 parent: ephemeral-tasks-one-offs-and-session-loops
 labels: []
 created: "2026-10-02"
 updated: "2026-10-02"
-claimed_at: "2026-10-02T15:17:56.705Z"
 depends_on: [task-t3-session-mode-and-run-history]
 ---
 <!--
@@ -29,13 +29,13 @@ See plan 002 §T5 and spec 002 § "One-off tasks".
 
 ## Acceptance
 
-- [ ] A one-off fires exactly once at its instant and is then gone.
-- [ ] A one-off **never** appears in or mutates a job file (ADR 0006 guarantee).
-- [ ] A past instant is refused, or run within a small documented grace window — never silently
+- [x] A one-off fires exactly once at its instant and is then gone.
+- [x] A one-off **never** appears in or mutates a job file (ADR 0006 guarantee).
+- [x] A past instant is refused, or run within a small documented grace window — never silently
       treated as "due now".
-- [ ] Cancelling an unknown or already-completed id returns a typed error naming the id.
-- [ ] Completed one-offs survive only inside run history, then are discarded.
-- [ ] Per-project cap (default 50) is enforced and **reported** when reached.
+- [x] Cancelling an unknown or already-completed id returns a typed error naming the id.
+- [x] Completed one-offs survive only inside run history, then are discarded.
+- [x] Per-project cap (default 50) is enforced and **reported** when reached.
 
 
 
