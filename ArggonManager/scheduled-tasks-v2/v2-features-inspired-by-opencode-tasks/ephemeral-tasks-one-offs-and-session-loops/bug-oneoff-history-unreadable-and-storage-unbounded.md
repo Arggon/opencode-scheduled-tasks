@@ -40,6 +40,11 @@ comment claimed a hard ceiling.
 catch, and the tick recorded only `ok`. The success path also stamped `startedAt` at *completion*
 (2136) rather than dispatch.
 
+- **Added by the loop fix** — `postLoop` records under `history/<id>` too, so a loop shares the
+  `history/<id>` key space with jobs and one-offs. Practically unreachable (ids are generated with a
+  random suffix), but it is the same key-space question this item already raises for one-offs, so it
+  is resolved here rather than filed twice.
+
 ## Acceptance
 
 - [ ] `schedules_history` reads a completed one-off, and the README + `cancel` message become true.
