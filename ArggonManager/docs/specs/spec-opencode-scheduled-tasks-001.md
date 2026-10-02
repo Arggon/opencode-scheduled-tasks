@@ -210,8 +210,18 @@ job set.**
 
 > **Ticked** — audit `task-audit-spec-001-acceptance-boxes`, 2026-10-02: `test/index.test.ts` → “collapses a backlog of eight to exactly one run under `skip`” (`collapsed: 1`, `lastRun` advanced to `now`, so the backlog cannot replay).
 
-- [ ] `misfire: "backfill"` replays at most `maxCatchUp` occurrences, oldest first, and
+- [x] `misfire: "backfill"` replays at most `maxCatchUp` occurrences, oldest first, and
       reports the dropped remainder as truncated in the run record.
+
+> **Ticked** — `bug-backfill-collapses-to-one-run-and-never-reports-truncation`: `resolveDue` now
+> returns one occurrence per tick with the rest held in a durable `catchUp` plan on the job's state
+> record, so a five-occurrence backlog with `maxCatchUp: 3` produces three prompts oldest-first across
+> three ticks. Named tests: “replays a backlog oldest-first, one occurrence per tick, up to
+> maxCatchUp”, “reports the dropped remainder in the log **and** on every record of the backlog”,
+> “defers a replayed occurrence that finds no free slot instead of spending it”, “restores the
+> catch-up plan from storage after a restart”. ADR 0002 stands unchanged — the code caught up to the
+> decision rather than the decision being rewritten to match the code.
+
 
 > **False** — audit `task-audit-spec-001-acceptance-boxes`, 2026-10-02: `misfire: "backfill"` neither replays what the box says nor reports what it dropped. `resolveDue` folds up to `maxCatchUp` occurrences into **one** decision (`occurrence.collapsed = N`, `dueAt` = the oldest) and `tick` dispatches it once; and `occurrence.dropped`/`droppedCapped` are read by nothing at all — the `backlog-truncated` suppression that would print them (src/index.ts:3451) is never returned. Repro: a job with `misfire: "backfill"`, `maxCatchUp: 3`, five hourly occurrences missed → **one** `session.prompt`, one record `{dueAt, startedAt, outcome, model, sessionID}`, and no truncation line in the log or the file. ADR 0002 says the remainder is “dropped and reported as truncated in the run record, never silently”.
 

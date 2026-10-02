@@ -28,16 +28,27 @@ The box claims:
 
 > One tick costs O(jobs): `nextRun` is advanced arithmetically, so cost never grows with backlog.
 
-Cost grows with **backlog**, not with jobs. Under `misfire: "skip"` the scheduler walks up to 1000
-occurrences to compute a collapse count that **no log line and no record ever prints** — because
-`dropped`/`droppedCapped` are read by nothing (see `bug-backfill-collapses-to-one-run-and-never-reports-truncation`).
+Cost grows with **backlog**, not with jobs. Under `misfire: "skip"` the scheduler walked up to 1000
+occurrences (`MAX_BACKLOG_SCAN`) to compute a collapse count that **no log line and no record ever
+printed**.
 
-Measured: ~1.9 ms per tick at a 24 h sleep, **~48.8 ms at 720 h (30 d)**. So the arithmetic claim is
-true of `nextRun` and false of the miss computation, and the work being done is discarded.
-
-This matters twice over: it is a cost invariant stated in the spec and violated in the code, and a
-tick that walks 1000 occurrences is unbounded work on a path that runs unattended every 30 s by
-default.
+> ### ⚠ Premise corrected by `bug-backfill-collapses-to-one-run-and-never-reports-truncation`
+>
+> The original framing of this item was "the walk computes a number nothing reads, so delete the
+> computation". **That is no longer true and must not be acted on.** The backfill fix made the
+> collapsed count **load-bearing**: `dropped` / `droppedCapped` are now reported in the log *and* on
+> every run record of the backlog, exactly as ADR 0002 requires. Deleting the computation would
+> reinstate the very silence this repo just spent an item eliminating.
+>
+> So the remedy has changed. It is now: **compute the count without walking the occurrences**, or
+> accept the cost with a measurement that justifies it. The arithmetic that makes `nextRun` cheap
+> should be reachable for the miss count too — `missedOccurrences` is an enumeration where the rest
+> of the file is arithmetic.
+>
+> Measured by the backfill worker after its fix: a 720 h backlog costs **25–41 ms once**, and the
+> next ordinary tick **0.17–0.19 ms** — i.e. the walk happens once per backlog, not once per tick.
+> That is far better than the audit's 48.8 ms *per tick*, and it may well be acceptable. Judge it on
+> the measurement rather than inheriting the original alarm.
 
 ## Acceptance
 
