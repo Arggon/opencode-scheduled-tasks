@@ -22,10 +22,13 @@ import plugin, {
   pushHistory,
   resolveDue,
   validateJob,
+  validateLoop,
   validateOneOff,
   wallParts,
   MAX_HISTORY_LIMIT,
   collectAsks,
+  DEFAULT_LOOP_CAP,
+  DEFAULT_LOOP_TTL_MS,
   DEFAULT_ONEOFF_CAP,
   type HistoryEntry,
   type JobDefinition,
@@ -566,7 +569,7 @@ describe("plugin setup — context wiring and failure isolation", () => {
 
     expect(calls).toHaveLength(1)
     const names = calls[0]!.added.map((tool) => tool.name)
-    expect(names).toEqual(["list", "schedule", "cancel", "history", "format", "run"])
+    expect(names).toEqual(["list", "start_loop", "stop_loop", "schedule", "cancel", "history", "format", "run"])
     for (const tool of calls[0]!.added) {
       expect((tool.options as Record<string, unknown>).namespace).toBe("schedules")
       expect((tool.options as Record<string, unknown>).codemode).toBe(true)
@@ -1481,6 +1484,191 @@ describe("one-off tasks (T5, ADR 0006)", () => {
       })
       expect(out.output.error).toMatch(/at the cap of 50/)
       expect(out.output.pending).toBe(50)
+    } finally {
+      ;(cleanup as () => void)?.()
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+})
+
+describe("session loops (T6, ADR 0006)", () => {
+  const now = Date.UTC(2026, 4, 10, 12, 0, 0)
+
+  it("accepts a duration interval, not a cron expression", () => {
+    const out = validateLoop({ prompt: "check the deploy", every: "5m" }, now, "ses_1")
+    expect(out).toHaveProperty("task")
+    const task = (out as { task: { intervalMs: number; expiresAt: number; sessionID: string } }).task
+    expect(task.intervalMs).toBe(5 * MINUTE_MS)
+    expect(task.expiresAt).toBe(now + DEFAULT_LOOP_TTL_MS)
+    expect(task.sessionID).toBe("ses_1")
+  })
+
+  it("refuses a sub-minute interval, because loops are minute-resolution", () => {
+    expect(validateLoop({ prompt: "p", every: "30s" }, now, "ses_1")).toHaveProperty("reason")
+  })
+
+  it("refuses a cron expression and a missing interval", () => {
+    expect(validateLoop({ prompt: "p", every: "* * * * *" }, now, "ses_1")).toHaveProperty("reason")
+    expect(validateLoop({ prompt: "p" }, now, "ses_1")).toHaveProperty("reason")
+    expect(validateLoop({ every: "5m" }, now, "ses_1")).toHaveProperty("reason")
+  })
+
+  it("honours an explicit ttl", () => {
+    const out = validateLoop({ prompt: "p", every: "1h", ttl: "2h" }, now, "ses_1")
+    expect((out as { task: { expiresAt: number } }).task.expiresAt).toBe(now + 2 * 60 * MINUTE_MS)
+  })
+
+  it("scopes a loop to the calling session and refuses without one", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "st-loop-"))
+    mkdirSync(join(dir, ".opencode"), { recursive: true })
+    writeFileSync(join(dir, ".opencode", "schedules.json"), JSON.stringify({ version: 1, jobs: [] }))
+    let added: Array<Record<string, unknown>> = []
+    const ctx = {
+      location: { directory: dir, project: { id: "loop" } },
+      session: { create: async () => ({ id: "s" }), prompt: async () => ({ id: "i" }) },
+      tool: {
+        transform: async (cb: (e: { add?: (tool: unknown) => void }) => void) => {
+          cb({ add: (tool) => added.push(tool as Record<string, unknown>) })
+          return { dispose: () => {} }
+        },
+      },
+    }
+    const cleanup = await plugin.setup(ctx as never)
+    try {
+      const start = added.find((tool) => tool.name === "start_loop")!
+      const exec = start.execute as (
+        i: Record<string, unknown>,
+        c?: { sessionID?: unknown },
+      ) => Promise<{ output: Record<string, unknown> }>
+
+      const noSession = await exec({ prompt: "p", every: "5m" })
+      expect(noSession.output.error).toMatch(/only be started from inside a session/)
+
+      const created = await exec({ prompt: "check the deploy", every: "5m" }, { sessionID: "ses_abc" })
+      expect(created.output.sessionID).toBe("ses_abc")
+      expect(created.output.id).toMatch(/^loop_/)
+
+      // The loop is recorded against its owning session, and nothing else.
+      const list = added.find((tool) => tool.name === "list")!
+      const listed = await (list.execute as (i: unknown) => Promise<{ output: Record<string, unknown> }>)({})
+      const loops = listed.output.loops as Array<Record<string, unknown>>
+      expect(loops).toHaveLength(1)
+      expect(loops[0]!.sessionID).toBe("ses_abc")
+      expect(listed.output.loopCap).toBe(DEFAULT_LOOP_CAP)
+    } finally {
+      ;(cleanup as () => void)?.()
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it("stops one loop by id, or all of them, and names an unknown id", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "st-loop2-"))
+    mkdirSync(join(dir, ".opencode"), { recursive: true })
+    writeFileSync(join(dir, ".opencode", "schedules.json"), JSON.stringify({ version: 1, jobs: [] }))
+    let added: Array<Record<string, unknown>> = []
+    const ctx = {
+      location: { directory: dir, project: { id: "loop2" } },
+      session: { create: async () => ({ id: "s" }), prompt: async () => ({ id: "i" }) },
+      tool: {
+        transform: async (cb: (e: { add?: (tool: unknown) => void }) => void) => {
+          cb({ add: (tool) => added.push(tool as Record<string, unknown>) })
+          return { dispose: () => {} }
+        },
+      },
+    }
+    const cleanup = await plugin.setup(ctx as never)
+    try {
+      const start = added.find((tool) => tool.name === "start_loop")!
+      const stop = added.find((tool) => tool.name === "stop_loop")!
+      const sExec = start.execute as (i: Record<string, unknown>, c?: { sessionID?: unknown }) => Promise<{ output: Record<string, unknown> }>
+      const xExec = stop.execute as (i: Record<string, unknown>, c?: { sessionID?: unknown }) => Promise<{ output: Record<string, unknown> }>
+      const call = { sessionID: "ses_abc" }
+
+      const a = await sExec({ prompt: "a", every: "5m" }, call)
+      const b = await sExec({ prompt: "b", every: "5m" }, call)
+
+      const one = await xExec({ id: a.output.id }, call)
+      expect((one.output.loops as Array<Record<string, unknown>>).map((l) => l.id)).toEqual([b.output.id])
+
+      const missing = await xExec({ id: "loop_nope" }, call)
+      expect(missing.output.error).toMatch(/no loop with id "loop_nope" in session ses_abc/)
+
+      const all = await xExec({}, call)
+      expect(all.output.loops).toEqual([])
+    } finally {
+      ;(cleanup as () => void)?.()
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it("does not let one session stop another session's loop", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "st-loop3-"))
+    mkdirSync(join(dir, ".opencode"), { recursive: true })
+    writeFileSync(join(dir, ".opencode", "schedules.json"), JSON.stringify({ version: 1, jobs: [] }))
+    let added: Array<Record<string, unknown>> = []
+    const ctx = {
+      location: { directory: dir, project: { id: "loop3" } },
+      session: { create: async () => ({ id: "s" }), prompt: async () => ({ id: "i" }) },
+      tool: {
+        transform: async (cb: (e: { add?: (tool: unknown) => void }) => void) => {
+          cb({ add: (tool) => added.push(tool as Record<string, unknown>) })
+          return { dispose: () => {} }
+        },
+      },
+    }
+    const cleanup = await plugin.setup(ctx as never)
+    try {
+      const start = added.find((tool) => tool.name === "start_loop")!
+      const stop = added.find((tool) => tool.name === "stop_loop")!
+      const sExec = start.execute as (i: Record<string, unknown>, c?: { sessionID?: unknown }) => Promise<{ output: Record<string, unknown> }>
+      const xExec = stop.execute as (i: Record<string, unknown>, c?: { sessionID?: unknown }) => Promise<{ output: Record<string, unknown> }>
+      const mine = await sExec({ prompt: "p", every: "5m" }, { sessionID: "ses_mine" })
+      const theirs = await xExec({ id: mine.output.id }, { sessionID: "ses_theirs" })
+      expect(theirs.output.error).toMatch(/in session ses_theirs/)
+    } finally {
+      ;(cleanup as () => void)?.()
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it("reports the per-session cap rather than silently refusing", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "st-loop4-"))
+    mkdirSync(join(dir, ".opencode"), { recursive: true })
+    writeFileSync(join(dir, ".opencode", "schedules.json"), JSON.stringify({ version: 1, jobs: [] }))
+    const store = new Map<string, unknown>()
+    const seed = Array.from({ length: DEFAULT_LOOP_CAP }, (_, n) => ({
+      id: `loop_seed${n}`,
+      prompt: "p",
+      intervalMs: MINUTE_MS,
+      nextRunAt: Date.now() + 10 * MINUTE_MS,
+      expiresAt: Date.now() + 60 * MINUTE_MS,
+      createdAt: Date.now(),
+    }))
+    store.set("scheduled-tasks/loop/ses_full", seed)
+    let added: Array<Record<string, unknown>> = []
+    const ctx = {
+      location: { directory: dir, project: { id: "loop4" } },
+      storage: {
+        get: async (k: string) => store.get(k),
+        set: async (k: string, v: unknown) => void store.set(k, v),
+        remove: async (k: string) => void store.delete(k),
+      },
+      session: { create: async () => ({ id: "s" }), prompt: async () => ({ id: "i" }) },
+      tool: {
+        transform: async (cb: (e: { add?: (tool: unknown) => void }) => void) => {
+          cb({ add: (tool) => added.push(tool as Record<string, unknown>) })
+          return { dispose: () => {} }
+        },
+      },
+    }
+    const cleanup = await plugin.setup(ctx as never)
+    try {
+      const start = added.find((tool) => tool.name === "start_loop")!
+      const out = await (start.execute as (i: Record<string, unknown>, c?: { sessionID?: unknown }) => Promise<{ output: Record<string, unknown> }>)(
+        { prompt: "p", every: "5m" },
+        { sessionID: "ses_full" },
+      )
+      expect(out.output.error).toMatch(/at the cap of 10 loops/)
     } finally {
       ;(cleanup as () => void)?.()
       rmSync(dir, { recursive: true, force: true })

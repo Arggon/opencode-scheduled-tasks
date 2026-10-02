@@ -161,6 +161,29 @@ captured into OpenCode's own log file:
 Set `OPENCODE_SCHEDULED_TASKS_DATA_DIR` to relocate that directory (containers, read-only
 homes, test runs).
 
+## Session loops
+
+A loop posts a prompt into **the session that created it**, on a fixed interval — for
+in-session automation like polling a deploy or watching a long-running command. It is not a
+cron expression: a loop is "every N", not "at these times".
+
+```
+schedules_start_loop({ prompt: "Check the deploy and report status", every: "5m" })
+schedules_stop_loop({ id: "loop_ab12cd34" })   // omit id to stop every loop here
+```
+
+- A loop is scoped by the calling session, and **cannot post into another session** or be
+  stopped from one. Starting one without a session is refused rather than guessed at.
+- Minimum interval is 1 minute; sub-minute is refused, matching OpenCode's cron resolution.
+- Default lifetime is **three days**, after which it auto-disables and says so. Pass `ttl` for
+  something else.
+- The loop is re-armed *before* it posts, so a crash cannot double-post on the next tick.
+- At most 10 loops per session; reaching the cap is reported with the existing ids.
+
+Loops are ephemeral and agent-managed. They live in plugin storage keyed by session, so a
+deleted session's loops are simply unreachable — a loop cannot outlive the session that asked
+for it.
+
 ## One-off tasks
 
 Sometimes the work is not recurring. `schedules_schedule` takes a prompt and a time — either

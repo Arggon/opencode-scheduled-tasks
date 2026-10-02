@@ -1425,6 +1425,110 @@ async function saveOneOffs(ctx: PluginContext, tasks: readonly OneOffTask[]): Pr
 }
 
 // ---------------------------------------------------------------------------
+// Session loops (ADR 0006)
+// ---------------------------------------------------------------------------
+
+/**
+ * An in-session recurring prompt: posts into **the session that created it** on a fixed
+ * interval, until it is stopped or expires.
+ *
+ * Not a `JobDefinition`: a loop has a duration interval (not a cron expression), belongs to
+ * a session rather than a project, and is agent-managed rather than file-defined.
+ */
+export type SessionLoop = {
+  id: string
+  /** Session that owns this loop. A loop never posts into another. */
+  sessionID: string
+  prompt: string
+  intervalMs: number
+  nextRunAt: number
+  createdAt: number
+  /** When the loop auto-disables. */
+  expiresAt: number
+}
+
+/** Most loops one session may hold at once. */
+export const DEFAULT_LOOP_CAP = 10
+
+/** Hard ceiling on loops per session, whatever the cap is configured to. */
+export const MAX_LOOP_CAP = 50
+
+/** Default loop lifetime. Three days, matching the convention borrowed with this feature. */
+export const DEFAULT_LOOP_TTL_MS = 3 * 24 * 60 * MINUTE_MS
+
+/** Loops are minute-resolution at best; OpenCode's cron is too. */
+export const MIN_LOOP_INTERVAL_MS = MINUTE_MS
+
+const LOOP_PREFIX = `${STORAGE_PREFIX}loop/`
+
+function loopId(): string {
+  return `loop_${Math.random().toString(36).slice(2, 10)}${Date.now().toString(36)}`
+}
+
+export type LoopValidation = { task: Omit<SessionLoop, "id" | "createdAt" | "nextRunAt"> } | { reason: string }
+
+/** Validate a `schedules_start_loop` request. `nowMs` is injected so TTLs are testable. */
+export function validateLoop(input: Record<string, unknown>, nowMs: number, sessionID: string): LoopValidation {
+  const prompt = typeof input.prompt === "string" ? input.prompt.trim() : ""
+  if (prompt === "") return { reason: "prompt is required" }
+  if (prompt.length > ONEOFF_PROMPT_MAX) {
+    return { reason: `prompt longer than ${ONEOFF_PROMPT_MAX} characters` }
+  }
+
+  // A duration, not a cron expression: a loop is "every N", not "at these times".
+  const interval = parseDuration(input.every ?? input.interval)
+  if (interval === undefined) {
+    return { reason: "every is required, as a duration such as \"5m\", \"2h\" or \"1d\"" }
+  }
+  if ("reason" in interval) return { reason: interval.reason }
+  if (interval.ms < MIN_LOOP_INTERVAL_MS) {
+    return {
+      reason: `interval must be at least ${Math.round(MIN_LOOP_INTERVAL_MS / 1000)}s (loops are minute-resolution)`,
+    }
+  }
+
+  const ttl = parseDuration(input.ttl)
+  if (ttl !== undefined && "reason" in ttl) return { reason: ttl.reason }
+  const expiresInMs = ttl !== undefined && "ms" in ttl ? ttl.ms : DEFAULT_LOOP_TTL_MS
+
+  return { task: { sessionID, prompt, intervalMs: interval.ms, expiresAt: nowMs + expiresInMs } }
+}
+
+/** Read loops for one session, dropping malformed entries rather than failing the load. */
+async function loadLoops(ctx: PluginContext, sessionID: string): Promise<SessionLoop[]> {
+  const stored = await storageGet(ctx, `${LOOP_PREFIX}${sessionID}`)
+  if (!Array.isArray(stored)) return []
+  const out: SessionLoop[] = []
+  for (const raw of stored) {
+    if (raw === null || typeof raw !== "object") continue
+    const r = raw as Record<string, unknown>
+    const id = asString(r.id)
+    const prompt = asString(r.prompt)
+    if (id === undefined || prompt === undefined) continue
+    if (typeof r.intervalMs !== "number" || !Number.isFinite(r.intervalMs)) continue
+    if (typeof r.nextRunAt !== "number" || !Number.isFinite(r.nextRunAt)) continue
+    if (typeof r.expiresAt !== "number" || !Number.isFinite(r.expiresAt)) continue
+    out.push({
+      id,
+      sessionID,
+      prompt,
+      intervalMs: r.intervalMs,
+      nextRunAt: r.nextRunAt,
+      expiresAt: r.expiresAt,
+      createdAt: typeof r.createdAt === "number" ? r.createdAt : r.nextRunAt,
+    })
+  }
+  return out
+}
+
+async function saveLoops(ctx: PluginContext, loops: readonly SessionLoop[]): Promise<void> {
+  // A loop belongs to one session, so the key is that session's: a loop can never outlive
+  // the session that asked for it, and a dead session's loops are simply unreachable.
+  const first = loops[0]
+  if (first !== undefined) await storageSet(ctx, `${LOOP_PREFIX}${first.sessionID}`, loops)
+}
+
+// ---------------------------------------------------------------------------
 // OpenCode V2 plugin context (structural types — no `@opencode/plugin` import)
 // ---------------------------------------------------------------------------
 
@@ -1554,6 +1658,17 @@ async function storageSet(ctx: PluginContext, key: string, value: unknown): Prom
   }
 }
 
+/**
+ * A runtime-provided session id, accepted only when it looks like an opaque token.
+ *
+ * A loop is scoped by this, so an odd or hostile value must not become a storage key.
+ */
+function sessionToken(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined
+  const token = value.trim()
+  return token !== "" && token.length <= 128 && /^[A-Za-z0-9._:-]+$/.test(token) ? token : undefined
+}
+
 function sessionIdOf(value: unknown): string | undefined {
   if (typeof value === "string" && value.trim() !== "") return value.trim()
   if (value !== null && typeof value === "object") {
@@ -1580,6 +1695,8 @@ type SchedulerState = {
   history: Map<string, HistoryEntry[]>
   /** Pending one-off tasks. Runtime-only; never written to a job file (ADR 0006). */
   oneOffs: OneOffTask[]
+  /** In-session loops, keyed by the owning session id. */
+  loops: Map<string, SessionLoop[]>
   inFlight: Set<string>
   fileError?: string
   invalid: InvalidJob[]
@@ -1613,6 +1730,16 @@ const FORMAT_OUTPUT = {
 const SCHEDULE_OUTPUT = {
   type: "object",
   properties: { id: { type: "string" }, dueAt: { type: "string" }, pending: { type: "number" } },
+}
+
+const LOOP_OUTPUT = {
+  type: "object",
+  properties: { id: { type: "string" }, sessionID: { type: "string" }, nextRunAt: { type: "string" }, expiresAt: { type: "string" } },
+}
+
+const LOOP_LIST_OUTPUT = {
+  type: "object",
+  properties: { loops: { type: "array" }, cap: { type: "number" } },
 }
 
 const CANCEL_OUTPUT = {
@@ -1958,6 +2085,34 @@ async function tick(ctx: PluginContext, state: SchedulerState, lease: Lease, max
     decisions.push(decision)
   }
 
+  // Loops fire only into the session that owns them, and never outlive that session.
+  for (const [sessionID, loops] of state.loops) {
+    if (loops.length === 0) continue
+    const surviving: SessionLoop[] = []
+    for (const loop of loops) {
+      if (loop.expiresAt <= now) {
+        logLine(`loop ${loop.id} expired after 3 days and was disabled`)
+        continue
+      }
+      surviving.push(loop)
+      if (loop.nextRunAt > now) continue
+      // Re-arm first: a crash must not double-post on the next tick.
+      loop.nextRunAt = now + loop.intervalMs
+      if (typeof ctx.session?.prompt === "function") {
+        logLine(`loop ${loop.id} posting into its own session (every ${Math.round(loop.intervalMs / MINUTE_MS)}m)`)
+        void ctx.session
+          .prompt({ sessionID, text: loop.prompt, delivery: "queue" })
+          .catch((error: unknown) => {
+            logOnce(`loop-${loop.id}`, `post failed (${error instanceof Error ? error.message : String(error)})`)
+          })
+      }
+    }
+    if (surviving.length !== loops.length) {
+      state.loops.set(sessionID, surviving)
+      await saveLoops(ctx, surviving)
+    }
+  }
+
   // One-offs are drained after recurring jobs so a one-off never starves a schedule.
   const due = state.oneOffs.filter((task) => task.dueAt <= now)
   if (due.length > 0) {
@@ -2049,12 +2204,125 @@ function buildTools(ctx: PluginContext, state: SchedulerState, lease: Lease, tic
               model: task.model === undefined ? "session default" : `${task.model.providerID}/${task.model.id}`,
             })),
           oneOffCap: DEFAULT_ONEOFF_CAP,
+          // Loops are per session, so they are listed across sessions with their owner.
+          loops: [...state.loops.entries()].flatMap(([sessionID, loops]) =>
+            loops.map((loop) => ({
+              id: loop.id,
+              sessionID,
+              nextRunAt: new Date(loop.nextRunAt).toISOString(),
+              expiresAt: new Date(loop.expiresAt).toISOString(),
+              intervalMs: loop.intervalMs,
+            })),
+          ),
+          loopCap: DEFAULT_LOOP_CAP,
           ...(state.fileError !== undefined ? { error: state.fileError } : {}),
           leaseHeld: lease.held,
           leaseForeign: lease.foreign,
           tickMs,
         },
       }),
+    },
+    {
+      name: "start_loop",
+      description:
+        "Start a recurring prompt inside THIS session on a fixed interval (e.g. every 5m). Auto-disables after three days unless a ttl is given.",
+      input: {
+        type: "object",
+        properties: {
+          prompt: { type: "string", description: "Text posted into this session each interval." },
+          every: { type: "string", description: "Interval as a duration: \"5m\", \"2h\", \"1d\". Minimum 1m." },
+          ttl: { type: "string", description: "Lifetime as a duration. Default 3 days." },
+        },
+        required: ["prompt", "every"],
+        additionalProperties: false,
+      },
+      output: LOOP_OUTPUT,
+      options: { namespace: TOOL_NAMESPACE, codemode: true },
+      execute: async (input, context) => {
+        // A loop is owned by the session that asked for it, so the calling session id is
+        // the only thing that can scope it. No session => refuse rather than guess.
+        const sessionID = sessionToken(context?.sessionID)
+        if (sessionID === undefined) {
+          return { output: { error: "no calling session: a loop can only be started from inside a session" } }
+        }
+        const now = Date.now()
+        const validated = validateLoop(input, now, sessionID)
+        if ("reason" in validated) return { output: { error: validated.reason } }
+
+        // Restore this session's loops from storage FIRST, so a loop survives a reload and
+        // so the cap is measured against what actually exists rather than against an empty
+        // in-memory map. Checking the cap before restoring silently overwrote stored loops.
+        const existing = state.loops.get(sessionID) ?? []
+        const restored = existing.length > 0 ? existing : await loadLoops(ctx, sessionID)
+        if (restored.length >= DEFAULT_LOOP_CAP) {
+          return {
+            output: {
+              error: `at the cap of ${DEFAULT_LOOP_CAP} loops in this session; stop one first`,
+              cap: DEFAULT_LOOP_CAP,
+              loops: restored.map((loop) => loop.id),
+            },
+          }
+        }
+
+        const loop: SessionLoop = {
+          ...validated.task,
+          id: loopId(),
+          createdAt: now,
+          nextRunAt: now + validated.task.intervalMs,
+        }
+        state.loops.set(sessionID, [...restored, loop])
+        await saveLoops(ctx, state.loops.get(sessionID)!)
+        logLine(`started loop ${loop.id} every ${Math.round(loop.intervalMs / MINUTE_MS)}m in session ${sessionID}`)
+        return {
+          output: {
+            id: loop.id,
+            sessionID,
+            nextRunAt: new Date(loop.nextRunAt).toISOString(),
+            expiresAt: new Date(loop.expiresAt).toISOString(),
+          },
+        }
+      },
+    },
+    {
+      name: "stop_loop",
+      description: "Stop one loop in this session by id, or every loop in this session when id is omitted.",
+      input: {
+        type: "object",
+        properties: { id: { type: "string", description: "Loop id. Omit to stop all loops in this session." } },
+        additionalProperties: false,
+      },
+      output: LOOP_LIST_OUTPUT,
+      options: { namespace: TOOL_NAMESPACE, codemode: true },
+      execute: async (input, context) => {
+        const sessionID = sessionToken(context?.sessionID)
+        if (sessionID === undefined) {
+          return { output: { error: "no calling session" } }
+        }
+        const existing = state.loops.get(sessionID) ?? (await loadLoops(ctx, sessionID))
+        const id = asString(input.id)
+        if (id === undefined) {
+          state.loops.set(sessionID, [])
+          await saveLoops(ctx, [])
+          logLine(`stopped all loops in session ${sessionID}`)
+          return { output: { loops: [], cap: DEFAULT_LOOP_CAP } }
+        }
+        if (!existing.some((loop) => loop.id === id)) {
+          // Name the session too: the loop may well exist, in a different one.
+          return {
+            output: {
+              error: `no loop with id "${id}" in session ${sessionID}`,
+              loops: existing.map((loop) => loop.id),
+            },
+          }
+        }
+        const remaining = existing.filter((loop) => loop.id !== id)
+        state.loops.set(sessionID, remaining)
+        await saveLoops(ctx, remaining)
+        logLine(`stopped loop ${id}`)
+        return {
+          output: { loops: remaining.map((loop) => ({ id: loop.id, nextRunAt: new Date(loop.nextRunAt).toISOString() })), cap: DEFAULT_LOOP_CAP },
+        }
+      },
     },
     {
       name: "schedule",
@@ -2255,6 +2523,7 @@ const definition: PluginDefinition = {
       sessions: new Map(),
       history: new Map(),
       oneOffs: [],
+      loops: new Map(),
       inFlight: new Set(),
       invalid: [],
       storageAvailable: typeof ctx.storage?.get === "function",
