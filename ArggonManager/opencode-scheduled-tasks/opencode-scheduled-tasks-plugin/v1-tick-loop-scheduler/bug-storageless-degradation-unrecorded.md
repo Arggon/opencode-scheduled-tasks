@@ -4,6 +4,7 @@ status: in_progress
 id: bug-storageless-degradation-unrecorded
 title: "Storage-absent degradation is recorded nowhere, and ephemeral history is unreachable without storage"
 assignee: arggon
+branch: fix/bug-storageless-degradation-unrecorded
 parent: v1-tick-loop-scheduler
 labels: []
 priority: p1
