@@ -1,14 +1,14 @@
 ---
 type: task
-status: in_progress
+status: done
 id: task-t3-session-mode-and-run-history
 title: Session mode (reuse/fresh) and bounded run history
 assignee: arggon
+branch: feat/task-t3-session-mode-and-run-history
 parent: run-control-permissions-session-mode-history
 labels: []
 created: "2026-10-02"
 updated: "2026-10-02"
-claimed_at: "2026-10-02T15:05:45.683Z"
 depends_on: [task-t1-durations-and-format-tool]
 ---
 <!--
@@ -27,12 +27,12 @@ tool. See plan 002 §T3 and spec 002 § "Session mode" / "Run history".
 
 ## Acceptance
 
-- [ ] `reuse` (default) preserves v1 behaviour; `fresh` creates a new session per run.
-- [ ] A `session` value other than `reuse`/`fresh` is refused with a named reason.
-- [ ] Resolved mode appears in `schedules_list` and in the `running` log line.
-- [ ] History is capped and evicts oldest-first; it can never grow unbounded.
-- [ ] Each entry records due instant, start, outcome, resolved model and a bounded error string.
-- [ ] `schedules_history` returns newest-first; an unknown id returns a typed error naming it,
+- [x] `reuse` (default) preserves v1 behaviour; `fresh` creates a new session per run.
+- [x] A `session` value other than `reuse`/`fresh` is refused with a named reason.
+- [x] Resolved mode appears in `schedules_list` and in the `running` log line.
+- [x] History is capped and evicts oldest-first; it can never grow unbounded.
+- [x] Each entry records due instant, start, outcome, resolved model and a bounded error string.
+- [x] `schedules_history` returns newest-first; an unknown id returns a typed error naming it,
       not an empty success.
 
 
