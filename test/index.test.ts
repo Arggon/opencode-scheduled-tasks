@@ -46,6 +46,9 @@ import plugin, {
   leasePath,
   normalizeLoops,
   MAX_LOOP_SCAN_KEYS,
+  MAX_LOOP_CAP,
+  MAX_ONEOFF_CAP,
+  MAX_EPHEMERAL_HISTORY_KEYS,
   type HistoryEntry,
   type JobDefinition,
   type JobState,
@@ -3027,10 +3030,10 @@ describe("arming the tick — ephemeral work is work (bug-ephemeral-work-never-a
 
       // Skipped and *recorded*: the occurrence is spent, and the record says why.
       await waitFor(
-        () => Array.isArray(store.get("scheduled-tasks/history/oneoff_probe")),
+        () => Array.isArray(store.get("scheduled-tasks/history/oneoff/oneoff_probe")),
         "the skip to be recorded in history",
       )
-      const history = store.get("scheduled-tasks/history/oneoff_probe") as Array<Record<string, unknown>>
+      const history = store.get("scheduled-tasks/history/oneoff/oneoff_probe") as Array<Record<string, unknown>>
       expect(history).toHaveLength(1)
       expect(history[0]).toMatchObject({ outcome: "skipped", dueAt: expect.any(Number) })
       expect(String(history[0]!.error)).toMatch(/concurrency cap 1/)
@@ -3043,7 +3046,7 @@ describe("arming the tick — ephemeral work is work (bug-ephemeral-work-never-a
       const before = store.get("scheduled-tasks/oneoff/pending")
       await new Promise((resolve) => setTimeout(resolve, 6_000))
       expect(store.get("scheduled-tasks/oneoff/pending")).toEqual(before)
-      expect(store.get("scheduled-tasks/history/oneoff_probe")).toHaveLength(1)
+      expect(store.get("scheduled-tasks/history/oneoff/oneoff_probe")).toHaveLength(1)
       expect(prompts.filter((entry) => entry.text === "the one-off prompt")).toEqual([])
     },
     25_000,
@@ -3063,14 +3066,14 @@ describe("arming the tick — ephemeral work is work (bug-ephemeral-work-never-a
 
     await waitFor(() => prompts.length > 0, "the first one-off to run")
     await waitFor(
-      () => Array.isArray(store.get("scheduled-tasks/history/oneoff_b")),
+      () => Array.isArray(store.get("scheduled-tasks/history/oneoff/oneoff_b")),
       "the surplus one-off to be recorded as skipped",
     )
     // Fairness, not luck: the head of the queue runs and the tail is spent, so the backlog
     // cannot reorder itself behind a permanently busy scheduler.
     expect(prompts.some((entry) => entry.text === "first")).toBe(true)
     expect(prompts.some((entry) => entry.text === "second")).toBe(false)
-    expect(store.get("scheduled-tasks/history/oneoff_b")).toMatchObject([
+    expect(store.get("scheduled-tasks/history/oneoff/oneoff_b")).toMatchObject([
       { outcome: "skipped" },
     ])
   })
@@ -3083,10 +3086,10 @@ describe("arming the tick — ephemeral work is work (bug-ephemeral-work-never-a
     })
     await waitFor(() => prompts.length > 0, "the one-off to run")
     await waitFor(
-      () => Array.isArray(store.get("scheduled-tasks/history/oneoff_probe")),
+      () => Array.isArray(store.get("scheduled-tasks/history/oneoff/oneoff_probe")),
       "the run to be recorded",
     )
-    const history = store.get("scheduled-tasks/history/oneoff_probe") as Array<Record<string, unknown>>
+    const history = store.get("scheduled-tasks/history/oneoff/oneoff_probe") as Array<Record<string, unknown>>
     expect(history[0]!.outcome).toBe("ok")
   })
 
@@ -3101,7 +3104,7 @@ describe("arming the tick — ephemeral work is work (bug-ephemeral-work-never-a
     const listedIds = (out: Record<string, unknown>): unknown =>
       (out.loops as Array<Record<string, unknown>>).map((loop) => loop.id)
     const storedHistory = (store: Map<string, unknown>, id: string): Array<Record<string, unknown>> =>
-      store.get(`scheduled-tasks/history/${id}`) as Array<Record<string, unknown>>
+      store.get(`scheduled-tasks/history/loop/${id}`) as Array<Record<string, unknown>>
 
     // ---------------------------------------------------------------------
     // B2: stopping a loop persists, and a stopped loop cannot come back.
@@ -3264,7 +3267,7 @@ describe("arming the tick — ephemeral work is work (bug-ephemeral-work-never-a
       })
 
       await waitFor(() => prompts.length > 0, "the due loop to post")
-      await waitFor(() => Array.isArray(store.get("scheduled-tasks/history/loop_one")), "the post to be recorded")
+      await waitFor(() => Array.isArray(store.get("scheduled-tasks/history/loop/loop_one")), "the post to be recorded")
 
       // Recorded like every other run: due instant, outcome, resolved model, owning session.
       const history = storedHistory(store, "loop_one")
@@ -3300,7 +3303,7 @@ describe("arming the tick — ephemeral work is work (bug-ephemeral-work-never-a
       })
 
       await waitFor(
-        () => Array.isArray(store.get("scheduled-tasks/history/loop_broken")),
+        () => Array.isArray(store.get("scheduled-tasks/history/loop/loop_broken")),
         "the failed post to be recorded",
       )
       expect(prompts).toHaveLength(1)
@@ -3329,7 +3332,7 @@ describe("arming the tick — ephemeral work is work (bug-ephemeral-work-never-a
 
         await waitFor(() => prompts.length > 0, "the first due loop to post")
         await waitFor(
-          () => Array.isArray(store.get("scheduled-tasks/history/loop_2")),
+          () => Array.isArray(store.get("scheduled-tasks/history/loop/loop_2")),
           "the surplus loops to be decided",
         )
 
@@ -3366,7 +3369,7 @@ describe("arming the tick — ephemeral work is work (bug-ephemeral-work-never-a
 
       await waitFor(() => prompts.length > 0, "the due loops to post")
       await waitFor(
-        () => Array.isArray(store.get("scheduled-tasks/history/loop_2")),
+        () => Array.isArray(store.get("scheduled-tasks/history/loop/loop_2")),
         "the third loop to be decided",
       )
       expect(prompts).toHaveLength(2)
@@ -3391,7 +3394,7 @@ describe("arming the tick — ephemeral work is work (bug-ephemeral-work-never-a
 
         await waitFor(() => prompts.length > 0, "the recurring job to take the slot")
         await waitFor(
-          () => Array.isArray(store.get("scheduled-tasks/history/loop_a")),
+          () => Array.isArray(store.get("scheduled-tasks/history/loop/loop_a")),
           "the loop to find no free slot",
         )
         expect(prompts).toHaveLength(1)
@@ -3427,12 +3430,12 @@ describe("arming the tick — ephemeral work is work (bug-ephemeral-work-never-a
 
         await waitFor(() => prompts.length > 0, "the loop to take the only slot")
         await waitFor(
-          () => Array.isArray(store.get("scheduled-tasks/history/oneoff_probe")),
+          () => Array.isArray(store.get("scheduled-tasks/history/oneoff/oneoff_probe")),
           "the one-off to find no free slot",
         )
         expect(prompts).toHaveLength(1)
         expect(prompts[0]).toMatchObject({ text: "the loop prompt" })
-        const history = store.get("scheduled-tasks/history/oneoff_probe") as Array<Record<string, unknown>>
+        const history = store.get("scheduled-tasks/history/oneoff/oneoff_probe") as Array<Record<string, unknown>>
         expect(history).toHaveLength(1)
         expect(history[0]).toMatchObject({ outcome: "skipped" })
         expect(String(history[0]!.error)).toMatch(/concurrency cap 1/)
@@ -3624,7 +3627,14 @@ describe("runTimeout bounds a run (bug-run-timeout-never-enforced)", () => {
       prompts,
       interrupts,
       store,
-      history: (id) => store.get(`scheduled-tasks/history/${id}`) as Array<Record<string, unknown>> | undefined,
+      // Jobs keep the flat `history/<id>` key; a one-off's and a loop's history moved under
+      // `history/oneoff/` and `history/loop/` so they cannot collide with a job id. Resolved
+      // across all three so each test below can still ask for the id it cares about; the key
+      // shape itself is pinned by the ephemeral-history suite.
+      history: (id) =>
+        (store.get(`scheduled-tasks/history/${id}`) ??
+          store.get(`scheduled-tasks/history/oneoff/${id}`) ??
+          store.get(`scheduled-tasks/history/loop/${id}`)) as Array<Record<string, unknown>> | undefined,
       jobState: (id) => store.get(`scheduled-tasks/${id}`) as Record<string, unknown> | undefined,
       list: async () => {
         const tool = tools.find((entry) => entry.name === "list") as
@@ -4094,4 +4104,575 @@ describe("runTimeout bounds a run (bug-run-timeout-never-enforced)", () => {
       rmSync(foreignPath, { force: true })
     }
   }, 25_000)
+})
+
+// =====================================================================
+// Ephemeral history: readable, namespaced and bounded
+// (bug-oneoff-history-unreadable-and-storage-unbounded)
+//
+// The live repro this block is built around: a one-off ran — the scheduler log said so — and
+// reading it back failed with `no job with id "oneoff_…"`, because the history was written
+// under the one-off's own id while `schedules_history` resolved `state.jobs` only. Two published
+// statements were therefore false (the README's "a completed one-off survives only in
+// `schedules_history`", and the `cancel` error's "check schedules_history"), and every one-off
+// left a permanent storage key because `storage.remove` was never called.
+// =====================================================================
+describe("ephemeral history is readable and bounded (bug-oneoff-history-unreadable-and-storage-unbounded)", () => {
+  let dir: string
+  let restoreEnv: string | undefined
+  let consoleLines: string[]
+  let realConsoleError: typeof console.error
+  const outstanding: Array<() => void> = []
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "st-eph-"))
+    mkdirSync(join(dir, ".opencode"), { recursive: true })
+    restoreEnv = process.env[DATA_DIR_ENV]
+    process.env[DATA_DIR_ENV] = join(dir, "state")
+    realConsoleError = console.error
+    consoleLines = []
+    console.error = (...args: unknown[]): void => void consoleLines.push(args.map(String).join(" "))
+  })
+
+  afterEach(() => {
+    for (const dispose of outstanding.splice(0).reverse()) {
+      try {
+        dispose()
+      } catch {
+        /* a failing teardown must not mask the assertion before it */
+      }
+    }
+    console.error = realConsoleError
+    if (restoreEnv === undefined) delete process.env[DATA_DIR_ENV]
+    else process.env[DATA_DIR_ENV] = restoreEnv
+    rmSync(dir, { recursive: true, force: true })
+    vi.useRealTimers()
+  })
+
+  type Tool = {
+    execute: (
+      input: Record<string, unknown>,
+      context?: { sessionID?: unknown },
+    ) => Promise<{ output: Record<string, unknown> }>
+  }
+
+  type Runs = Array<Record<string, unknown>>
+
+  type Ephemeral = {
+    tool: (name: string) => Tool
+    store: Map<string, unknown>
+    /** Every key the plugin deleted, in order. */
+    removed: string[]
+    prompts: Record<string, unknown>[]
+    list: () => Promise<Record<string, unknown>>
+    /** The stored run history under an explicit key. */
+    stored: (key: string) => Runs | undefined
+    /** Every stored history key, whatever namespace it is in. */
+    historyKeys: () => string[]
+    cleanup: () => void
+  }
+
+  /**
+   * A plugin over a `get`/`set`/`remove` store, with the prompt surface individually
+   * withholdable — every one-off failure path starts with "the host does not offer this".
+   *
+   * `remove` is optional on the real surface, so it can be withheld to exercise the host whose
+   * only way to clear a key is to write an empty record over it.
+   */
+  async function ephemeral(
+    options: {
+      jobs?: unknown[]
+      seed?: Record<string, unknown>
+      /** Withhold `session.prompt`, as a host without it would. */
+      noPrompt?: boolean
+      /** Withhold `session.create`, as a host without it would. */
+      noCreate?: boolean
+      /** `session.create` resolves a record carrying no usable id. */
+      createWithoutId?: boolean
+      /** `session.create` resolves this id — an absurdly long one, as a hostile host might. */
+      createSessionID?: string
+      /** Every admitted prompt fails with this message. */
+      promptError?: string
+      /** Every admitted prompt waits this long on the injected clock before resolving. */
+      promptDelayMs?: number
+      /** Offer `ctx.storage.scan`, without which a stored loop is not restored at setup. */
+      scan?: boolean
+      /** Withhold `ctx.storage.remove`. */
+      storageRemove?: boolean
+      pluginOptions?: Record<string, unknown>
+    } = {},
+  ): Promise<Ephemeral> {
+    const store = new Map<string, unknown>(Object.entries(options.seed ?? {}))
+    if (options.jobs !== undefined) {
+      writeFileSync(join(dir, ".opencode", "schedules.json"), JSON.stringify({ version: 1, jobs: options.jobs }))
+    }
+    const tools: Array<Record<string, unknown>> = []
+    const prompts: Record<string, unknown>[] = []
+    const removed: string[] = []
+    const ctx: Record<string, unknown> = {
+      ...(options.pluginOptions === undefined ? {} : { options: options.pluginOptions }),
+      location: { directory: dir, project: { id: "ephemeral" } },
+      storage: {
+        get: async (key: string) => store.get(key),
+        set: async (key: string, value: unknown) => void store.set(key, value),
+        // Records the call *and* performs it: a double that only logs a deletion would let a
+        // test assert the intent while the key stayed on disk, which is the trap this suite has
+        // already paid for once with an in-memory flag standing in for a resource.
+        ...(options.storageRemove === false
+          ? {}
+          : {
+              remove: async (key: string) => {
+                removed.push(key)
+                store.delete(key)
+              },
+            }),
+        ...(options.scan === true
+          ? {
+              scan: async (input: { prefix?: string; after?: string; limit?: number }) => {
+                const keys = [...store.keys()].filter((key) => key.startsWith(input.prefix ?? "")).sort()
+                const start = input.after === undefined ? 0 : Math.max(0, keys.indexOf(input.after) + 1)
+                const limit = input.limit ?? 100
+                const page = keys.slice(start, start + limit)
+                const entries = page.map((key) => ({ key, value: store.get(key) }))
+                const consumed = start + page.length
+                return consumed < keys.length ? { entries, next: page[page.length - 1]! } : { entries }
+              },
+            }
+          : {}),
+      },
+      session: {
+        ...(options.noCreate === true
+          ? {}
+          : {
+              create: async () =>
+                options.createWithoutId === true
+                  ? { nothing: true }
+                  : { id: options.createSessionID ?? "ses_created" },
+            }),
+        ...(options.noPrompt === true
+          ? {}
+          : {
+              prompt: async (input: Record<string, unknown>) => {
+                prompts.push(input)
+                if (options.promptError !== undefined) throw new Error(options.promptError)
+                if (options.promptDelayMs !== undefined) {
+                  await new Promise((resolve) => setTimeout(resolve, options.promptDelayMs))
+                }
+                return { id: `inbox_${prompts.length}` }
+              },
+            }),
+      },
+      tool: {
+        transform: async (cb: (editor: { add?: (tool: unknown) => void }) => void) => {
+          cb({ add: (tool) => void tools.push(tool as Record<string, unknown>) })
+          return { dispose() {} }
+        },
+      },
+    }
+    const resolved = await plugin.setup(ctx as never)
+    const cleanup = (): void => void (resolved as () => void)?.()
+    outstanding.push(cleanup)
+    return {
+      store,
+      removed,
+      prompts,
+      cleanup,
+      tool: (name: string): Tool => {
+        const found = tools.find((entry) => entry.name === name)
+        if (found === undefined) throw new Error(`tool ${name} was not registered`)
+        return found as unknown as Tool
+      },
+      list: async () => (await (tools.find((t) => t.name === "list") as Tool).execute({})).output,
+      stored: (key: string) => store.get(key) as Runs | undefined,
+      historyKeys: () => [...store.keys()].filter((key) => key.startsWith("scheduled-tasks/history/")),
+    }
+  }
+
+  /**
+   * Flush pending microtasks and 0/1ms timers on the injected clock.
+   *
+   * A run is dispatched with `void`, so "the run has been recorded" is a statement about
+   * progress rather than about a returned promise. Twenty turns is a bound, not a wait: the
+   * chain is a fixed number of `await`s, so this settles deterministically, and it cannot hide
+   * a hang — an unsettled chain fails the assertion that follows instead.
+   */
+  async function settle(turns = 20): Promise<void> {
+    for (let n = 0; n < turns; n += 1) await vi.advanceTimersByTimeAsync(1)
+  }
+
+  /** A due one-off as `schedules_schedule` accepts it: inside the 5-minute grace window. */
+  const dueSoon = (): Record<string, unknown> => ({ prompt: "the one-off prompt", dueAt: Date.now() - 1_000 })
+
+  /** One stored run record, in the shape `pushHistory` writes. */
+  const entry = (over: Record<string, unknown> = {}): Record<string, unknown> => ({
+    dueAt: 1_000,
+    startedAt: 1_000,
+    outcome: "ok",
+    model: "opencode/space-bunny-free",
+    ...over,
+  })
+
+  /** One stored loop: due now, unexpired. */
+  const storedLoop = (over: Record<string, unknown> = {}): Record<string, unknown> => ({
+    id: "loop_read",
+    prompt: "the loop prompt",
+    intervalMs: MINUTE_MS,
+    nextRunAt: Date.now() - 1_000,
+    expiresAt: Date.now() + 60 * MINUTE_MS,
+    createdAt: Date.now() - 60_000,
+    ...over,
+  })
+
+  // -------------------------------------------------------------------
+  // Box 1: a completed one-off is readable, so the two published
+  // statements that depend on it become true.
+  // -------------------------------------------------------------------
+
+  it("reads a completed one-off back through schedules_history (the live repro)", async () => {
+    vi.useFakeTimers()
+    const start = Date.now()
+    vi.setSystemTime(start)
+    const h = await ephemeral({ jobs: [] })
+
+    // Exactly the live sequence: schedule a one-off, let the tick run it.
+    const created = (await h.tool("schedule").execute(dueSoon())).output
+    const id = created.id as string
+    expect(id).toMatch(/^oneoff_/)
+    await settle()
+
+    // The run happened — asserted on the prompt, not on the log, so it cannot pass on a line.
+    expect(h.prompts).toHaveLength(1)
+    expect(h.prompts[0]).toMatchObject({ text: "the one-off prompt", delivery: "queue" })
+
+    // …and reading it back is the claim that was false.
+    const read = (await h.tool("history").execute({ id })).output
+    expect(read.error).toBeUndefined()
+    expect(read.id).toBe(id)
+    expect(read.runs).toMatchObject([
+      { outcome: "ok", dueAt: expect.any(String), startedAt: expect.any(String), model: expect.any(String) },
+    ])
+
+    // The `cancel` message promises this lookup exists, so it is asserted here rather than
+    // trusted: "check schedules_history" is only true if this very call answers.
+    const cancelled = (await h.tool("cancel").execute({ id })).output
+    expect(String(cancelled.error)).toMatch(/check schedules_history/)
+    expect((await h.tool("history").execute({ id })).output.runs).toHaveLength(1)
+  })
+
+  it("reads a loop's runs back through schedules_history", async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(Date.now())
+    const h = await ephemeral({
+      jobs: [],
+      scan: true,
+      seed: { "scheduled-tasks/loop/ses_abc": [storedLoop()] },
+    })
+    await settle()
+    expect(h.prompts).toHaveLength(1)
+
+    const read = (await h.tool("history").execute({ id: "loop_read" })).output
+    expect(read.error).toBeUndefined()
+    expect(read.runs).toMatchObject([{ outcome: "ok", sessionID: "ses_abc" }])
+
+    // And after the loop is stopped: it is out of every live list, so this answer can only come
+    // from storage. That is the shape the one-off repro had — history written under an id nothing
+    // resolves any more — and it is what made the original lookup blind.
+    await h.tool("stop_loop").execute({ id: "loop_read" }, { sessionID: "ses_abc" })
+    const afterStop = (await h.tool("history").execute({ id: "loop_read" })).output
+    expect(afterStop.error).toBeUndefined()
+    expect(afterStop.kind).toBe("loop")
+    expect(afterStop.runs).toHaveLength(1)
+  })
+
+  it("answers for a pending one-off with an empty run list, not with an error", async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(Date.now())
+    const h = await ephemeral({ jobs: [], pluginOptions: { tickMs: 60 * MINUTE_MS } })
+
+    const id = ((await h.tool("schedule").execute({ prompt: "later", dueIn: "2h" })).output.id) as string
+    await settle()
+
+    const read = (await h.tool("history").execute({ id })).output
+    expect(read.error).toBeUndefined()
+    expect(read.runs).toEqual([])
+  })
+
+  it("keeps ephemeral history in its own key space, so it cannot collide with a job's", async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(Date.now())
+    // A job file may legally be called `oneoff_probe` — the job-id pattern allows it — so this is
+    // a reachable collision rather than a hypothetical one. The job's own history is seeded, so
+    // the claim is about two keys coexisting rather than about a job happening to fire.
+    const h = await ephemeral({
+      jobs: [{ id: "oneoff_probe", schedule: "@daily", prompt: "the job prompt" }],
+      seed: {
+        "scheduled-tasks/history/oneoff_probe": [entry({ model: "the job's own model" })],
+        "scheduled-tasks/oneoff/pending": [
+          { id: "oneoff_probe", prompt: "the one-off prompt", dueAt: Date.now() - 1_000, createdAt: Date.now() - 60_000, runTimeoutMs: MINUTE_MS },
+        ],
+      },
+    })
+    await settle()
+
+    // Two distinct keys, neither overwriting the other: the job's record is untouched and the
+    // one-off's run landed beside it rather than on top of it.
+    expect(h.historyKeys()).toContain("scheduled-tasks/history/oneoff_probe")
+    expect(h.historyKeys()).toContain("scheduled-tasks/history/oneoff/oneoff_probe")
+    expect(h.stored("scheduled-tasks/history/oneoff_probe")).toMatchObject([{ model: "the job's own model" }])
+    expect(h.stored("scheduled-tasks/history/oneoff/oneoff_probe")).toMatchObject([{ outcome: "ok" }])
+  })
+
+  // -------------------------------------------------------------------
+  // Box 2: ephemeral history keys are bounded, and the keys a pre-fix
+  // build leaked are reclaimed rather than inherited.
+  // -------------------------------------------------------------------
+
+  it("evicts the oldest ephemeral history key once the cap is reached, and never a job's key", async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(Date.now())
+    // The index is this plugin's own record of which keys it minted, so seeding it directly is
+    // the only way to reach the cap without running fifty one-offs. The first entry is a job's
+    // key, stamped oldest of all: the eviction has to reach past it to the first *ephemeral*
+    // one, and must not touch the job's key however old the index claims it is.
+    const index = [
+      { key: "scheduled-tasks/history/nightly", at: 1 },
+      ...Array.from({ length: MAX_EPHEMERAL_HISTORY_KEYS }, (_, n) => ({
+        key: `scheduled-tasks/history/oneoff/old${n}`,
+        at: n + 2,
+      })),
+    ]
+    const h = await ephemeral({ jobs: [], seed: { "scheduled-tasks/history/nightly": [entry()], "scheduled-tasks/history/ephemeral": index } })
+
+    await h.tool("schedule").execute(dueSoon())
+    await settle()
+
+    // The cap holds…
+    expect(h.stored("scheduled-tasks/history/ephemeral")).toHaveLength(MAX_EPHEMERAL_HISTORY_KEYS)
+    // …the oldest ephemeral key was actually deleted, not merely dropped from the index…
+    expect(h.store.has("scheduled-tasks/history/oneoff/old0")).toBe(false)
+    expect(h.removed).toContain("scheduled-tasks/history/oneoff/old0")
+    // …and a key that is not an ephemeral one is never deleted, however old the index claims.
+    expect(h.store.has("scheduled-tasks/history/nightly")).toBe(true)
+    expect(h.removed).not.toContain("scheduled-tasks/history/nightly")
+  })
+
+  it("writes an empty record when the host has no storage.remove, rather than a silent no-op", async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(Date.now())
+    const index = Array.from({ length: MAX_EPHEMERAL_HISTORY_KEYS }, (_, n) => ({
+      key: `scheduled-tasks/history/oneoff/old${n}`,
+      at: n,
+    }))
+    const h = await ephemeral({ jobs: [], storageRemove: false, seed: { "scheduled-tasks/history/ephemeral": index } })
+
+    await h.tool("schedule").execute(dueSoon())
+    await settle()
+
+    // The key cannot be deleted on this host, so "nothing here" is written in its place — and
+    // the key count is still bounded, because the index that decides what to drop is itself
+    // capped.
+    expect(h.store.get("scheduled-tasks/history/oneoff/old0")).toEqual([])
+    expect(h.stored("scheduled-tasks/history/ephemeral")).toHaveLength(MAX_EPHEMERAL_HISTORY_KEYS)
+  })
+
+  it("migrates a pre-fix flat history key into the ephemeral namespace and removes the old one", async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(Date.now())
+    // What a 2.0.22 host already holds: history written under the one-off's own id, readable by
+    // no tool, and never reclaimed.
+    const h = await ephemeral({
+      jobs: [],
+      seed: { "scheduled-tasks/history/oneoff_legacy": [entry({ dueAt: 1_700_000_000_000 })] },
+    })
+
+    const read = (await h.tool("history").execute({ id: "oneoff_legacy" })).output
+    expect(read.error).toBeUndefined()
+    expect(read.runs).toHaveLength(1)
+    // The leaked key is gone and the runs live where every new run writes them.
+    expect(h.store.has("scheduled-tasks/history/oneoff_legacy")).toBe(false)
+    expect(h.stored("scheduled-tasks/history/oneoff/oneoff_legacy")).toHaveLength(1)
+  })
+
+  // -------------------------------------------------------------------
+  // Box 3: the bounds hold on the way in as well as on the way out, so a
+  // hand-edited stored record cannot blow past them.
+  // -------------------------------------------------------------------
+
+  it("clips a hand-edited stored history record: cardinality, error and model alike", async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(Date.now())
+    // Written by hand, or by a build with no bounds at all: 400 runs, each carrying an error
+    // and a model far past anything a real run produces.
+    const oversized = Array.from({ length: 400 }, (_, n) =>
+      entry({ dueAt: n, outcome: "failed", error: "x".repeat(50_000), model: "m".repeat(50_000) }),
+    )
+    const h = await ephemeral({
+      jobs: [{ id: "j", schedule: "@daily", prompt: "p" }],
+      seed: { "scheduled-tasks/history/j": oversized },
+    })
+
+    const runs = (await h.tool("history").execute({ id: "j" })).output.runs as Runs
+    expect(runs.length).toBeLessThanOrEqual(MAX_HISTORY_LIMIT)
+    // Newest kept, so a reader still sees the most recent attempt rather than the oldest.
+    expect(Date.parse(runs[0]!.dueAt as string)).toBe(399)
+    for (const run of runs) {
+      expect(String(run.error).length).toBeLessThanOrEqual(300)
+      expect(String(run.model).length).toBeLessThanOrEqual(300)
+    }
+  })
+
+  it("clips a host-supplied session id on the way *into* storage, not only on the way out", async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(Date.now())
+    // The read-side clip cannot bound what was written: a host that resolves a session with
+    // 50KB of id would leave 50KB in storage until someone read it back, which may be never.
+    const h = await ephemeral({ jobs: [], createSessionID: "s".repeat(50_000) })
+    const id = ((await h.tool("schedule").execute(dueSoon())).output.id) as string
+    await settle()
+
+    const stored = h.stored(`scheduled-tasks/history/oneoff/${id}`)![0]!
+    expect(String(stored.sessionID).length).toBeLessThanOrEqual(200)
+    // And the same value on the way out, so the reader and the record agree.
+    const runs = (await h.tool("history").execute({ id })).output.runs as Runs
+    expect(String(runs[0]!.sessionID).length).toBeLessThanOrEqual(200)
+  })
+
+  it("caps stored loops at MAX_LOOP_CAP, on read and in the record it saves", async () => {
+    // The pure rule, which is where the two read paths meet (`loadLoops` and the startup scan).
+    const overCap = Array.from({ length: MAX_LOOP_CAP + 20 }, (_, n) => ({
+      id: `loop_${n}`,
+      prompt: "p",
+      intervalMs: MINUTE_MS,
+      nextRunAt: Date.now() - 1_000,
+      expiresAt: Date.now() + 60 * MINUTE_MS,
+      createdAt: Date.now(),
+    }))
+    const loaded = normalizeLoops(overCap, "ses_abc")
+    expect(loaded).toHaveLength(MAX_LOOP_CAP)
+    // Oldest kept: a loop is recurring work someone asked for, not a queue entry to prune.
+    expect(loaded[0]!.id).toBe("loop_0")
+
+    // …and the record that goes back to storage cannot exceed the ceiling either.
+    vi.useFakeTimers()
+    vi.setSystemTime(Date.now())
+    const h = await ephemeral({
+      jobs: [],
+      scan: true,
+      seed: { "scheduled-tasks/loop/ses_abc": overCap },
+    })
+    await settle()
+    expect(h.stored("scheduled-tasks/loop/ses_abc")).toHaveLength(MAX_LOOP_CAP)
+  })
+
+  it("caps stored pending one-offs at MAX_ONEOFF_CAP and reports the drop", async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(Date.now())
+    const pending = Array.from({ length: MAX_ONEOFF_CAP + 25 }, (_, n) => ({
+      id: `oneoff_bulk${n}`,
+      dueAt: Date.now() + 60 * MINUTE_MS,
+      prompt: "p",
+      createdAt: Date.now(),
+      runTimeoutMs: MINUTE_MS,
+    }))
+    const h = await ephemeral({ jobs: [], seed: { "scheduled-tasks/oneoff/pending": pending } })
+
+    const oneOffs = (await h.list()).oneOffs as Runs
+    expect(oneOffs.length).toBeLessThanOrEqual(MAX_ONEOFF_CAP)
+    // The oldest survive, because they are the most overdue: capping the other way would
+    // silently drop the one-off an agent had just asked for.
+    expect((oneOffs[0] as { id: string }).id).toBe("oneoff_bulk0")
+    // Silent truncation is how a lost task looks, so the count is stated in the log.
+    expect(consoleLines.filter((line) => /one-off/.test(line) && /\b25\b/.test(line)).length).toBeGreaterThan(0)
+  })
+
+  // -------------------------------------------------------------------
+  // Box 4: every one-off path records, including the ones that never reach
+  // the catch that records the rest.
+  // -------------------------------------------------------------------
+
+  it("records a one-off on a host with no session.prompt to dispatch it", async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(Date.now())
+    const h = await ephemeral({ jobs: [], noPrompt: true })
+    const id = ((await h.tool("schedule").execute(dueSoon())).output.id) as string
+    await settle()
+
+    const runs = (await h.tool("history").execute({ id })).output.runs as Runs
+    expect(runs).toHaveLength(1)
+    expect(runs[0]).toMatchObject({ outcome: "failed" })
+    expect(String(runs[0]!.error)).toMatch(/session\.prompt/)
+  })
+
+  it("records a one-off on a host with no session.create", async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(Date.now())
+    const h = await ephemeral({ jobs: [], noCreate: true })
+    const id = ((await h.tool("schedule").execute(dueSoon())).output.id) as string
+    await settle()
+
+    const runs = (await h.tool("history").execute({ id })).output.runs as Runs
+    expect(runs).toHaveLength(1)
+    expect(runs[0]).toMatchObject({ outcome: "failed" })
+    expect(String(runs[0]!.error)).toMatch(/session\.create/)
+  })
+
+  it("records a one-off whose created session carried no usable id", async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(Date.now())
+    const h = await ephemeral({ jobs: [], createWithoutId: true })
+    const id = ((await h.tool("schedule").execute(dueSoon())).output.id) as string
+    await settle()
+
+    const runs = (await h.tool("history").execute({ id })).output.runs as Runs
+    expect(runs).toHaveLength(1)
+    expect(runs[0]).toMatchObject({ outcome: "failed" })
+    expect(String(runs[0]!.error)).toMatch(/session/)
+  })
+
+  it("records a one-off whose prompt threw, with the message it threw", async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(Date.now())
+    const h = await ephemeral({ jobs: [], promptError: "provider is down" })
+    const id = ((await h.tool("schedule").execute(dueSoon())).output.id) as string
+    await settle()
+
+    const runs = (await h.tool("history").execute({ id })).output.runs as Runs
+    expect(runs).toHaveLength(1)
+    expect(runs[0]).toMatchObject({ outcome: "failed", sessionID: "ses_created" })
+    expect(String(runs[0]!.error)).toBe("provider is down")
+  })
+
+  // -------------------------------------------------------------------
+  // Box 5: `startedAt` is when the run was dispatched.
+  // -------------------------------------------------------------------
+
+  it("stamps startedAt at dispatch, not at completion", async () => {
+    vi.useFakeTimers()
+    const start = Date.now()
+    vi.setSystemTime(start)
+    // The run occupies half a minute of clock, which is the only reason a completion stamp and
+    // a dispatch stamp cannot be the same number.
+    const h = await ephemeral({ jobs: [], promptDelayMs: 30_000 })
+
+    const id = ((await h.tool("schedule").execute(dueSoon())).output.id) as string
+    await settle()
+    // In flight, and nothing recorded yet: the run has not finished.
+    expect(h.prompts).toHaveLength(1)
+    expect((await h.tool("history").execute({ id })).output.runs).toEqual([])
+
+    await vi.advanceTimersByTimeAsync(30_000)
+    await settle()
+
+    const runs = (await h.tool("history").execute({ id })).output.runs as Runs
+    expect(runs).toHaveLength(1)
+    expect(runs[0]).toMatchObject({ outcome: "ok" })
+    const startedAt = Date.parse(runs[0]!.startedAt as string)
+    // The clock really did move, so the stamp below is a decision rather than a coincidence.
+    expect(Date.now()).toBeGreaterThan(start + 30_000)
+    // Not before the run existed…
+    expect(startedAt).toBeGreaterThanOrEqual(start)
+    // …and at least the length of the run before the clock now. A completion stamp lands exactly
+    // on "now", so this is the assertion that separates the two.
+    expect(startedAt).toBeLessThanOrEqual(Date.now() - 30_000)
+  })
 })

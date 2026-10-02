@@ -1576,6 +1576,15 @@ export const MAX_HISTORY_LIMIT = 50
 const HISTORY_ERROR_MAX = 300
 
 /**
+ * Longest model or session string retained per run.
+ *
+ * Bounded for the same reason as `HISTORY_ERROR_MAX`, and on the read side as well as the write
+ * side: a hand-edited record carrying a megabyte of "model" must not become a megabyte of
+ * in-memory buffer and a megabyte of tool output.
+ */
+const HISTORY_LABEL_MAX = 200
+
+/**
  * Append one run to a job's history, evicting oldest-first at the limit.
  *
  * Pure and exported so the eviction rule is testable without a clock or a session.
@@ -1586,8 +1595,17 @@ export function pushHistory(
   limit = DEFAULT_HISTORY_LIMIT,
 ): HistoryEntry[] {
   const bounded = Math.max(1, Math.min(MAX_HISTORY_LIMIT, Math.trunc(limit)))
-  const errored = entry.error === undefined ? {} : { error: clip(entry.error, HISTORY_ERROR_MAX) }
-  const next = [...history, { ...entry, ...errored }]
+  // Clipped here as well as in `loadHistory`: this is the write side, and the two have to agree
+  // or the same run reads back differently depending on which one happened to see it.
+  const next = [
+    ...history,
+    {
+      ...entry,
+      ...(entry.error === undefined ? {} : { error: clip(entry.error, HISTORY_ERROR_MAX) }),
+      model: clip(entry.model, HISTORY_LABEL_MAX),
+      ...(entry.sessionID === undefined ? {} : { sessionID: clip(entry.sessionID, HISTORY_LABEL_MAX) }),
+    },
+  ]
   // Evict oldest-first: the newest run is the one a reader wants.
   return next.length > bounded ? next.slice(next.length - bounded) : next
 }
@@ -1908,7 +1926,16 @@ function oneOffId(): string {
   return `oneoff_${Math.random().toString(36).slice(2, 10)}${Date.now().toString(36)}`
 }
 
-/** Read pending one-offs, dropping malformed entries rather than failing the load. */
+/**
+ * Read pending one-offs, dropping malformed entries rather than failing the load.
+ *
+ * **Capped on read as well as on write**, because `saveOneOffs`'s slice only ever bounds what
+ * this plugin writes — a record that was hand-edited, or written by an older build with a
+ * different cap, arrives whole and would otherwise be admitted in full. The cap keeps the
+ * *oldest* entries: the list is due-ordered, so the oldest are the most overdue and the newest
+ * are the ones someone has just asked for and is still waiting on. The drop is stated in the
+ * log, because a task that silently stops existing is the worst way for it to go.
+ */
 async function loadOneOffs(ctx: PluginContext): Promise<OneOffTask[]> {
   const stored = await storageGet(ctx, `${ONEOFF_PREFIX}pending`)
   if (!Array.isArray(stored)) return []
@@ -1932,6 +1959,12 @@ async function loadOneOffs(ctx: PluginContext): Promise<OneOffTask[]> {
       ...(model !== undefined && "model" in model ? { model: model.model } : {}),
       ...(record.permissions !== undefined ? { permissions: record.permissions as PermissionSet } : {}),
     })
+  }
+  if (out.length > MAX_ONEOFF_CAP) {
+    logLine(
+      `stored one-off record holds ${out.length} tasks, over the cap of ${MAX_ONEOFF_CAP}; dropping the newest ${out.length - MAX_ONEOFF_CAP}`,
+    )
+    return out.slice(0, MAX_ONEOFF_CAP)
   }
   return out
 }
@@ -1966,7 +1999,13 @@ export type SessionLoop = {
 /** Most loops one session may hold at once. */
 export const DEFAULT_LOOP_CAP = 10
 
-/** Hard ceiling on loops per session, whatever the cap is configured to. */
+/**
+ * Hard ceiling on loops per session, whatever the cap is configured to.
+ *
+ * Enforced where a stored record is *read* (`normalizeLoops`), not only where one is created:
+ * `schedules_start_loop` caps what this plugin accepts, which says nothing about what a
+ * hand-edited or oversized record can hand it at setup.
+ */
 export const MAX_LOOP_CAP = 50
 
 /** Default loop lifetime. Three days, matching the convention borrowed with this feature. */
@@ -2012,11 +2051,16 @@ export function validateLoop(input: Record<string, unknown>, nowMs: number, sess
 
 /**
  * Validate one session's stored loop record, dropping malformed entries rather than failing
- * the whole load.
+ * the whole load, and capping what is kept.
  *
  * Pure and exported because **two** callers need it and must not drift: the per-session read
  * (`loadLoops`) and the startup scan, which has a record in hand and the session id it was
  * filed under rather than being told either.
+ *
+ * The cap is `MAX_LOOP_CAP` — the hard ceiling the constant has always claimed to be, applied
+ * here so the claim is true of a hand-edited or oversized record rather than only of what
+ * `schedules_start_loop` is willing to accept. Oldest kept, because a loop is recurring work
+ * somebody asked for and not a queue entry to prune.
  */
 export function normalizeLoops(stored: unknown, sessionID: string): SessionLoop[] {
   if (!Array.isArray(stored)) return []
@@ -2039,6 +2083,12 @@ export function normalizeLoops(stored: unknown, sessionID: string): SessionLoop[
       expiresAt: r.expiresAt,
       createdAt: typeof r.createdAt === "number" ? r.createdAt : r.nextRunAt,
     })
+  }
+  if (out.length > MAX_LOOP_CAP) {
+    logLine(
+      `stored loop record for session ${sessionID} holds ${out.length} loops, over the ceiling of ${MAX_LOOP_CAP}; dropping the newest ${out.length - MAX_LOOP_CAP}`,
+    )
+    return out.slice(0, MAX_LOOP_CAP)
   }
   return out
 }
@@ -2159,6 +2209,10 @@ async function saveLoops(ctx: PluginContext, sessionID: string, loops: readonly 
   // key per session id, still re-derived on load.
   const key = `${LOOP_PREFIX}${sessionID}`
   if (loops.length > 0) {
+    // No slice to the ceiling here, deliberately: every array that reaches this point came from
+    // `normalizeLoops` (which caps at `MAX_LOOP_CAP`) or from `schedules_start_loop` (which caps
+    // at `DEFAULT_LOOP_CAP`), so a second cap would be unreachable — and a mutation removing it
+    // caught nothing, which is how unreachable code is recognised.
     await storageSet(ctx, key, loops)
     return
   }
@@ -2385,6 +2439,15 @@ type SchedulerState = {
   /** In-session loops, keyed by the owning session id. */
   loops: Map<string, SessionLoop[]>
   /**
+   * Ids of one-offs dispatched by this process and not yet recorded.
+   *
+   * Not the same question as `inFlight`, and deliberately a separate set: a one-off is consumed
+   * out of `oneOffs` before it is dispatched and records nothing until it finishes, so for the
+   * length of a run its id is named nowhere. This is what lets a reader be told "this one-off
+   * exists and has no runs yet" rather than "no such id" for a run that is plainly happening.
+   */
+  dispatching: Set<string>
+  /**
    * Ids with a run outstanding — a job's run or a loop's post — so the concurrency cap is
    * global rather than per-kind. Ids are namespaced by construction (`oneoff_*`, `loop_*` vs
    * a file-defined job id), so the two sets cannot collide in practice.
@@ -2468,6 +2531,7 @@ const HISTORY_OUTPUT = {
   type: "object",
   properties: {
     id: { type: "string" },
+    kind: { type: "string", description: 'Which kind of thing this id is: "job", "oneoff" or "loop".' },
     session: { type: "string" },
     runs: { type: "array" },
     limit: { type: "number" },
@@ -2570,7 +2634,8 @@ async function loadStates(ctx: PluginContext, state: SchedulerState): Promise<vo
 /** Reload every job's run history at setup. */
 async function loadAllHistory(ctx: PluginContext, state: SchedulerState): Promise<void> {
   for (const job of state.jobs) {
-    state.history.set(job.id, await loadHistory(ctx, job.id))
+    const key = historyKey("job", job.id)
+    state.history.set(key, await loadHistory(ctx, key))
   }
 }
 
@@ -2580,9 +2645,101 @@ async function saveState(ctx: PluginContext, state: SchedulerState, jobId: strin
 
 const HISTORY_PREFIX = `${STORAGE_PREFIX}history/`
 
-/** Read one job's history, tolerating absent or corrupt storage (spec 002 § Persistence). */
-async function loadHistory(ctx: PluginContext, jobId: string): Promise<HistoryEntry[]> {
-  const stored = await storageGet(ctx, `${HISTORY_PREFIX}${jobId}`)
+/**
+ * What a run record belongs to. Decides the storage key and which ids the reader knows, and
+ * nothing else — the record itself is the same shape for all three.
+ */
+type HistoryKind = "job" | "oneoff" | "loop"
+
+/**
+ * The one place a history key is spelled.
+ *
+ * A job's key is unchanged (`history/<id>`) because a job id is the id in the reviewed job file
+ * and its history is read at setup from `state.jobs`. Ephemeral ids get a **sub-namespace**:
+ * they are generated, they outlive nothing, and a job file may legitimately be named `oneoff_x`
+ * or `loop_x` (the id pattern allows both), so sharing one flat key space with them is a
+ * collision waiting for a coincidence. The load-bearing property is that `JOB_ID_PATTERN`
+ * forbids `/`, so `history/oneoff/…` and `history/loop/…` can never be produced by a job id and
+ * no job key can be shadowed by an ephemeral one.
+ */
+function historyKey(kind: HistoryKind, id: string): string {
+  return kind === "job" ? `${HISTORY_PREFIX}${id}` : `${HISTORY_PREFIX}${kind}/${id}`
+}
+
+/** Whether a key is one of this plugin's ephemeral history keys, and so safe to delete. */
+function isEphemeralHistoryKey(key: string): boolean {
+  return key.startsWith(`${HISTORY_PREFIX}oneoff/`) || key.startsWith(`${HISTORY_PREFIX}loop/`)
+}
+
+/** An id this plugin generated, as opposed to one a job file declares. */
+function isEphemeralId(id: string): boolean {
+  return /^oneoff_/.test(id) || /^loop_/.test(id)
+}
+
+/**
+ * How many *ephemeral* history keys are retained at once.
+ *
+ * A job's history is bounded by its own ring. A one-off's is not, because the number of one-offs
+ * is not: each one mints a key, and nothing ever removed it. This caps the keys instead — a
+ * project that has run a thousand one-offs keeps the last fifty runs' records and nothing older.
+ */
+export const MAX_EPHEMERAL_HISTORY_KEYS = 50
+
+/**
+ * The index of ephemeral history keys this plugin minted, oldest-last.
+ *
+ * The key set cannot be counted any other way that works on every host: `scan` is optional (and
+ * absent wherever the plugin storage surface predates it), whereas `get`/`set` are always here.
+ * So the plugin keeps its own list, and every eviction decision is made from it.
+ */
+type EphemeralHistoryKey = { key: string; at: number }
+
+const EPHEMERAL_INDEX_KEY = `${HISTORY_PREFIX}ephemeral`
+
+/**
+ * Note that `key` holds ephemeral history, and drop the oldest entries past the cap.
+ *
+ * Removal happens *before* the index is rewritten: a crash between the two leaves the index
+ * still naming a key that exists, so the next write evicts it again. The other order would
+ * forget a key that was never deleted, and a forgotten key is leaked for good.
+ *
+ * The index is trusted only as far as `isEphemeralHistoryKeyRecord` accepted it, which is where
+ * the "never delete a job's history" rule is enforced: an entry naming anything outside this
+ * plugin's ephemeral namespace is not read at all, so it can never reach the deletion below.
+ * (Checked in the filter rather than again at the deletion, because a second check there is
+ * unreachable — a mutation that removed it caught nothing, and unreachable defence is worse than
+ * none: it reads as protection that is not there.)
+ */
+async function retainEphemeralHistoryKey(ctx: PluginContext, key: string): Promise<void> {
+  if (!isEphemeralHistoryKey(key)) return
+  const stored = await storageGet(ctx, EPHEMERAL_INDEX_KEY)
+  const known: EphemeralHistoryKey[] = Array.isArray(stored) ? stored.filter(isEphemeralHistoryKeyRecord) : []
+  // Re-recorded rather than appended, so a loop that keeps posting stays at the young end and an
+  // active loop is never evicted in favour of a one-off that ran once, months ago. Ordered by
+  // the stamp rather than by position, so a hand-edited index is read by its timestamps and not
+  // by whatever order it happened to be written in.
+  const next = [...known.filter((entry) => entry.key !== key), { key, at: Date.now() }].sort(
+    (a, b) => a.at - b.at,
+  )
+  const evicted = next.slice(0, Math.max(0, next.length - MAX_EPHEMERAL_HISTORY_KEYS))
+  const kept = next.slice(Math.max(0, next.length - MAX_EPHEMERAL_HISTORY_KEYS))
+  for (const entry of evicted) {
+    // Safe to delete without re-checking the namespace: every entry above came out of
+    // `isEphemeralHistoryKeyRecord`, which is what refuses anything outside it.
+    await storageRemove(ctx, entry.key)
+  }
+  await storageSet(ctx, EPHEMERAL_INDEX_KEY, kept)
+}
+
+function isEphemeralHistoryKeyRecord(value: unknown): value is EphemeralHistoryKey {
+  if (value === null || typeof value !== "object") return false
+  const record = value as Record<string, unknown>
+  return typeof record.key === "string" && isEphemeralHistoryKey(record.key) && typeof record.at === "number"
+}
+
+/** Read one run history, tolerating absent or corrupt storage (spec 002 § Persistence). */
+async function loadHistory(ctx: PluginContext, key: string): Promise<HistoryEntry[]> {
+  const stored = await storageGet(ctx, key)
   if (!Array.isArray(stored)) return []
   const entries: HistoryEntry[] = []
   for (const raw of stored) {
@@ -2590,22 +2747,97 @@ async function loadHistory(ctx: PluginContext, jobId: string): Promise<HistoryEn
     const record = raw as Record<string, unknown>
     if (typeof record.dueAt !== "number" || typeof record.startedAt !== "number") continue
     if (!isRunStatus(record.outcome) || typeof record.model !== "string") continue
+    // Clipped, not just re-validated: a record can be *shape-valid* and still carry a megabyte
+    // of error text, and the clip that exists on the write side cannot help a record that
+    // arrived from outside. Bounded on read as well as on write, as the comment claims.
+    const sessionID = asString(record.sessionID)
+    const error = asString(record.error)
     entries.push({
       dueAt: record.dueAt,
       startedAt: record.startedAt,
       outcome: record.outcome,
-      model: record.model,
-      ...(asString(record.sessionID) !== undefined ? { sessionID: asString(record.sessionID) as string } : {}),
-      ...(asString(record.error) !== undefined ? { error: asString(record.error) as string } : {}),
+      model: clip(record.model, HISTORY_LABEL_MAX),
+      ...(sessionID !== undefined ? { sessionID: clip(sessionID, HISTORY_LABEL_MAX) } : {}),
+      ...(error !== undefined ? { error: clip(error, HISTORY_ERROR_MAX) } : {}),
     })
   }
-  // Bounded on read as well as on write, so a hand-edited or oversized record cannot
-  // grow the in-memory buffer either.
   return entries.slice(-MAX_HISTORY_LIMIT)
 }
 
-async function saveHistory(ctx: PluginContext, state: SchedulerState, jobId: string): Promise<void> {
-  await storageSet(ctx, `${HISTORY_PREFIX}${jobId}`, state.history.get(jobId) ?? [])
+async function saveHistory(ctx: PluginContext, state: SchedulerState, key: string): Promise<void> {
+  await storageSet(ctx, key, state.history.get(key) ?? [])
+}
+
+/**
+ * Record one run against the right history, and keep the ephemeral key space bounded.
+ *
+ * Every run of every kind goes through here, so "which key did this land in" and "is that key
+ * still retained" are one decision rather than two that can disagree — which is exactly how the
+ * one-off's history ended up written somewhere nothing could read it.
+ */
+async function recordRun(
+  ctx: PluginContext,
+  state: SchedulerState,
+  kind: HistoryKind,
+  id: string,
+  entry: HistoryEntry,
+): Promise<void> {
+  const key = historyKey(kind, id)
+  state.history.set(key, pushHistory(state.history.get(key) ?? [], entry))
+  await saveHistory(ctx, state, key)
+  if (kind !== "job") await retainEphemeralHistoryKey(ctx, key)
+}
+
+/** What an id turned out to be, and the runs recorded against it. */
+type HistoryOwner = { kind: HistoryKind; session?: string; runs: HistoryEntry[] }
+
+/**
+ * Which history an id belongs to, and whether this plugin can still answer for it.
+ *
+ * The lookup is deliberately wider than `state.jobs`. A one-off is consumed the moment it runs
+ * and a loop is scoped to a session, so neither is in any live list by the time anyone asks what
+ * it did — which is why history was written and never read. So the answer comes from storage,
+ * namespaced per kind, and a flat pre-fix key is migrated on the way through so a host that
+ * already leaked one gets it reclaimed instead of inheriting the leak.
+ */
+async function resolveHistoryOwner(ctx: PluginContext, state: SchedulerState, id: string): Promise<HistoryOwner | undefined> {
+  const job = state.jobs.find((entry) => entry.id === id)
+  if (job !== undefined) {
+    return { kind: "job", session: job.session, runs: state.history.get(historyKey("job", id)) ?? [] }
+  }
+  const pending = state.oneOffs.find((task) => task.id === id)
+  if (pending !== undefined) {
+    // Pending, so nothing has run yet — a real answer, and not the same answer as "no such id".
+    return { kind: "oneoff", runs: state.history.get(historyKey("oneoff", id)) ?? [] }
+  }
+  if (state.dispatching.has(id)) {
+    // Running right now: the id is real and its outcome is not written yet, which is a
+    // different answer from an unknown id and from a finished run.
+    return { kind: "oneoff", runs: state.history.get(historyKey("oneoff", id)) ?? [] }
+  }
+  for (const [sessionID, loops] of state.loops) {
+    const loop = loops.find((entry) => entry.id === id)
+    if (loop === undefined) continue
+    return { kind: "loop", session: sessionID, runs: state.history.get(historyKey("loop", id)) ?? [] }
+  }
+
+  // Gone from every live list, which is the normal state of a finished one-off: ask storage.
+  for (const kind of ["oneoff", "loop"] as const) {
+    const key = historyKey(kind, id)
+    const runs = await loadHistory(ctx, key)
+    if (runs.length > 0) return { kind, runs }
+  }
+  if (!isEphemeralId(id)) return undefined
+  // A pre-fix build wrote ephemeral history flat, under the id itself, and never removed it.
+  // Adopt it: copy it to the namespaced key so this and every later read agree, then delete the
+  // leaked key — which is the one thing `storage.remove` can now be relied on to do.
+  const legacy = historyKey("job", id)
+  const runs = await loadHistory(ctx, legacy)
+  if (runs.length === 0) return undefined
+  await storageSet(ctx, historyKey("oneoff", id), runs)
+  await storageRemove(ctx, legacy)
+  await retainEphemeralHistoryKey(ctx, historyKey("oneoff", id))
+  return { kind: "oneoff", runs }
 }
 
 /**
@@ -2614,29 +2846,49 @@ async function saveHistory(ctx: PluginContext, state: SchedulerState, jobId: str
  *
  * Reuses `applyJobTarget` deliberately — a one-off gets the same permission discipline as a
  * scheduled job, so it cannot become a loophole.
+ *
+ * **Every exit records**, through the one `record` closure below rather than through the catch
+ * alone. The early returns used to leave no trace at all: a host without `session.prompt`, a host
+ * without `session.create`, and a `create` that resolved no usable id were each `return
+ * "failed"` above the `try`, so the outcome went back to the tick, and the tick recorded only
+ * an `"ok"`. A one-off could consume its occurrence and leave nothing behind — the scheduler log
+ * said it ran, and no record said what happened to it.
  */
-async function runOneOff(
-  ctx: PluginContext,
-  state: SchedulerState,
-  task: OneOffTask,
-): Promise<RunStatus> {
+async function runOneOff(ctx: PluginContext, state: SchedulerState, task: OneOffTask): Promise<void> {
+  // Dispatch instant, taken before anything is awaited: a run that times out genuinely began
+  // before it finished, so a completion stamp records the bound rather than the run.
+  const startedAt = Date.now()
+  let model = "unknown"
+  let sessionID: string | undefined
+  const record = (outcome: RunStatus, error?: string): Promise<void> =>
+    recordRun(ctx, state, "oneoff", task.id, {
+      dueAt: task.dueAt,
+      startedAt,
+      outcome,
+      model,
+      ...(sessionID !== undefined ? { sessionID } : {}),
+      ...(error !== undefined ? { error } : {}),
+    })
+
   if (typeof ctx.session?.create !== "function") {
-    logOnce("no-session-create", "ctx.session.create is unavailable; runs cannot be dispatched")
-    return "failed"
+    logOnce("no-session-create", "ctx.session.create is unavailable; one-offs cannot be dispatched")
+    await record("failed", "ctx.session.create is unavailable")
+    return
   }
   if (typeof ctx.session?.prompt !== "function") {
     logOnce("no-prompt", "ctx.session.prompt is unavailable; one-offs cannot be dispatched")
-    return "failed"
+    await record("failed", "ctx.session.prompt is unavailable")
+    return
   }
   // Bound to a local, because the narrowing above does not survive into the closure below.
   const prompt = ctx.session.prompt
-  let outcome: RunStatus = "failed"
-  let model = "unknown"
-  let sessionID: string | undefined
   try {
     const created = await ctx.session.create({ title: `scheduled: ${task.id}` })
     sessionID = sessionIdOf(created)
-    if (sessionID === undefined) return "failed"
+    if (sessionID === undefined) {
+      await record("failed", "ctx.session.create resolved a session with no id")
+      return
+    }
     model = await applyJobTarget(ctx, task, sessionID)
     logLine(
       `running one-off ${task.id} (due ${new Date(task.dueAt).toISOString()}, model ${model}, runTimeout ${runTimeoutLabel(task.runTimeoutMs)})`,
@@ -2650,40 +2902,17 @@ async function runOneOff(
     if (bounded.outcome === "timeout") {
       const reason = timeoutReason(task.runTimeoutMs, bounded.stopped)
       logLine(`one-off ${task.id} timed out: ${reason}`)
-      // Recorded here rather than by the tick: the tick only records an `"ok"` outcome, so a
-      // timeout returned from here would otherwise leave no trace at all.
-      state.history.set(
-        task.id,
-        pushHistory(state.history.get(task.id) ?? [], {
-          dueAt: task.dueAt,
-          startedAt: Date.now(),
-          outcome: "timeout",
-          model,
-          ...(sessionID !== undefined ? { sessionID } : {}),
-          error: reason,
-        }),
-      )
-      await saveHistory(ctx, state, task.id)
-      return "timeout"
+      await record("timeout", reason)
+      return
     }
-    outcome = "ok"
+    // The *resolved* model, not the requested one: `applyJobTarget` is what answered "this is
+    // what will be billed", and the record has to agree with the `running` line above it.
+    await record("ok")
   } catch (error) {
-    const message = clip(error instanceof Error ? error.message : String(error), 300)
+    const message = clip(error instanceof Error ? error.message : String(error), HISTORY_ERROR_MAX)
     logLine(`one-off ${task.id} failed: ${message}`)
-    state.history.set(
-      task.id,
-      pushHistory(state.history.get(task.id) ?? [], {
-        dueAt: task.dueAt,
-        startedAt: Date.now(),
-        outcome: "failed",
-        model,
-        ...(sessionID !== undefined ? { sessionID } : {}),
-        error: message,
-      }),
-    )
-    await saveHistory(ctx, state, task.id)
+    await record("failed", message)
   }
-  return outcome
 }
 
 /**
@@ -2704,18 +2933,14 @@ async function recordLoopRun(
   model: string,
   error?: string,
 ): Promise<void> {
-  state.history.set(
-    loop.id,
-    pushHistory(state.history.get(loop.id) ?? [], {
-      dueAt,
-      startedAt: Date.now(),
-      outcome,
-      model,
-      sessionID,
-      ...(error !== undefined ? { error } : {}),
-    }),
-  )
-  await saveHistory(ctx, state, loop.id)
+  await recordRun(ctx, state, "loop", loop.id, {
+    dueAt,
+    startedAt: Date.now(),
+    outcome,
+    model,
+    sessionID,
+    ...(error !== undefined ? { error } : {}),
+  })
 }
 
 /**
@@ -3028,18 +3253,14 @@ async function runJob(
     // it would suppress the next occurrence of a job that is no longer running.
     clearInterval(renewLease)
     record.leaseUntil = undefined
-    state.history.set(
-      job.id,
-      pushHistory(state.history.get(job.id) ?? [], {
-        dueAt,
-        startedAt: now,
-        outcome,
-        model,
-        ...(sessionID !== undefined ? { sessionID } : {}),
-        ...(record.lastError !== undefined ? { error: record.lastError } : {}),
-      }),
-    )
-    await saveHistory(ctx, state, job.id)
+    await recordRun(ctx, state, "job", job.id, {
+      dueAt,
+      startedAt: now,
+      outcome,
+      model,
+      ...(sessionID !== undefined ? { sessionID } : {}),
+      ...(record.lastError !== undefined ? { error: record.lastError } : {}),
+    })
     await saveState(ctx, state, job.id)
   }
 }
@@ -3178,17 +3399,16 @@ async function tick(ctx: PluginContext, state: SchedulerState, lease: Lease, max
         `skipping ${skipped.length} one-off task(s): concurrency cap reached (${maxConcurrent}); recorded as skipped`,
       )
       for (const task of skipped) {
-        state.history.set(
-          task.id,
-          pushHistory(state.history.get(task.id) ?? [], {
-            dueAt: task.dueAt,
-            startedAt: now,
-            outcome: "skipped",
-            model: task.model === undefined ? "session default" : `${task.model.providerID}/${task.model.id}`,
-            error: `no free run slot: concurrency cap ${maxConcurrent} reached`,
-          }),
-        )
-        await saveHistory(ctx, state, task.id)
+        // `startedAt` is the instant the occurrence was *decided*, not dispatched: there was no
+        // dispatch to stamp, and a start that preceded its own skip would describe a run which
+        // somehow began after it was skipped.
+        await recordRun(ctx, state, "oneoff", task.id, {
+          dueAt: task.dueAt,
+          startedAt: now,
+          outcome: "skipped",
+          model: task.model === undefined ? "session default" : `${task.model.providerID}/${task.model.id}`,
+          error: `no free run slot: concurrency cap ${maxConcurrent} reached`,
+        })
       }
     }
 
@@ -3200,22 +3420,18 @@ async function tick(ctx: PluginContext, state: SchedulerState, lease: Lease, max
     await saveOneOffs(ctx, state.oneOffs)
 
     for (const task of admitted) {
-      const entry = task.id
-      void runOneOff(ctx, state, task).then(async (outcome) => {
-        // A completed one-off survives only in history, then is gone (ADR 0006).
-        if (outcome === "ok") {
-          state.history.set(
-            entry,
-            pushHistory(state.history.get(entry) ?? [], {
-              dueAt: task.dueAt,
-              startedAt: Date.now(),
-              outcome,
-              model: task.model === undefined ? "session default" : `${task.model.providerID}/${task.model.id}`,
-            }),
-          )
-          await saveHistory(ctx, state, entry)
-        }
-      })
+      // The run records itself now, on every outcome, so this is a bare dispatch: there is no
+      // "ok" case left here to special-case, and none of the other cases can be forgotten.
+      state.dispatching.add(task.id)
+      void runOneOff(ctx, state, task)
+        .catch((error: unknown) => {
+          // `runOneOff` records its own failures, so this is only reachable if the recording
+          // path itself threw — which must still not take the tick down with it.
+          logOnce(`oneoff-${task.id}`, `one-off failed (${error instanceof Error ? error.message : String(error)})`)
+        })
+        .finally(() => {
+          state.dispatching.delete(task.id)
+        })
     }
   }
 
@@ -3511,11 +3727,15 @@ function buildTools(
     {
       name: "history",
       description:
-        "Return one job's recent runs, newest first: due and start instants, outcome, resolved model, and any error.",
+        "Return recent runs for a job, a one-off or a session loop, newest first: due and start instants, outcome, resolved model, and any error.",
       input: {
         type: "object",
         properties: {
-          id: { type: "string", description: "Job id, as reported by schedules_list." },
+          id: {
+            type: "string",
+            description:
+              "Job id as reported by schedules_list, one-off id as returned by schedules_schedule, or loop id as returned by schedules_start_loop.",
+          },
           limit: { type: "number", description: "Max runs to return (capped at 50)." },
         },
         required: ["id"],
@@ -3526,14 +3746,28 @@ function buildTools(
       execute: async (input) => {
         const id = asString(input.id)
         if (id === undefined) return { output: { error: "id is required" } }
-        const job = state.jobs.find((entry) => entry.id === id)
+        const limit = boundedInt(input.limit, DEFAULT_HISTORY_LIMIT, 1, MAX_HISTORY_LIMIT)
+        // Wider than `state.jobs` on purpose: a one-off is consumed the moment it runs and a
+        // loop belongs to a session, so a completed one is in neither list by the time anyone
+        // asks what it did — which is what made this tool unable to read a one-off at all.
+        const owner = await resolveHistoryOwner(ctx, state, id)
         // An unknown id is a typed failure naming the id, never an empty success: "no runs
         // yet" and "no such job" are different answers and must not look alike.
-        if (job === undefined) {
-          return { output: { error: `no job with id "${id}"`, ids: state.jobs.map((e) => e.id) } }
+        if (owner === undefined) {
+          return {
+            output: {
+              error: `no job with id "${id}"`,
+              // Jobs plus what is still pending: the live ids this plugin can name. A completed
+              // one-off is deliberately absent — it has no pending record to name it by, which
+              // is the whole reason the lookup above had to reach into storage.
+              ids: [
+                ...state.jobs.map((entry) => entry.id),
+                ...state.oneOffs.map((task) => task.id),
+              ],
+            },
+          }
         }
-        const limit = boundedInt(input.limit, DEFAULT_HISTORY_LIMIT, 1, MAX_HISTORY_LIMIT)
-        const runs = [...(state.history.get(id) ?? [])]
+        const runs = owner.runs
           .slice(-limit)
           .reverse()
           .map((entry) => ({
@@ -3544,7 +3778,17 @@ function buildTools(
             ...(entry.sessionID !== undefined ? { sessionID: entry.sessionID } : {}),
             ...(entry.error !== undefined ? { error: entry.error } : {}),
           }))
-        return { output: { id, session: job.session, runs, limit } }
+        return {
+          output: {
+            id,
+            // Reported because the three kinds answer different questions: a loop runs into a
+            // session, a job may reuse one, and a one-off has a fresh session every time.
+            kind: owner.kind,
+            ...(owner.session !== undefined ? { session: owner.session } : {}),
+            runs,
+            limit,
+          },
+        }
       },
     },
     {
@@ -3629,6 +3873,7 @@ const definition: PluginDefinition = {
       history: new Map(),
       oneOffs: [],
       loops: new Map(),
+      dispatching: new Set(),
       inFlight: new Set(),
       invalid: [],
       storageAvailable: typeof ctx.storage?.get === "function",
