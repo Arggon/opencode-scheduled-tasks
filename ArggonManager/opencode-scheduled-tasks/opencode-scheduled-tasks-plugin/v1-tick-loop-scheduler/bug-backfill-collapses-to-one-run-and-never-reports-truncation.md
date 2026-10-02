@@ -1,6 +1,6 @@
 ---
 type: bug
-status: in_progress
+status: done
 id: bug-backfill-collapses-to-one-run-and-never-reports-truncation
 title: misfire backfill collapses every missed occurrence into one run and reports truncation nowhere
 assignee: arggon
@@ -10,7 +10,6 @@ labels: []
 priority: p1
 created: "2026-10-02"
 updated: "2026-10-02"
-claimed_at: "2026-10-02T22:42:34.046Z"
 ---
 <!--
   Placement (v0): ArggonManager/opencode-scheduled-tasks/opencode-scheduled-tasks-plugin/v1-tick-loop-scheduler/bug-backfill-collapses-to-one-run-and-never-reports-truncation.md
@@ -46,13 +45,13 @@ backfill to catch up is told nothing about the four that were not replayed.
 
 ## Acceptance
 
-- [ ] `backfill` replays up to `maxCatchUp` occurrences oldest-first, **each dispatched**, or the
+- [x] `backfill` replays up to `maxCatchUp` occurrences oldest-first, **each dispatched**, or the
       spec and ADR 0002 are amended to state the collapse deliberately — with the reason.
-- [ ] Whatever is dropped is reported: a `backlog-truncated` line **and** a field in the run record
+- [x] Whatever is dropped is reported: a `backlog-truncated` line **and** a field in the run record
       carrying `dropped` / `droppedCapped`, so "never silently" is true of both sinks.
-- [ ] A test pins it end to end with an injected clock: five missed occurrences, `maxCatchUp: 3`,
+- [x] A test pins it end to end with an injected clock: five missed occurrences, `maxCatchUp: 3`,
       assert the number of dispatches **and** the reported remainder.
-- [ ] Decide whether `collapsed` should survive into the record. If a collapsed N is genuinely the
+- [x] Decide whether `collapsed` should survive into the record. If a collapsed N is genuinely the
       desired behaviour, the record must say so rather than looking like a single occurrence.
 
 ## Notes
