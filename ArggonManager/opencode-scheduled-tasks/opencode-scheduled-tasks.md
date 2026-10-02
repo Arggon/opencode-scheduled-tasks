@@ -1,6 +1,6 @@
 ---
 type: initiative
-status: todo
+status: done
 id: opencode-scheduled-tasks
 title: Scheduled agent execution for OpenCode
 labels: []

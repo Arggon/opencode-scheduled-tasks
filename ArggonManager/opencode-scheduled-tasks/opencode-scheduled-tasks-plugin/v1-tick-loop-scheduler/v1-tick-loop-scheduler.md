@@ -1,6 +1,6 @@
 ---
 type: story
-status: todo
+status: done
 id: v1-tick-loop-scheduler
 title: v1 tick-loop scheduler
 parent: opencode-scheduled-tasks-plugin

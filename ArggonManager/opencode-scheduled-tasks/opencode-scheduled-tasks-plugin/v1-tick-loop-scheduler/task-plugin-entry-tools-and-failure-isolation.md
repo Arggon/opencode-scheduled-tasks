@@ -1,8 +1,9 @@
 ---
 type: task
-status: todo
+status: done
 id: task-plugin-entry-tools-and-failure-isolation
 title: "Plugin entry, tools, and failure isolation"
+assignee: arggon
 parent: v1-tick-loop-scheduler
 labels: []
 created: "2026-10-02"
@@ -27,23 +28,23 @@ import breaks auto-discovery on 2.0.7/2.0.8/2.0.10/2.0.12). See plan §T4.
 
 ## Acceptance
 
-- [ ] Single file, Node builtins only; no `@opencode/plugin` import; plain default-export
+- [x] Single file, Node builtins only; no `@opencode/plugin` import; plain default-export
       definition object.
-- [ ] Every `ctx` API is feature-detected; no path can throw through the plugin.
-- [ ] Loads and validates `.opencode/schedules.json`; malformed JSON retains
+- [x] Every `ctx` API is feature-detected; no path can throw through the plugin.
+- [x] Loads and validates `.opencode/schedules.json`; malformed JSON retains
       last-known-good and surfaces the error via `schedules_list`.
-- [ ] Registers `schedules_list` (pure read) and `schedules_run` (ad-hoc trigger) via
+- [x] Registers `schedules_list` (pure read) and `schedules_run` (ad-hoc trigger) via
       `ctx.tool.transform`; neither mutates the job set.
-- [ ] Arms the `unref()`ed tick loop only when the lease is held and >=1 job is enabled.
-- [ ] Cleanup clears the interval, releases the lease and disposes the tool registration,
+- [x] Arms the `unref()`ed tick loop only when the lease is held and >=1 job is enabled.
+- [x] Cleanup clears the interval, releases the lease and disposes the tool registration,
       and is safe to call twice.
-- [ ] A context missing `ctx.storage` degrades to in-memory state; the loss of cross-restart
+- [x] A context missing `ctx.storage` degrades to in-memory state; the loss of cross-restart
       continuity is recorded in the run record.
-- [ ] Each run is bounded by `runTimeoutMs`; on expiry the session is interrupted and
+- [x] Each run is bounded by `runTimeoutMs`; on expiry the session is interrupted and
       `timeout` recorded.
-- [ ] Every fire/skip/error logs one bounded `scheduled-tasks:` line including the job id;
+- [x] Every fire/skip/error logs one bounded `scheduled-tasks:` line including the job id;
       a repeated identical failure logs once.
-- [ ] Fake-context tests cover setup, both tools, cleanup-twice, missing `ctx.storage`,
+- [x] Fake-context tests cover setup, both tools, cleanup-twice, missing `ctx.storage`,
       malformed job file, and a throwing run.
 
 

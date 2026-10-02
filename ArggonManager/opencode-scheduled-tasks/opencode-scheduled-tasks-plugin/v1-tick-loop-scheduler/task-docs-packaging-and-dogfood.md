@@ -1,8 +1,9 @@
 ---
 type: task
-status: todo
+status: done
 id: task-docs-packaging-and-dogfood
 title: "Docs, packaging, and dogfood"
+assignee: arggon
 parent: v1-tick-loop-scheduler
 labels: []
 created: "2026-10-02"
@@ -24,14 +25,14 @@ T5 of `plan-001`. Depends on T4. See plan §T5 and spec 001 §"Synopsis".
 
 ## Acceptance
 
-- [ ] `README.md` documents install, the job-file reference, both tools, the inherited-
+- [x] `README.md` documents install, the job-file reference, both tools, the inherited-
       permissions threat model, and OS cron as the documented escape hatch for jobs that
       must fire while the server is down.
-- [ ] `package.json` is publishable as an OpenCode plugin and ships the vendored
+- [x] `package.json` is publishable as an OpenCode plugin and ships the vendored
       single-file install path (zero `node_modules`).
-- [ ] Dogfood: installed into this repo, a `* * * * *` job runs end to end against a real
+- [x] Dogfood: installed into this repo, a `* * * * *` job runs end to end against a real
       OpenCode server with the observed log lines captured.
-- [ ] The README's documented commands are executed verbatim by the dogfood run.
+- [x] The README's documented commands are executed verbatim by the dogfood run.
 
 
 

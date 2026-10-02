@@ -1,6 +1,6 @@
 ---
 type: epic
-status: todo
+status: done
 id: opencode-scheduled-tasks-plugin
 title: opencode-scheduled-tasks plugin
 parent: opencode-scheduled-tasks

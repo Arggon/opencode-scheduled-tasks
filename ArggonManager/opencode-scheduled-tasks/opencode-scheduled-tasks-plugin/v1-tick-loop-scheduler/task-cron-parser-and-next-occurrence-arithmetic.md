@@ -1,6 +1,6 @@
 ---
 type: task
-status: in_progress
+status: done
 id: task-cron-parser-and-next-occurrence-arithmetic
 title: Cron parser and next-occurrence arithmetic
 assignee: arggon
@@ -9,7 +9,6 @@ parent: v1-tick-loop-scheduler
 labels: []
 created: "2026-10-02"
 updated: "2026-10-02"
-claimed_at: "2026-10-02T12:46:55.711Z"
 ---
 <!--
   Placement (v0): ArggonManager/opencode-scheduled-tasks/opencode-scheduled-tasks-plugin/v1-tick-loop-scheduler/task-cron-parser-and-next-occurrence-arithmetic.md
@@ -29,16 +28,16 @@ next-occurrence arithmetic everything else depends on. See
 
 ## Acceptance
 
-- [ ] Parses 5-field cron (minute hour day-of-month month day-of-week) with `*`, lists,
+- [x] Parses 5-field cron (minute hour day-of-month month day-of-week) with `*`, lists,
       ranges and steps.
-- [ ] Expands `@hourly`, `@daily`, `@weekly` (Sun 00:00), `@monthly` (1st 00:00); any other
+- [x] Expands `@hourly`, `@daily`, `@weekly` (Sun 00:00), `@monthly` (1st 00:00); any other
       `@` token is rejected.
-- [ ] Rejects malformed expressions, out-of-range fields, and impossible schedules
+- [x] Rejects malformed expressions, out-of-range fields, and impossible schedules
       (`0 0 30 2 *`) with a named reason.
-- [ ] Computes the next occurrence strictly after an instant, in a named IANA timezone.
-- [ ] Table-driven test pins each field position, month rollover and leap day, under UTC
+- [x] Computes the next occurrence strictly after an instant, in a named IANA timezone.
+- [x] Table-driven test pins each field position, month rollover and leap day, under UTC
       and a DST-observing zone.
-- [ ] DST spring-forward skips the nonexistent local time; fall-back yields one first
+- [x] DST spring-forward skips the nonexistent local time; fall-back yields one first
       occurrence.
 
 

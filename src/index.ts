@@ -1,0 +1,1583 @@
+/**
+ * opencode-scheduled-tasks — cron-style scheduled agent tasks for OpenCode V2.
+ *
+ * Single dependency-free source file: it is simultaneously the npm package entry and the
+ * file you copy into `.opencode/plugins/scheduled-tasks/index.ts`. Node builtins only, and
+ * **no** `@opencode/plugin` import — that static import fails to load an auto-discovered
+ * plugin in a dependency-less tree (probed on 2.0.7/2.0.8/2.0.10/2.0.12; see
+ * ArggonManager's plugin playbook). The plain default-export definition object below is a
+ * valid V2 plugin definition and loads identically.
+ *
+ * Every `ctx` API is feature-detected and every path is failure-isolated: a broken
+ * scheduler logs once and goes inert. It must never break a session, a tool call or the
+ * server (invariant 3, spec 001).
+ *
+ * Pure helpers (cron parsing, occurrence arithmetic, misfire resolution) are exported for
+ * unit tests and contain no OpenCode dependency.
+ *
+ * Architecture: ADR 0001 (tick loop over declarative jobs), ADR 0002 (misfire and cost
+ * bounds), ADR 0003 (cross-process writer lease).
+ */
+
+import {
+  appendFileSync,
+  closeSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  unlinkSync,
+  utimesSync,
+  writeFileSync,
+  writeSync,
+} from "node:fs"
+import { homedir } from "node:os"
+import { dirname, join } from "node:path"
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+/** Milliseconds in one minute — cron resolution and the tick's floor unit. */
+export const MINUTE_MS = 60_000
+
+/** Default tick cadence. Fire accuracy is bounded by this; a run is seconds anyway. */
+export const DEFAULT_TICK_MS = 30_000
+
+/**
+ * Floor for a configured cadence. Deliberately *below* `DEFAULT_TICK_MS`: clamping the
+ * default up to a minute would silently halve its resolution and delay every job by up to
+ * a minute. A cron job does not need sub-minute polling, but the harness and any future
+ * second-resolution schedule do.
+ */
+export const MIN_TICK_MS = 5_000
+
+/** Default per-run bound, which also bounds an unanswerable permission prompt. */
+export const DEFAULT_RUN_TIMEOUT_MS = 15 * 60_000
+
+/** Default ceiling on runs in flight at once, across all jobs. */
+export const DEFAULT_MAX_CONCURRENT_RUNS = 1
+
+/** Default replay ceiling for `misfire: "backfill"`. */
+export const DEFAULT_MAX_CATCH_UP = 5
+
+/** Ceiling on jobs loaded from one file, so a hostile or generated file cannot flood us. */
+export const DEFAULT_MAX_JOBS = 100
+
+/** A lease whose heartbeat is older than this is considered abandoned and reclaimed. */
+export const DEFAULT_LEASE_TTL_MS = 90_000
+
+/** Ceiling on one lease heartbeat write period (must stay well under the TTL). */
+const LEASE_HEARTBEAT_MS = 30_000
+
+/** `ctx.storage` key prefix — namespaced so it can never collide with another plugin. */
+const STORAGE_PREFIX = "scheduled-tasks/"
+
+/** Version of the persisted run-state record. An unknown version is re-initialized. */
+export const STATE_VERSION = 1
+
+/** Log prefix; one bounded line per fire, skip or error. */
+const LOG_PREFIX = "scheduled-tasks:"
+
+/**
+ * Where this instance's log lines also go on disk.
+ *
+ * `console.error` from a plugin is **not** captured into OpenCode's own log file (verified:
+ * ArggonManager's `[arggon]` lines are absent from `~/.local/share/opencode/log/opencode.log`
+ * too), so console output alone makes the scheduler unobservable and a silent failure
+ * indistinguishable from an idle job. Every line is therefore also appended to a per-project
+ * file the user can read directly.
+ */
+let activeLogPath: string | undefined
+
+/** Maximum bytes of one appended log line. */
+const LOG_LINE_MAX = 1000
+
+/** Per-project log file, beside the writer lease. */
+export function logPath(directory: string, id: string): string {
+  const safe = id.replace(/[^A-Za-z0-9._-]/g, "_")
+  return join(leaseBaseDir(), safe, "scheduler.log")
+}
+
+/** Job file, relative to the plugin's location directory. */
+const JOBS_FILE = join(".opencode", "schedules.json")
+
+/** Longest cron expression we will look at before refusing it as hostile input. */
+const MAX_CRON_LENGTH = 128
+
+/** Longest prompt text accepted for one job. */
+const MAX_PROMPT_CHARS = 20_000
+
+/** How far ahead occurrence search will look before declaring a schedule unsatisfiable. */
+const SEARCH_HORIZON_MS = 5 * 366 * 24 * 60 * MINUTE_MS
+
+// ---------------------------------------------------------------------------
+// Cron: parsing
+// ---------------------------------------------------------------------------
+
+/** A parsed, validated cron schedule. All fields are sets of already-resolved numbers. */
+export type CronSpec = {
+  minutes: ReadonlySet<number>
+  hours: ReadonlySet<number>
+  daysOfMonth: ReadonlySet<number>
+  months: ReadonlySet<number>
+  daysOfWeek: ReadonlySet<number>
+  /** False when the day-of-month field was exactly `*` — drives the Vixie OR rule. */
+  domRestricted: boolean
+  /** False when the day-of-week field was exactly `*` — drives the Vixie OR rule. */
+  dowRestricted: boolean
+}
+
+/** A parse failure carrying a reason fit to show a user. */
+export class CronError extends Error {
+  readonly expression: string
+
+  constructor(expression: string, reason: string) {
+    super(`${reason} (in "${expression}")`)
+    this.name = "CronError"
+    this.expression = expression
+  }
+}
+
+const MONTH_NAMES: Record<string, number> = {
+  jan: 1, feb: 2, mar: 3, apr: 4, may: 5, jun: 6,
+  jul: 7, aug: 8, sep: 9, oct: 10, nov: 11, dec: 12,
+}
+
+const DAY_NAMES: Record<string, number> = {
+  sun: 0, mon: 1, tue: 2, wed: 3, thu: 4, fri: 5, sat: 6,
+}
+
+type FieldSpec = {
+  name: string
+  min: number
+  max: number
+  names?: Record<string, number>
+  /** Day-of-week accepts 7 as an alias for Sunday. */
+  wrap?: (value: number) => number
+}
+
+/** The five fields, in order, with their bounds. */
+const FIELDS: readonly FieldSpec[] = [
+  { name: "minute", min: 0, max: 59 },
+  { name: "hour", min: 0, max: 23 },
+  { name: "day-of-month", min: 1, max: 31 },
+  { name: "month", min: 1, max: 12, names: MONTH_NAMES },
+  // `7` is accepted as an alias for Sunday, so the range runs to 7 and `wrap` folds it
+  // onto 0. `*` therefore yields 0..7, which wraps (and dedupes) to 0..6.
+  { name: "day-of-week", min: 0, max: 7, names: DAY_NAMES, wrap: (v) => (v === 7 ? 0 : v) },
+]
+
+/** `@macro` expansions, in 5-field form. */
+const MACROS: Record<string, string> = {
+  "@hourly": "0 * * * *",
+  "@daily": "0 0 * * *",
+  "@midnight": "0 0 * * *",
+  "@weekly": "0 0 * * 0",
+  "@monthly": "0 0 1 * *",
+  "@yearly": "0 0 1 1 *",
+  "@annually": "0 0 1 1 *",
+}
+
+/** One atom of a field: a single value, a range, or a stepped range. */
+type Resolved = { values: number[]; restricted: boolean }
+
+/** Resolve one comma-separated field atom set into concrete numbers. */
+function resolveField(expression: string, raw: string, spec: FieldSpec): Resolved {
+  const trimmed = raw.trim()
+  if (trimmed === "") throw new CronError(expression, `empty ${spec.name} field`)
+
+  const values = new Set<number>()
+  let restricted = true
+
+  for (const part of trimmed.split(",")) {
+    const atom = part.trim()
+    if (atom === "") throw new CronError(expression, `empty ${spec.name} entry`)
+
+    const segments = atom.split("/")
+    const rangePart = segments[0] ?? ""
+    const stepPart = segments[1]
+    if (segments.length > 2) throw new CronError(expression, `malformed step in ${spec.name} "${atom}"`)
+
+    let step = 1
+    if (stepPart !== undefined) {
+      if (!/^\d+$/.test(stepPart)) throw new CronError(expression, `non-numeric step in ${spec.name} "${atom}"`)
+      step = Number(stepPart)
+      if (step === 0) throw new CronError(expression, `zero step in ${spec.name} "${atom}"`)
+    }
+
+    const nameOf = (token: string): number => {
+      const lower = token.toLowerCase()
+      if (spec.names !== undefined) {
+        const named = spec.names[lower]
+        if (named !== undefined) return named
+      }
+      if (!/^\d+$/.test(token)) throw new CronError(expression, `non-numeric ${spec.name} "${token}"`)
+      return Number(token)
+    }
+
+    let start: number
+    let end: number
+    if (rangePart === "*") {
+      start = spec.min
+      end = spec.max
+      if (stepPart === undefined) restricted = false
+    } else if (rangePart.includes("-")) {
+      const bounds = rangePart.split("-")
+      if (bounds.length !== 2) throw new CronError(expression, `malformed range in ${spec.name} "${atom}"`)
+      start = nameOf((bounds[0] ?? "").trim())
+      end = nameOf((bounds[1] ?? "").trim())
+    } else {
+      start = nameOf(rangePart)
+      end = stepPart === undefined ? start : spec.max
+    }
+
+    if (start < spec.min || start > spec.max) {
+      throw new CronError(expression, `${spec.name} ${start} out of range ${spec.min}-${spec.max}`)
+    }
+    if (end < spec.min || end > spec.max) {
+      throw new CronError(expression, `${spec.name} ${end} out of range ${spec.min}-${spec.max}`)
+    }
+    if (end < start) throw new CronError(expression, `inverted range in ${spec.name} "${atom}"`)
+
+    const wrap = spec.wrap
+    for (let value = start; value <= end; value += step) {
+      values.add(wrap === undefined ? value : wrap(value))
+    }
+  }
+
+  return { values: [...values].sort((a, b) => a - b), restricted }
+}
+
+/** Days in `month` (1-12) of `year`; `month` is validated by the caller. */
+export function daysInMonth(month: number, year: number): number {
+  return new Date(Date.UTC(year, month, 0)).getUTCDate()
+}
+
+/**
+ * True when the day-of-month and month fields can never name a real date — e.g.
+ * `0 0 30 2 *` (30 February). Checking one leap year covers every Gregorian year, because
+ * the leap rule repeats on a 4-year cycle.
+ */
+function hasImpossibleDay(spec: CronSpec): boolean {
+  for (const month of spec.months) {
+    for (const day of spec.daysOfMonth) {
+      if (day <= daysInMonth(month, 2024)) return false
+    }
+  }
+  return true
+}
+
+/**
+ * Parse a 5-field cron expression (or an `@macro`) into a `CronSpec`.
+ *
+ * Throws `CronError` with a user-facing reason on a malformed expression, an out-of-range
+ * field, or a schedule that can never match — never returns a spec that silently never
+ * fires (spec 001 § "Loading and validation").
+ */
+export function parseCron(expression: string): CronSpec {
+  if (typeof expression !== "string") throw new CronError(String(expression), "schedule must be a string")
+  const trimmed = expression.trim()
+  if (trimmed === "") throw new CronError(expression, "empty schedule")
+  if (trimmed.length > MAX_CRON_LENGTH) {
+    throw new CronError(`${trimmed.slice(0, 32)}…`, `schedule longer than ${MAX_CRON_LENGTH} characters`)
+  }
+
+  const normalized = trimmed.startsWith("@") ? MACROS[trimmed.toLowerCase()] : trimmed
+  if (normalized === undefined) throw new CronError(trimmed, `unknown macro "${trimmed}"`)
+
+  const fields = normalized.split(/\s+/).filter((part) => part !== "")
+  if (fields.length !== FIELDS.length) {
+    throw new CronError(
+      normalized,
+      `expected ${FIELDS.length} space-separated fields, found ${fields.length}`,
+    )
+  }
+
+  const resolved = FIELDS.map((spec, index) => {
+    const raw = fields[index]
+    if (raw === undefined) throw new CronError(normalized, `missing ${spec.name} field`)
+    return resolveField(normalized, raw, spec)
+  })
+  const [minuteField, hourField, dayField, monthField, weekField] = resolved as [
+    Resolved,
+    Resolved,
+    Resolved,
+    Resolved,
+    Resolved,
+  ]
+  const parsed: CronSpec = {
+    minutes: new Set(minuteField.values),
+    hours: new Set(hourField.values),
+    daysOfMonth: new Set(dayField.values),
+    months: new Set(monthField.values),
+    daysOfWeek: new Set(weekField.values),
+    domRestricted: dayField.restricted,
+    dowRestricted: weekField.restricted,
+  }
+
+  if (hasImpossibleDay(parsed)) {
+    throw new CronError(normalized, "day-of-month never exists in the selected month(s)")
+  }
+  return parsed
+}
+
+// ---------------------------------------------------------------------------
+// Timezone arithmetic
+// ---------------------------------------------------------------------------
+
+/** Local wall-clock parts of an instant in a named zone. */
+export type WallParts = {
+  year: number
+  month: number
+  day: number
+  hour: number
+  minute: number
+  weekday: number
+}
+
+const formatterCache = new Map<string, Intl.DateTimeFormat>()
+
+function formatterFor(timeZone: string): Intl.DateTimeFormat {
+  const cached = formatterCache.get(timeZone)
+  if (cached !== undefined) return cached
+  let formatter: Intl.DateTimeFormat
+  try {
+    formatter = new Intl.DateTimeFormat("en-US", {
+      timeZone,
+      hourCycle: "h23",
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      weekday: "short",
+    })
+  } catch {
+    throw new CronError(timeZone, `unknown IANA timezone "${timeZone}"`)
+  }
+  formatterCache.set(timeZone, formatter)
+  return formatter
+}
+
+const WEEKDAY_INDEX: Record<string, number> = {
+  Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6,
+}
+
+/** Wall-clock parts of `instantMs` in `timeZone`. */
+export function wallParts(instantMs: number, timeZone: string): WallParts {
+  const parts = formatterFor(timeZone).formatToParts(new Date(instantMs))
+  const read: Record<string, string> = {}
+  for (const part of parts) read[part.type] = part.value
+  return {
+    year: Number(read.year),
+    month: Number(read.month),
+    day: Number(read.day),
+    hour: Number(read.hour) % 24,
+    minute: Number(read.minute),
+    weekday: WEEKDAY_INDEX[read.weekday ?? ""] ?? 0,
+  }
+}
+
+/** Offset of `timeZone` from UTC, in ms, at the given instant. */
+function zoneOffsetMs(instantMs: number, timeZone: string): number {
+  const parts = wallParts(instantMs, timeZone)
+  const asIfUtc = Date.UTC(parts.year, parts.month - 1, parts.day, parts.hour, parts.minute, 0, 0)
+  // Drop the seconds the formatter rounded away so the offset is minute-exact.
+  return asIfUtc - Math.floor(instantMs / MINUTE_MS) * MINUTE_MS
+}
+
+/** True when `instantMs` renders back to exactly this wall time in `timeZone`. */
+function rendersAs(instantMs: number, parts: WallParts, timeZone: string): boolean {
+  const back = wallParts(instantMs, timeZone)
+  return (
+    back.year === parts.year &&
+    back.month === parts.month &&
+    back.day === parts.day &&
+    back.hour === parts.hour &&
+    back.minute === parts.minute
+  )
+}
+
+/**
+ * The instant at which `timeZone` shows the given wall-clock minute, or `undefined` when
+ * that local time **does not exist** (DST spring-forward).
+ *
+ * When the wall time occurs twice (DST fall-back) the **earlier** instant is returned, so a
+ * schedule that lands on an ambiguous minute fires once, at the first occurrence.
+ */
+export function wallToInstant(parts: WallParts, timeZone: string): number | undefined {
+  const target = Date.UTC(parts.year, parts.month - 1, parts.day, parts.hour, parts.minute, 0, 0)
+  const day = 24 * 60 * MINUTE_MS
+  const candidates = new Set<number>()
+  // Probing either side of the target covers both transitions: the offset in force just
+  // before and just after the wall time we are resolving.
+  for (const probe of [target - day, target, target + day]) {
+    const candidate = target - zoneOffsetMs(probe, timeZone)
+    if (rendersAs(candidate, parts, timeZone)) candidates.add(candidate)
+  }
+  if (candidates.size === 0) return undefined
+  return Math.min(...candidates)
+}
+
+/** Wall parts treated as a UTC instant, so day/month arithmetic never needs a timezone. */
+function wallAsUtc(parts: WallParts): number {
+  return Date.UTC(parts.year, parts.month - 1, parts.day, parts.hour, parts.minute, 0, 0)
+}
+
+function wallFromUtc(ms: number): WallParts {
+  const date = new Date(ms)
+  return {
+    year: date.getUTCFullYear(),
+    month: date.getUTCMonth() + 1,
+    day: date.getUTCDate(),
+    hour: date.getUTCHours(),
+    minute: date.getUTCMinutes(),
+    // getUTCDay: 0 = Sunday, already the convention `daysOfWeek` uses.
+    weekday: date.getUTCDay(),
+  }
+}
+
+/**
+ * Vixie day rule: when **both** day-of-month and day-of-week are restricted the day matches
+ * if **either** does; when only one is restricted, that one must match.
+ */
+export function dayMatches(parts: WallParts, spec: CronSpec): boolean {
+  if (!spec.months.has(parts.month)) return false
+  const domOk = spec.daysOfMonth.has(parts.day)
+  const dowOk = spec.daysOfWeek.has(parts.weekday)
+  if (spec.domRestricted && spec.dowRestricted) return domOk || dowOk
+  if (spec.domRestricted) return domOk
+  if (spec.dowRestricted) return dowOk
+  return true
+}
+
+/**
+ * First occurrence of `spec` strictly after `afterMs`, evaluated in `timeZone`, or
+ * `undefined` when nothing matches within the search horizon.
+ *
+ * The search walks **wall-clock** minutes and only converts the match to an instant, which
+ * is what makes DST correct for free: a wall time that does not exist resolves to
+ * `undefined` and the walk continues, and an ambiguous wall time resolves to its first
+ * instant.
+ */
+export function nextOccurrence(spec: CronSpec, afterMs: number, timeZone: string): number | undefined {
+  // Start at the next whole minute strictly after `afterMs`.
+  let wall = Math.floor(afterMs / MINUTE_MS) * MINUTE_MS + MINUTE_MS
+  const horizon = wall + SEARCH_HORIZON_MS
+
+  while (wall < horizon) {
+    const parts = wallFromUtc(wall)
+    if (!dayMatches(parts, spec)) {
+      // Jump to the next local midnight instead of walking 1440 dead minutes.
+      wall = Date.UTC(parts.year, parts.month - 1, parts.day + 1, 0, 0, 0, 0)
+      continue
+    }
+    if (!spec.hours.has(parts.hour)) {
+      wall = Date.UTC(parts.year, parts.month - 1, parts.day, parts.hour + 1, 0, 0, 0)
+      continue
+    }
+    if (!spec.minutes.has(parts.minute)) {
+      wall += MINUTE_MS
+      continue
+    }
+    const instant = wallToInstant(parts, timeZone)
+    if (instant !== undefined && instant > afterMs) return instant
+    // The wall minute matched but does not exist locally (spring-forward): step past it.
+    wall += MINUTE_MS
+  }
+  return undefined
+}
+
+// ---------------------------------------------------------------------------
+// Job definition
+// ---------------------------------------------------------------------------
+
+/** How missed occurrences are handled when the scheduler was not running. */
+export type MisfirePolicy = "skip" | "backfill"
+
+/** A model reference: `{ providerID, id }`, as `ctx.session.switchModel` takes it. */
+export type ModelRef = { providerID: string; id: string }
+
+export type JobDefinition = {
+  id: string
+  schedule: string
+  timezone: string
+  prompt: string
+  agent?: string
+  /**
+   * Model for this job's runs. Omitted means "inherit the session default", which is
+   * usually a *paid* model — an unattended recurring job should name its model explicitly.
+   */
+  model?: ModelRef
+  enabled: boolean
+  misfire: MisfirePolicy
+  maxCatchUp: number
+  runTimeoutMs: number
+}
+
+const JOB_ID_PATTERN = /^[a-z0-9][a-z0-9._-]*$/
+
+/**
+ * Parse a job's `model` field: `provider/model`, or an explicit
+ * `{ providerID, id }` object. Returns a reason string when it is malformed.
+ */
+export function parseModelRef(
+  value: unknown,
+): { model: ModelRef } | { reason: string } | undefined {
+  if (value === undefined) return undefined
+  if (typeof value === "string") {
+    const trimmed = value.trim()
+    const slash = trimmed.indexOf("/")
+    if (slash <= 0 || slash === trimmed.length - 1) {
+      return { reason: `model "${trimmed}" must be "provider/model"` }
+    }
+    const providerID = trimmed.slice(0, slash)
+    const id = trimmed.slice(slash + 1)
+    if (providerID.trim() === "" || id.trim() === "") {
+      return { reason: `model "${trimmed}" must be "provider/model"` }
+    }
+    return { model: { providerID: providerID.trim(), id: id.trim() } }
+  }
+  if (value !== null && typeof value === "object" && !Array.isArray(value)) {
+    const record = value as Record<string, unknown>
+    const providerID = asString(record.providerID)
+    const id = asString(record.id) ?? asString(record.modelID)
+    if (providerID !== undefined && id !== undefined) return { model: { providerID, id } }
+  }
+  return { reason: "model must be \"provider/model\" or { providerID, id }" }
+}
+
+/** A job that failed validation, kept so `schedules_list` can report it instead of hiding it. */
+export type InvalidJob = { id: string; schedule: unknown; reason: string }
+
+export type LoadedJobs = {
+  jobs: JobDefinition[]
+  invalid: InvalidJob[]
+  /** Present when the file itself could not be read or parsed. */
+  error?: string
+}
+
+function asString(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim() !== "" ? value.trim() : undefined
+}
+
+function boundedInt(value: unknown, fallback: number, min: number, max: number): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) return fallback
+  return Math.min(max, Math.max(min, Math.trunc(value)))
+}
+
+/**
+ * Validate one raw job entry. Returns either a `JobDefinition` or the reason it is
+ * refused; a refused job never silently disappears (spec 001 § "Loading and validation").
+ */
+export function validateJob(raw: unknown, index: number): { job: JobDefinition } | { reason: string } {
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+    return { reason: `job at index ${index} is not an object` }
+  }
+  const record = raw as Record<string, unknown>
+
+  const id = asString(record.id)
+  if (id === undefined) return { reason: `job at index ${index} has no id` }
+  if (!JOB_ID_PATTERN.test(id)) {
+    return { reason: `job id "${id}" must match ${JOB_ID_PATTERN.source}` }
+  }
+
+  const schedule = asString(record.schedule)
+  if (schedule === undefined) return { reason: `job "${id}" has no schedule` }
+  try {
+    parseCron(schedule)
+  } catch (error) {
+    return { reason: `job "${id}": ${error instanceof Error ? error.message : String(error)}` }
+  }
+
+  const timezone = asString(record.timezone) ?? asString(record.tz) ?? localTimeZone()
+  try {
+    formatterFor(timezone)
+  } catch {
+    return { reason: `job "${id}": unknown IANA timezone "${timezone}"` }
+  }
+
+  const prompt = typeof record.prompt === "string" ? record.prompt.trim() : ""
+  if (prompt === "") return { reason: `job "${id}" has no prompt` }
+  if (prompt.length > MAX_PROMPT_CHARS) {
+    return { reason: `job "${id}": prompt longer than ${MAX_PROMPT_CHARS} characters` }
+  }
+
+  const misfire = record.misfire === "backfill" ? "backfill" : "skip"
+
+  const model = parseModelRef(record.model)
+  if (model !== undefined && "reason" in model) return { reason: `job "${id}": ${model.reason}` }
+
+  return {
+    job: {
+      id,
+      schedule,
+      timezone,
+      prompt,
+      ...(asString(record.agent) !== undefined ? { agent: asString(record.agent) as string } : {}),
+      ...(model !== undefined && "model" in model ? { model: model.model } : {}),
+      enabled: record.enabled !== false,
+      misfire,
+      maxCatchUp: boundedInt(record.maxCatchUp, DEFAULT_MAX_CATCH_UP, 1, 50),
+      runTimeoutMs: boundedInt(record.runTimeoutMs, DEFAULT_RUN_TIMEOUT_MS, MINUTE_MS, 24 * 60 * MINUTE_MS),
+    },
+  }
+}
+
+/**
+ * Validate a whole parsed job file. Refusing one job never refuses the others: the valid
+ * ones load and the invalid ones are reported.
+ */
+export function loadJobs(payload: unknown): LoadedJobs {
+  if (payload === null || typeof payload !== "object" || Array.isArray(payload)) {
+    return { jobs: [], invalid: [], error: "job file must be a JSON object" }
+  }
+  const record = payload as Record<string, unknown>
+  const version = record.version
+  if (version !== undefined && version !== 1) {
+    return { jobs: [], invalid: [], error: `unsupported job file version ${String(version)} (expected 1)` }
+  }
+  const raw = record.jobs
+  if (!Array.isArray(raw)) {
+    return { jobs: [], invalid: [], error: "job file has no `jobs` array" }
+  }
+  if (raw.length > DEFAULT_MAX_JOBS) {
+    return {
+      jobs: [],
+      invalid: [],
+      error: `job file declares ${raw.length} jobs, above the cap of ${DEFAULT_MAX_JOBS}`,
+    }
+  }
+
+  const jobs: JobDefinition[] = []
+  const invalid: InvalidJob[] = []
+  const seen = new Set<string>()
+
+  raw.forEach((entry, index) => {
+    const outcome = validateJob(entry, index)
+    if ("reason" in outcome) {
+      const id = asString((entry as Record<string, unknown> | null)?.id) ?? `#${index}`
+      invalid.push({ id, schedule: (entry as Record<string, unknown> | null)?.schedule, reason: outcome.reason })
+      return
+    }
+    if (seen.has(outcome.job.id)) {
+      invalid.push({ id: outcome.job.id, schedule: outcome.job.schedule, reason: `duplicate job id "${outcome.job.id}"` })
+      return
+    }
+    seen.add(outcome.job.id)
+    jobs.push(outcome.job)
+  })
+
+  return { jobs, invalid }
+}
+
+/** The server's local IANA zone; the default for a job that names no timezone. */
+export function localTimeZone(): string {
+  try {
+    return Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC"
+  } catch {
+    return "UTC"
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Misfire resolution and run state (ADR 0002)
+// ---------------------------------------------------------------------------
+
+export type RunStatus = "ok" | "failed" | "timeout" | "skipped"
+
+/** Durable, versioned per-job record. Only mutable run state lives here — never the job. */
+export type JobState = {
+  version: number
+  lastRun?: number
+  lastStatus?: RunStatus
+  lastError?: string
+  nextRun?: number
+  /** Heartbeat of an in-flight run; an expired one is treated as abandoned. */
+  leaseUntil?: number
+}
+
+export type JobStateMap = Record<string, JobState>
+
+/** One occurrence the tick decided about. */
+export type Occurrence = {
+  jobId: string
+  /** The instant the occurrence was due. */
+  dueAt: number
+  /** How many due occurrences this decision covers, and how many past the cap were dropped. */
+  collapsed: number
+  dropped: number
+  /** True when `dropped` hit the scan bound and is therefore a lower bound. */
+  droppedCapped?: boolean
+}
+
+/** Why a due job was not run. */
+export type Suppression =
+  | { reason: "in-flight" }
+  | { reason: "concurrency"; running: number }
+  | { reason: "backlog-truncated"; dropped: number }
+
+export type TickDecision =
+  | { kind: "run"; job: JobDefinition; occurrence: Occurrence }
+  | { kind: "skip"; job: JobDefinition; occurrence: Occurrence; suppression: Suppression }
+
+export type MissedOccurrences = {
+  /** Replayed occurrences, oldest first, capped at `limit`. */
+  instants: number[]
+  /** Occurrences past the cap. Exact up to `MAX_BACKLOG_SCAN`, a lower bound beyond it. */
+  dropped: number
+  droppedCapped: boolean
+}
+
+/**
+ * Ceiling on the walk that counts a dropped backlog. Counting a `* * * * *` job across a
+ * year asleep would otherwise cost half a million `nextOccurrence` calls to produce a number
+ * nobody acts on, so past this bound the count is reported as a lower bound.
+ */
+const MAX_BACKLOG_SCAN = 1000
+
+/**
+ * Every occurrence of `spec` in `(afterMs, untilMs]`, capped at `limit`, oldest first.
+ *
+ * `dropped` reports what the cap swallowed rather than silently discarding it (ADR 0002).
+ */
+export function missedOccurrences(
+  spec: CronSpec,
+  afterMs: number,
+  untilMs: number,
+  timeZone: string,
+  limit: number,
+): MissedOccurrences {
+  const instants: number[] = []
+  let cursor = afterMs
+  while (instants.length < limit) {
+    const next = nextOccurrence(spec, cursor, timeZone)
+    if (next === undefined || next > untilMs) break
+    instants.push(next)
+    cursor = next
+  }
+  if (instants.length < limit) return { instants, dropped: 0, droppedCapped: false }
+
+  let dropped = 0
+  while (dropped < MAX_BACKLOG_SCAN) {
+    const next = nextOccurrence(spec, cursor, timeZone)
+    if (next === undefined || next > untilMs) return { instants, dropped, droppedCapped: false }
+    dropped += 1
+    cursor = next
+  }
+  // One probe past the bound distinguishes "exactly at the bound" from "beyond it".
+  const beyond = nextOccurrence(spec, cursor, timeZone)
+  return { instants, dropped, droppedCapped: beyond !== undefined && beyond <= untilMs }
+}
+
+/**
+ * Decide what to do about the occurrences a job owes at `nowMs`.
+ *
+ * The cursor is `state.lastRun ?? nowMs`: a job with **no history** starts at `nowMs`, so a
+ * fresh install never replays a decade of the past — only a job that has actually run
+ * before carries a cursor that can fall behind.
+ *
+ * Whichever policy fires, the cursor is advanced to `nowMs`. That is what makes `skip`
+ * genuinely *collapse* a backlog rather than replaying it one occurrence per tick: the
+ * window is consumed whether or not each of its occurrences was run.
+ */
+export function resolveDue(
+  job: JobDefinition,
+  spec: CronSpec,
+  state: JobState,
+  nowMs: number,
+  inFlight: boolean,
+  running: number,
+  maxConcurrentRuns: number,
+): TickDecision | undefined {
+  const after = state.lastRun ?? nowMs
+  const limit = job.misfire === "backfill" ? job.maxCatchUp : 1
+  const { instants, dropped, droppedCapped } = missedOccurrences(spec, after, nowMs, job.timezone, limit)
+
+  if (instants.length === 0) {
+    // Arm the cursor the first time we ever see this job. Without this the job stays
+    // starved forever: with `lastRun` still undefined every tick re-derives
+    // `after = nowMs`, the window is always empty, and the job can never come due.
+    if (state.lastRun === undefined) state.lastRun = nowMs
+    const upcoming = nextOccurrence(spec, nowMs, job.timezone)
+    if (upcoming !== undefined && state.nextRun !== upcoming) state.nextRun = upcoming
+    return undefined
+  }
+
+  const occurrence: Occurrence = {
+    jobId: job.id,
+    dueAt: instants[0] as number,
+    collapsed: instants.length,
+    dropped,
+    ...(droppedCapped ? { droppedCapped: true } : {}),
+  }
+
+  /** Consume the whole window: the cursor moves to `nowMs`, never to a replayed instant. */
+  const consume = (): void => {
+    state.lastRun = nowMs
+    const upcoming = nextOccurrence(spec, nowMs, job.timezone)
+    if (upcoming !== undefined) state.nextRun = upcoming
+  }
+
+  if (inFlight) {
+    state.lastStatus = "skipped"
+    consume()
+    return { kind: "skip", job, occurrence, suppression: { reason: "in-flight" } }
+  }
+  if (running >= maxConcurrentRuns) {
+    state.lastStatus = "skipped"
+    consume()
+    return { kind: "skip", job, occurrence, suppression: { reason: "concurrency", running } }
+  }
+
+  // Advance the cursor *before* the run, so a crash mid-run cannot replay the same
+  // occurrence forever — and advance it to `nowMs`, so the rest of the backlog is consumed
+  // rather than trickling out one occurrence per tick.
+  consume()
+
+  return { kind: "run", job, occurrence }
+}
+
+/** Repair a persisted record: an unknown version or a corrupt entry re-initializes. */
+export function normalizeState(value: unknown): JobState {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return { version: STATE_VERSION }
+  const record = value as Record<string, unknown>
+  if (record.version !== STATE_VERSION) return { version: STATE_VERSION }
+  const state: JobState = { version: STATE_VERSION }
+  if (typeof record.lastRun === "number" && Number.isFinite(record.lastRun)) state.lastRun = record.lastRun
+  if (typeof record.nextRun === "number" && Number.isFinite(record.nextRun)) state.nextRun = record.nextRun
+  if (typeof record.leaseUntil === "number" && Number.isFinite(record.leaseUntil)) {
+    state.leaseUntil = record.leaseUntil
+  }
+  if (isRunStatus(record.lastStatus)) state.lastStatus = record.lastStatus
+  if (typeof record.lastError === "string") state.lastError = record.lastError.slice(0, 500)
+  return state
+}
+
+function isRunStatus(value: unknown): value is RunStatus {
+  return value === "ok" || value === "failed" || value === "timeout" || value === "skipped"
+}
+
+/** An in-flight lease older than its own timeout is abandoned, not hung. */
+export function isLeaseLive(state: JobState, nowMs: number): boolean {
+  return state.leaseUntil !== undefined && state.leaseUntil > nowMs
+}
+
+// ---------------------------------------------------------------------------
+// Cross-process writer lease (ADR 0003)
+// ---------------------------------------------------------------------------
+
+export type Lease = {
+  path: string
+  /** False when the directory could not be created and we run without a lease. */
+  held: boolean
+  /** True when another live instance holds the lease and we must stay inert. */
+  foreign: boolean
+  heartbeat: () => void
+  release: () => void
+}
+
+/**
+ * Override for the state directory. Set `OPENCODE_SCHEDULED_TASKS_DATA_DIR` to relocate
+ * every lockfile — useful for a container, a read-only home, or a test run that must not
+ * touch the real one.
+ */
+export const DATA_DIR_ENV = "OPENCODE_SCHEDULED_TASKS_DATA_DIR"
+
+/** Directory holding one lockfile per project. */
+export function leaseBaseDir(): string {
+  const override = asString(process.env[DATA_DIR_ENV])
+  if (override !== undefined) return override
+  return join(homedir(), ".local", "share", "opencode", "scheduled-tasks")
+}
+
+/** Lockfile path for one project. The id is sanitized, so it is never a path component. */
+export function leasePath(directory: string, id: string): string {
+  const safe = id.replace(/[^A-Za-z0-9._-]/g, "_")
+  return join(leaseBaseDir(), safe, "writer.lock")
+}
+
+function readLease(path: string): { pid: number; heartbeat: number } | undefined {
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(path, "utf8"))
+    if (parsed === null || typeof parsed !== "object") return undefined
+    const record = parsed as Record<string, unknown>
+    const pid = typeof record.pid === "number" ? record.pid : Number.NaN
+    const heartbeat = typeof record.heartbeat === "number" ? record.heartbeat : Number.NaN
+    if (!Number.isFinite(pid) || !Number.isFinite(heartbeat)) return undefined
+    return { pid, heartbeat }
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * Acquire the writer lease for this instance.
+ *
+ * `fs.openSync(path, "wx")` is an atomic exclusive create: `EEXIST` proves another process
+ * holds it. A lease whose heartbeat is older than `ttlMs` is reclaimed, so a `SIGKILL`ed
+ * server does not wedge scheduling forever. When the directory cannot be created we
+ * **degrade** to running without a lease rather than disabling the scheduler — the
+ * `held: false` result is recorded so the loss of arbitration is visible, not silent.
+ */
+export function acquireLease(path: string, options: { now?: () => number; ttlMs?: number } = {}): Lease {
+  const now = (): number => options.now?.() ?? Date.now()
+  const ttlMs = options.ttlMs ?? DEFAULT_LEASE_TTL_MS
+
+  const noLease = (foreign: boolean): Lease => ({
+    path,
+    held: false,
+    foreign,
+    heartbeat: () => {},
+    release: () => {},
+  })
+
+  let created = false
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      mkdirSync(dirname(path), { recursive: true })
+    } catch {
+      return noLease(false)
+    }
+    try {
+      const fd = openSync(path, "wx")
+      try {
+        writeSync(fd, JSON.stringify({ pid: process.pid, heartbeat: now() }))
+      } finally {
+        closeSync(fd)
+      }
+      created = true
+      break
+    } catch {
+      const existing = readLease(path)
+      // Our own pid means a reload inside this very process: the previous instance may not
+      // have run its cleanup, and treating that as a foreign holder would make the plugin
+      // permanently inert after the first `opencode reload`. Take our own lease back.
+      if (existing !== undefined && existing.pid === process.pid) {
+        try {
+          writeFileSync(path, JSON.stringify({ pid: process.pid, heartbeat: now() }))
+          created = true
+          break
+        } catch {
+          return noLease(true)
+        }
+      }
+      if (existing !== undefined && now() - existing.heartbeat <= ttlMs) {
+        return noLease(true)
+      }
+      // Stale or unreadable: drop it and make exactly one more exclusive attempt.
+      try {
+        unlinkSync(path)
+      } catch {
+        return noLease(true)
+      }
+    }
+  }
+
+  if (!created) return noLease(true)
+
+  return {
+    path,
+    held: true,
+    foreign: false,
+    heartbeat: () => {
+      try {
+        const existing = readLease(path)
+        if (existing !== undefined && existing.pid !== process.pid) return
+        utimesSync(path, new Date(), new Date())
+        writeFileSync(path, JSON.stringify({ pid: process.pid, heartbeat: now() }))
+      } catch {
+        // A failed heartbeat only costs us the lease at the next stale check; the tick
+        // itself keeps running, which is the correct degradation.
+      }
+    },
+    release: () => {
+      const existing = readLease(path)
+      if (existing !== undefined && existing.pid !== process.pid) return
+      try {
+        unlinkSync(path)
+      } catch {
+        // Already gone: releasing twice is not an error.
+      }
+    },
+  }
+}
+
+// ---------------------------------------------------------------------------
+// OpenCode V2 plugin context (structural types — no `@opencode/plugin` import)
+// ---------------------------------------------------------------------------
+
+type StorageContext = {
+  get?(key: string): Promise<unknown>
+  set?(key: string, value: unknown): Promise<unknown>
+  remove?(key: string): Promise<unknown>
+}
+
+type SessionContext = {
+  create?(input?: { title?: string }): Promise<unknown>
+  get?(input: { sessionID: string }): Promise<unknown>
+  prompt?(input: Record<string, unknown>): Promise<unknown>
+  interrupt?(input: { sessionID: string; continue?: boolean }): Promise<unknown>
+  update?(input: { sessionID: string; title?: string }): Promise<unknown>
+  rename?(input: { sessionID: string; title: string }): Promise<unknown>
+  switchAgent?(input: { sessionID: string; agent: string }): Promise<unknown>
+  switchModel?(input: { sessionID: string; model: { providerID: string; id: string } }): Promise<unknown>
+}
+
+type ToolEditorLike = {
+  namespace?(input: { name: string; description: string }): void
+  add?(tool: ToolRegistration): void
+}
+
+type ToolContext = {
+  transform?(callback: (editor: ToolEditorLike) => void): Promise<unknown>
+}
+
+type ToolCallContext = { sessionID?: unknown }
+
+type ToolResult = { output: Record<string, unknown> }
+
+type ToolRegistration = {
+  name: string
+  description: string
+  input: Record<string, unknown>
+  output: Record<string, unknown>
+  options: { namespace: string; codemode: boolean }
+  execute: (input: Record<string, unknown>, context?: ToolCallContext) => Promise<ToolResult>
+}
+
+type PluginContext = {
+  options?: Record<string, unknown>
+  location?: { directory?: unknown; project?: { id?: unknown } }
+  storage?: StorageContext
+  session?: SessionContext
+  tool?: ToolContext
+}
+
+type PluginDefinition = {
+  id: string
+  setup: (ctx: PluginContext) => Promise<(() => void) | void>
+}
+
+export const TOOL_NAMESPACE = "schedules"
+
+/**
+ * One short line: the Code Mode catalog pays for this description on every model request.
+ */
+const TOOL_NAMESPACE_DESCRIPTION =
+  "Scheduled agent tasks: list cron jobs with their next/last run, or trigger one now."
+
+/** Log at most once per key — a broken scheduler stays quiet and inert. */
+const logged = new Set<string>()
+
+function emit(message: string): void {
+  const line = `${LOG_PREFIX} ${clip(message, LOG_LINE_MAX)}`
+  // stderr first: it is what an interactive `--print-logs` run shows.
+  console.error(line)
+  if (activeLogPath === undefined) return
+  try {
+    appendFileSync(activeLogPath, `${new Date().toISOString()} ${line}\n`)
+  } catch {
+    // A scheduler that cannot write its log must still run; say so once and move on.
+    if (!logged.has("log-write")) {
+      logged.add("log-write")
+      console.error(`${LOG_PREFIX} could not append to ${activeLogPath}`)
+    }
+  }
+}
+
+function logOnce(key: string, message: string): void {
+  if (logged.has(key)) return
+  logged.add(key)
+  emit(message)
+}
+
+function logLine(message: string): void {
+  emit(message)
+}
+
+function clip(text: string, max: number): string {
+  return text.length > max ? `${text.slice(0, max - 1)}…` : text
+}
+
+function dispose(registration: unknown): void {
+  const candidate = registration as { dispose?: unknown } | null
+  if (candidate !== null && typeof candidate.dispose === "function") {
+    void Promise.resolve((candidate.dispose as () => unknown).call(candidate)).catch(() => {})
+  }
+}
+
+async function storageGet(ctx: PluginContext, key: string): Promise<unknown> {
+  try {
+    return typeof ctx.storage?.get === "function" ? await ctx.storage.get(key) : undefined
+  } catch (error) {
+    logOnce("storage-get", `storage read failed (${error instanceof Error ? error.message : String(error)})`)
+    return undefined
+  }
+}
+
+async function storageSet(ctx: PluginContext, key: string, value: unknown): Promise<void> {
+  try {
+    if (typeof ctx.storage?.set === "function") await ctx.storage.set(key, value)
+  } catch (error) {
+    logOnce("storage-set", `storage write failed (${error instanceof Error ? error.message : String(error)})`)
+  }
+}
+
+function sessionIdOf(value: unknown): string | undefined {
+  if (typeof value === "string" && value.trim() !== "") return value.trim()
+  if (value !== null && typeof value === "object") {
+    const record = value as Record<string, unknown>
+    for (const key of ["id", "sessionID", "sessionId"]) {
+      const found = asString(record[key])
+      if (found !== undefined) return found
+    }
+  }
+  return undefined
+}
+
+// ---------------------------------------------------------------------------
+// The scheduler
+// ---------------------------------------------------------------------------
+
+type SchedulerState = {
+  jobs: JobDefinition[]
+  specs: Map<string, CronSpec>
+  states: JobStateMap
+  /** Session id per job, so runs accumulate context the way `opencode run -s` does. */
+  sessions: Map<string, string>
+  inFlight: Set<string>
+  fileError?: string
+  invalid: InvalidJob[]
+  storageAvailable: boolean
+}
+
+const NO_INPUT = { type: "object", properties: {}, additionalProperties: false }
+
+const LIST_OUTPUT = {
+  type: "object",
+  properties: {
+    jobs: { type: "array" },
+    invalid: { type: "array" },
+    error: { type: "string" },
+    leaseHeld: { type: "boolean" },
+    leaseForeign: { type: "boolean" },
+    tickMs: { type: "number" },
+  },
+}
+
+const RUN_OUTPUT = {
+  type: "object",
+  properties: { id: { type: "string" }, sessionID: { type: "string" }, admitted: { type: "string" } },
+}
+
+/** Read, validate and parse the job file; never throws. */
+function reloadJobs(ctx: PluginContext, directory: string, state: SchedulerState): void {
+  let payload: unknown
+  let failure: string | undefined
+  try {
+    payload = JSON.parse(readFileSync(join(directory, JOBS_FILE), "utf8"))
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code
+    failure = code === "ENOENT" ? `no ${JOBS_FILE}` : `${JOBS_FILE}: ${error instanceof Error ? error.message : String(error)}`
+  }
+
+  if (payload === undefined) {
+    // Last-known-good is retained; only the reported error changes.
+    state.fileError = failure
+    return
+  }
+
+  const loaded = loadJobs(payload)
+  const specs = new Map<string, CronSpec>()
+  for (const job of loaded.jobs) {
+    // validateJob already parsed this successfully; a failure here would be a bug, and
+    // dropping the job is safer than arming the loop with an unparsed schedule.
+    try {
+      specs.set(job.id, parseCron(job.schedule))
+    } catch {
+      /* unreachable: validateJob rejects exactly what parseCron rejects */
+    }
+  }
+
+  state.jobs = loaded.jobs
+  state.specs = specs
+  state.invalid = loaded.invalid
+  state.fileError = loaded.error ?? (failure !== undefined && loaded.jobs.length === 0 ? failure : undefined)
+}
+
+/** Resolve (creating on first use) the persistent session a job runs in. */
+async function sessionFor(ctx: PluginContext, state: SchedulerState, job: JobDefinition): Promise<string | undefined> {
+  const existing = state.sessions.get(job.id)
+  if (existing !== undefined) return existing
+  if (typeof ctx.session?.create !== "function") {
+    logOnce("no-session-create", "ctx.session.create is unavailable; runs cannot be dispatched")
+    return undefined
+  }
+  try {
+    const created = await ctx.session.create({ title: `scheduled: ${job.id}` })
+    const id = sessionIdOf(created)
+    if (id === undefined) return undefined
+    state.sessions.set(job.id, id)
+    return id
+  } catch (error) {
+    logOnce(`session-create-${job.id}`, `session create failed (${error instanceof Error ? error.message : String(error)})`)
+    return undefined
+  }
+}
+
+async function loadStates(ctx: PluginContext, state: SchedulerState): Promise<void> {
+  for (const job of state.jobs) {
+    const stored = await storageGet(ctx, `${STORAGE_PREFIX}${job.id}`)
+    state.states[job.id] = normalizeState(stored)
+  }
+}
+
+async function saveState(ctx: PluginContext, state: SchedulerState, jobId: string): Promise<void> {
+  await storageSet(ctx, `${STORAGE_PREFIX}${jobId}`, state.states[jobId])
+}
+
+/**
+ * Point the target session at the job's agent and model before dispatching.
+ *
+ * A job that names no model **inherits the session default**, which for an unattended
+ * recurring job is usually a paid model. That is why the resolved model is echoed in the
+ * `running` line: the log is where you see which model is being billed.
+ */
+async function applyJobTarget(ctx: PluginContext, job: JobDefinition, sessionID: string): Promise<string> {
+  if (job.agent !== undefined && typeof ctx.session?.switchAgent === "function") {
+    await ctx.session.switchAgent({ sessionID, agent: job.agent })
+  }
+  if (job.model !== undefined) {
+    if (typeof ctx.session?.switchModel === "function") {
+      await ctx.session.switchModel({ sessionID, model: job.model })
+    } else {
+      logOnce("no-switch-model", "ctx.session.switchModel is unavailable; the job runs on the session default")
+    }
+  }
+  return job.model === undefined ? "session default" : `${job.model.providerID}/${job.model.id}`
+}
+
+/**
+ * Run one job: admit the prompt, bound it by `runTimeoutMs`, record the outcome.
+ *
+ * A run never throws out of here: every failure is recorded on the job's state, which is
+ * what keeps invariant 3 (never breaks a session) true for the scheduling path too.
+ */
+async function runJob(ctx: PluginContext, state: SchedulerState, job: JobDefinition): Promise<void> {
+  const now = Date.now()
+  const record = state.states[job.id] ?? { version: STATE_VERSION }
+  record.leaseUntil = now + job.runTimeoutMs
+
+  try {
+    if (typeof ctx.session?.prompt !== "function") {
+      logOnce("no-prompt", "ctx.session.prompt is unavailable; the scheduler is inert")
+      return
+    }
+    const sessionID = await sessionFor(ctx, state, job)
+    if (sessionID === undefined) {
+      record.lastStatus = "failed"
+      record.lastError = "no session available for this job"
+      return
+    }
+    const model = await applyJobTarget(ctx, job, sessionID)
+
+    logLine(`running ${job.id} (schedule "${job.schedule}" ${job.timezone}, model ${model})`)
+
+    // `prompt` admits the turn; the run itself is bounded by the lease the tick refreshes.
+    await ctx.session.prompt({
+      sessionID,
+      text: job.prompt,
+      // Queue, so a run cannot interleave with a human typing into the same session.
+      delivery: "queue",
+    })
+    record.lastStatus = "ok"
+    record.lastError = undefined
+  } catch (error) {
+    record.lastStatus = "failed"
+    record.lastError = clip(error instanceof Error ? error.message : String(error), 500)
+    logLine(`job ${job.id} failed: ${record.lastError}`)
+  } finally {
+    record.leaseUntil = undefined
+    await saveState(ctx, state, job.id)
+  }
+}
+
+/** Evaluate every enabled job once. Re-entrancy is guarded by the caller. */
+async function tick(ctx: PluginContext, state: SchedulerState, lease: Lease, maxConcurrent: number): Promise<void> {
+  lease.heartbeat()
+
+  const now = Date.now()
+  const decisions: Array<Extract<TickDecision, { kind: "run" }>> = []
+
+  for (const job of state.jobs) {
+    if (!job.enabled) continue
+    const spec = state.specs.get(job.id)
+    if (spec === undefined) continue
+
+    const record = state.states[job.id] ?? { version: STATE_VERSION }
+    state.states[job.id] = record
+
+    // An abandoned lease (crashed run) is cleared so the job can fire again.
+    if (record.leaseUntil !== undefined && !isLeaseLive(record, now)) record.leaseUntil = undefined
+
+    const decision = resolveDue(
+      job,
+      spec,
+      record,
+      now,
+      isLeaseLive(record, now),
+      state.inFlight.size + decisions.length,
+      maxConcurrent,
+    )
+    if (decision === undefined) continue
+
+    if (decision.kind === "skip") {
+      const reason =
+        decision.suppression.reason === "in-flight"
+          ? "previous run still in flight"
+          : decision.suppression.reason === "concurrency"
+            ? `concurrency cap reached (${decision.suppression.running}/${maxConcurrent})`
+            : `backlog truncated, ${decision.suppression.dropped} occurrence(s) dropped`
+      logLine(`skipping ${job.id}: ${reason}`)
+      await saveState(ctx, state, job.id)
+      continue
+    }
+    decisions.push(decision)
+  }
+
+  for (const decision of decisions) {
+    state.inFlight.add(decision.job.id)
+    void runJob(ctx, state, decision.job)
+      .catch((error: unknown) => {
+        logOnce(`run-${decision.job.id}`, `run failed (${error instanceof Error ? error.message : String(error)})`)
+      })
+      .finally(() => {
+        state.inFlight.delete(decision.job.id)
+      })
+  }
+}
+
+function buildTools(ctx: PluginContext, state: SchedulerState, lease: Lease, tickMs: number): ToolRegistration[] {
+  return [
+    {
+      name: "list",
+      description: "List scheduled jobs with schedule, timezone, next/last run and last status. Pure read.",
+      input: NO_INPUT,
+      output: LIST_OUTPUT,
+      options: { namespace: TOOL_NAMESPACE, codemode: true },
+      execute: async () => ({
+        output: {
+          jobs: state.jobs.map((job) => {
+            const record = state.states[job.id] ?? { version: STATE_VERSION }
+            return {
+              id: job.id,
+              schedule: job.schedule,
+              timezone: job.timezone,
+              enabled: job.enabled,
+              misfire: job.misfire,
+              runTimeoutMs: job.runTimeoutMs,
+              agent: job.agent ?? null,
+              model:
+                job.model === undefined
+                  ? "session default"
+                  : `${job.model.providerID}/${job.model.id}`,
+              nextRun: record.nextRun === undefined ? null : new Date(record.nextRun).toISOString(),
+              lastRun: record.lastRun === undefined ? null : new Date(record.lastRun).toISOString(),
+              lastStatus: record.lastStatus ?? null,
+              lastError: record.lastError ?? null,
+              running: state.inFlight.has(job.id),
+            }
+          }),
+          invalid: state.invalid,
+          ...(state.fileError !== undefined ? { error: state.fileError } : {}),
+          leaseHeld: lease.held,
+          leaseForeign: lease.foreign,
+          tickMs,
+        },
+      }),
+    },
+    {
+      name: "run",
+      description: "Trigger one scheduled job now, obeying the same concurrency, timeout and lease rules.",
+      input: {
+        type: "object",
+        properties: { id: { type: "string", description: "Job id, as reported by schedules_list." } },
+        required: ["id"],
+        additionalProperties: false,
+      },
+      output: RUN_OUTPUT,
+      options: { namespace: TOOL_NAMESPACE, codemode: true },
+      execute: async (input) => {
+        const id = asString(input.id)
+        if (id === undefined) {
+          return { output: { error: "id is required" } }
+        }
+        const job = state.jobs.find((entry) => entry.id === id)
+        if (job === undefined) {
+          return { output: { error: `no job with id "${id}"`, ids: state.jobs.map((entry) => entry.id) } }
+        }
+        if (state.inFlight.has(job.id)) {
+          return { output: { id: job.id, error: "job is already running" } }
+        }
+        if (typeof ctx.session?.prompt !== "function") {
+          return { output: { id: job.id, error: "ctx.session.prompt is unavailable" } }
+        }
+        const sessionID = await sessionFor(ctx, state, job)
+        if (sessionID === undefined) {
+          return { output: { id: job.id, error: "no session available for this job" } }
+        }
+        const model = await applyJobTarget(ctx, job, sessionID)
+        try {
+          const admitted = await ctx.session.prompt({
+            sessionID,
+            text: job.prompt,
+            delivery: "queue",
+          })
+          logLine(`triggered ${job.id} on demand (model ${model})`)
+          return {
+            output: {
+              id: job.id,
+              sessionID,
+              admitted: sessionIdOf(admitted) ?? "",
+            },
+          }
+        } catch (error) {
+          return {
+            output: { id: job.id, error: clip(error instanceof Error ? error.message : String(error), 500) },
+          }
+        }
+      },
+    },
+  ]
+}
+
+// ---------------------------------------------------------------------------
+// V2 plugin definition
+// ---------------------------------------------------------------------------
+
+const definition: PluginDefinition = {
+  id: "scheduled-tasks",
+  async setup(ctx) {
+    const disposers: Array<() => void> = []
+    const directory = asString(ctx.location?.directory)
+
+    const state: SchedulerState = {
+      jobs: [],
+      specs: new Map(),
+      states: {},
+      sessions: new Map(),
+      inFlight: new Set(),
+      invalid: [],
+      storageAvailable: typeof ctx.storage?.get === "function",
+    }
+
+    // Options are read once, from the `plugins: [{ package, options }]` object form. The job
+    // file is what defines jobs; these only tune the engine.
+    const options = ctx.options ?? {}
+    const tickMs = boundedInt(options.tickMs, DEFAULT_TICK_MS, MIN_TICK_MS, 60 * MINUTE_MS)
+    const maxConcurrent = boundedInt(
+      options.maxConcurrentRuns,
+      DEFAULT_MAX_CONCURRENT_RUNS,
+      1,
+      8,
+    )
+
+    if (directory === undefined) {
+      logOnce("no-location", "ctx.location.directory is unavailable; the scheduler is inert")
+      return () => {}
+    }
+
+    // ADR 0003: a foreign lease leaves the plugin loaded and its tools readable, but the
+    // tick loop unarmed — a second server must not double-fire every job.
+    const projectID = asString(ctx.location?.project?.id) ?? directory
+    activeLogPath = logPath(directory, projectID)
+    const lease = acquireLease(leasePath(directory, projectID))
+    if (lease.foreign) {
+      logLine(`another OpenCode instance holds the writer lease at ${lease.path}; staying inert`)
+      if (directory !== undefined) reloadJobs(ctx, directory, state)
+      await loadStates(ctx, state)
+      registerTools(ctx, state, lease, tickMs)
+      return () => {}
+    }
+    if (!lease.held) {
+      logLine(`writer lease unavailable at ${lease.path}; running without arbitration`)
+    }
+
+    reloadJobs(ctx, directory, state)
+    await loadStates(ctx, state)
+
+    const registered = registerTools(ctx, state, lease, tickMs)
+    if (registered) disposers.push(registered)
+
+    if (state.jobs.some((job) => job.enabled)) {
+      let running = false
+      const interval = setInterval(() => {
+        // Never re-enter: a tick still in flight is skipped, not queued (spec 001).
+        if (running) return
+        running = true
+        void tick(ctx, state, lease, maxConcurrent)
+          .catch((error: unknown) => {
+            logOnce("tick", `tick failed (${error instanceof Error ? error.message : String(error)})`)
+          })
+          .finally(() => {
+            running = false
+          })
+      }, tickMs)
+      // Never hold the server process open just to poll a schedule.
+      interval.unref?.()
+      disposers.push(() => clearInterval(interval))
+    } else {
+      logLine(`no enabled jobs (${state.fileError ?? "empty job file"}); no timer armed`)
+    }
+
+    return () => {
+      for (const disposeOne of disposers.reverse()) {
+        try {
+          disposeOne()
+        } catch {
+          // Cleanup must never throw out of the plugin boundary.
+        }
+      }
+      lease.release()
+    }
+  },
+}
+
+/** Register `schedules_list` / `schedules_run`; returns a disposer, or undefined. */
+function registerTools(
+  ctx: PluginContext,
+  state: SchedulerState,
+  lease: Lease,
+  tickMs: number,
+): (() => void) | undefined {
+  try {
+    const transform = ctx.tool?.transform
+    if (typeof transform !== "function") {
+      logOnce("no-tools", "ctx.tool.transform is unavailable; no tools registered")
+      return undefined
+    }
+    let registration: unknown
+    const pending = transform((editor: ToolEditorLike) => {
+      editor.namespace?.({ name: TOOL_NAMESPACE, description: TOOL_NAMESPACE_DESCRIPTION })
+      for (const tool of buildTools(ctx, state, lease, tickMs)) editor.add?.(tool)
+    })
+    if (pending !== undefined && typeof (pending as Promise<unknown>).then === "function") {
+      void (pending as Promise<unknown>).then(
+        (value) => {
+          registration = value
+        },
+        (error: unknown) => {
+          logOnce("tools", `tool registration failed (${error instanceof Error ? error.message : String(error)})`)
+        },
+      )
+    }
+    return () => dispose(registration)
+  } catch (error) {
+    logOnce("tools", `tool registration failed (${error instanceof Error ? error.message : String(error)})`)
+    return undefined
+  }
+}
+
+export default definition

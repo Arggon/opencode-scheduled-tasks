@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "jobs": [
+    {
+      "id": "dogfood-smoke",
+      "schedule": "* * * * *",
+      "timezone": "Europe/Madrid",
+      "model": "opencode/space-bunny-free",
+      "prompt": "Reply with exactly: SCHEDULER-OK. Do not use any tools.",
+      "misfire": "skip",
+      "enabled": false
+    }
+  ]
+}

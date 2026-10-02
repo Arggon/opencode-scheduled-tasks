@@ -41,6 +41,7 @@ cron schedule inside a running OpenCode server.
       "timezone": "Europe/Madrid",      // IANA; default = server local zone
       "prompt": "Review the diff since the last tag for security issues.",
       "agent": "build",                 // optional; defaults to the session's agent
+      "model": "opencode/space-bunny-free", // optional; defaults to the session's model
       "enabled": true,                  // default true
       "misfire": "skip",                // "skip" (default) | "backfill"
       "maxCatchUp": 5,                  // backfill only; default 5
@@ -147,11 +148,22 @@ job set.**
 
 ### Observability — observability/debuggability
 
-- [ ] Every fire, skip, and error emits exactly one bounded line to the server log via
-      `console.error`, prefixed `scheduled-tasks:` and including the job id.
+- [ ] Every fire, skip, and error emits exactly one bounded line, prefixed `scheduled-tasks:`
+      and including the job id, to `stderr` **and** to
+      `~/.local/share/opencode/scheduled-tasks/<project>/scheduler.log`.
+      (Plugin `console.error` is **not** captured into OpenCode's own
+      `~/.local/share/opencode/log/opencode.log` — verified against ArggonManager's `[arggon]`
+      lines, which are equally absent — so stderr alone would make the scheduler unobservable.)
 - [ ] A repeated identical failure logs **once**, not once per tick.
 - [ ] `schedules_list` reports per job: `id`, `schedule`, `timezone`, `enabled`, `nextRun`,
       `lastRun`, `lastStatus`, `lastError`, and whether the lease is held elsewhere.
+- [ ] A job may name a `model` as `provider/model` (or `{ providerID, id }`); a malformed one
+      refuses the job with a named reason rather than dispatching on the wrong model.
+- [ ] The job's model is applied **before** the prompt is admitted, and the resolved model is
+      echoed in the `running` line, so a job that inherited an unintended (paid) model is
+      visible in the log instead of silent.
+- [ ] A job that names no model inherits the session default, and the log says
+      `model session default`.
 
 ### Security — security/threat model
 
