@@ -78,3 +78,15 @@ Ordering, with a fake host recording every call on one `schedules_run`:
 - No harness/smoke.ts coverage and no recorded end-to-end evidence for the ordering or the ask behaviour; the ordering evidence in this verdict comes from my own probe, not from anything committed. engineering.md § Smoke gate requires expected-vs-observed recorded **in the verdict** — which is what this is, but it should have been produced before merge.
 - ADR 0005 is still `status: Proposed` after the feature landed (engineering.md § ADR: `Proposed` in the PR, `Accepted` on merge). Same for 0006 and for v1's 0001-0003, so this is project-wide rather than T4-specific, but it should be swept.
 - `npm run typecheck` clean; 119/119 tests pass locally.
+
+### 2026-10-02 — provenance: the `"ask"`-as-deny box was untrue here, and is now true
+
+`bug-tool-boundary-throws-and-ask-not-recorded` (the M2 + B5 item filed from this verdict) resolved
+B5 by making the code carry what this box claims, rather than by amending the box. As of
+`6344ce4` the claim above was **false** — the ask report was a separate log line, and neither
+`HistoryEntry` nor `runJob`'s record kept any trace of it, so `schedules_history` could not answer
+"did this unattended run hit an ask?". Now `HistoryEntry` carries `asksAsDeny`, clipped to 16
+entries of 120 characters on both the write and the read side, the ask list is folded into the
+`running` log line the box names, and both halves are pinned by tests. The box is ticked and
+describes the shipped code; nothing else in this item was reopened, and this note is provenance
+only — `status` stays `done`.
