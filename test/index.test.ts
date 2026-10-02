@@ -1,7 +1,7 @@
 import { describe, expect, it, beforeEach, afterEach, vi } from "vitest"
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync, existsSync } from "node:fs"
 import { tmpdir } from "node:os"
-import { join } from "node:path"
+import { dirname, join } from "node:path"
 import { spawnSync } from "node:child_process"
 
 import plugin, {
@@ -50,6 +50,7 @@ import plugin, {
   MAX_LOOP_CAP,
   MAX_ONEOFF_CAP,
   MAX_EPHEMERAL_HISTORY_KEYS,
+  openRunLease,
   type HistoryEntry,
   type JobDefinition,
   type JobState,
@@ -1134,14 +1135,24 @@ describe("run history (T3)", () => {
     let cleanup: () => void = typeof resolved === "function" ? resolved : () => {}
     try {
       const run = added.find((tool) => tool.name === "run")!
+      const before = Date.now()
       await (run.execute as (i: Record<string, unknown>) => Promise<unknown>)({ id: "j" })
-      // The scheduled path records history; the on-demand path does not. Drive the
-      // recorded path directly by checking the persisted shape after a scheduled run is
-      // covered by the harness, so here assert the store key exists and is well-formed.
       cleanup()
       const keys = [...store.keys()].filter((k) => k.includes("history"))
-      // No scheduled run happened, so nothing should be stored yet.
-      expect(keys).toEqual([])
+
+      // An on-demand run records in the same ring a scheduled one writes, under the job's own
+      // history key. This asserted the opposite — "no scheduled run happened, so nothing should be
+      // stored yet" — and that *was* the defect (bug-schedules-run-not-bounded-capped-or-leased,
+      // acceptance box 3): a run that costs a model call and leaves no record behind is a run
+      // nobody can account for, and `schedules_run` promised the same rules a scheduled run obeys.
+      expect(keys).toEqual(["scheduled-tasks/history/j"])
+      const stored = store.get("scheduled-tasks/history/j") as Array<Record<string, unknown>>
+      expect(stored).toHaveLength(1)
+      expect(stored[0]).toMatchObject({ outcome: "ok", model: "session default", sessionID: "ses_1" })
+      // Stamped at dispatch: both fields are real instants of this run, neither absent.
+      expect(typeof stored[0]!.dueAt).toBe("number")
+      expect(typeof stored[0]!.startedAt).toBe("number")
+      expect(stored[0]!.startedAt as number).toBeGreaterThanOrEqual(before)
     } finally {
       cleanup?.()
       rmSync(dir, { recursive: true, force: true })
@@ -4964,5 +4975,773 @@ describe("the tool boundary and the ask-as-deny report (bug-tool-boundary-throws
     const triggered = h.logged().filter((line) => line.includes("triggered guarded"))
     expect(triggered).toHaveLength(1)
     expect(triggered[0]).toContain("asks as deny: edit")
+    // …and the record says so too, not only the line: a manual run lands in the job's own history
+    // ring, so `schedules_history` answers for it exactly as it answers for a scheduled run.
+    expect(h.stored("guarded")).toMatchObject([{ outcome: "ok", asksAsDeny: ["edit"] }])
   })
+})
+
+// =====================================================================
+// The manual trigger is bounded, capped and leased
+// (bug-schedules-run-not-bounded-capped-or-leased)
+//
+// The tool's own description promised "the same concurrency, timeout and lease rules" while
+// the code honoured none of the three: it checked whether *that job* was running (which is not
+// the cap), never joined `inFlight`, awaited `ctx.session.prompt` unbounded, and took no
+// lease. Each block below names one of the three, and the last asserts the sentence itself.
+//
+// Fake timers throughout, and deliberately so: `runTimeout` is floored at one minute, so a
+// hung run is only observable by delivering the bound timer itself. That is what makes the
+// timeout test *fail* rather than hang when the bound is removed.
+// =====================================================================
+describe("schedules_run is bounded, capped and leased (bug-schedules-run-not-bounded-capped-or-leased)", () => {
+  const PROJECT = "manual"
+
+  let dir: string
+  let restoreEnv: string | undefined
+  let consoleLines: string[]
+  let realConsoleError: typeof console.error
+  const outstanding: Array<() => void> = []
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "st-manual-"))
+    mkdirSync(join(dir, ".opencode"), { recursive: true })
+    restoreEnv = process.env[DATA_DIR_ENV]
+    process.env[DATA_DIR_ENV] = join(dir, "state")
+    realConsoleError = console.error
+    consoleLines = []
+    console.error = (...args: unknown[]): void => void consoleLines.push(args.map(String).join(" "))
+  })
+
+  afterEach(() => {
+    for (const dispose of outstanding.splice(0).reverse()) {
+      try {
+        dispose()
+      } catch {
+        /* a failing teardown must not mask the assertion before it */
+      }
+    }
+    console.error = realConsoleError
+    if (restoreEnv === undefined) delete process.env[DATA_DIR_ENV]
+    else process.env[DATA_DIR_ENV] = restoreEnv
+    rmSync(dir, { recursive: true, force: true })
+    vi.useRealTimers()
+  })
+
+  type Runs = Array<Record<string, unknown>>
+
+  type ManualTool = {
+    description: string
+    execute: (input: Record<string, unknown>) => Promise<{ output: Record<string, unknown> }>
+  }
+
+  type Manual = {
+    tool: (name: string) => ManualTool
+    prompts: Record<string, unknown>[]
+    interrupts: Record<string, unknown>[]
+    store: Map<string, unknown>
+    /** A job's stored run records — the same ring a scheduled run writes. */
+    history: (id: string) => Runs | undefined
+    jobState: (id: string) => Record<string, unknown> | undefined
+    list: () => Promise<Record<string, unknown>>
+    logged: () => string[]
+    /** Let a hung prompt settle, so nothing is left pending into the next test. */
+    release: () => void
+  }
+
+  /**
+   * A plugin whose named prompt never resolves, with a clock the test controls.
+   *
+   * The hang is named rather than global because "a hung manual run must not starve scheduled
+   * work" is only observable if the scheduled work actually runs — which is the whole point of
+   * the cap tests below.
+   */
+  async function manual(
+    options: {
+      jobs?: unknown[]
+      seed?: Record<string, unknown>
+      pluginOptions?: Record<string, unknown>
+      projectID?: string
+      /** The one prompt text that never resolves; every other prompt resolves at once. */
+      hangPrompt?: string
+      /** Withhold `session.interrupt`, as a host without the cancel primitive would be. */
+      interrupt?: boolean
+    } = {},
+  ): Promise<Manual> {
+    const store = new Map<string, unknown>(Object.entries(options.seed ?? {}))
+    if (options.jobs !== undefined) {
+      writeFileSync(
+        join(dir, ".opencode", "schedules.json"),
+        JSON.stringify({ version: 1, jobs: options.jobs }),
+      )
+    }
+    const prompts: Record<string, unknown>[] = []
+    const interrupts: Record<string, unknown>[] = []
+    let openTheGate: () => void = () => {}
+    const gate = new Promise<void>((resolve) => void (openTheGate = resolve))
+    const tools: Array<Record<string, unknown>> = []
+    const ctx: Record<string, unknown> = {
+      ...(options.pluginOptions === undefined ? {} : { options: options.pluginOptions }),
+      location: { directory: dir, project: { id: options.projectID ?? PROJECT } },
+      storage: {
+        get: async (key: string) => store.get(key),
+        set: async (key: string, value: unknown) => void store.set(key, value),
+        remove: async (key: string) => void store.delete(key),
+      },
+      session: {
+        create: async () => ({ id: "ses_manual" }),
+        prompt: async (input: Record<string, unknown>) => {
+          prompts.push(input)
+          if (options.hangPrompt !== undefined && input.text === options.hangPrompt) await gate
+          return { id: `inbox_${prompts.length}` }
+        },
+        ...(options.interrupt === false
+          ? {}
+          : {
+              interrupt: async (input: Record<string, unknown>) => {
+                interrupts.push(input)
+                return { interrupted: true }
+              },
+            }),
+      },
+      tool: {
+        transform: async (cb: (editor: { add?: (t: unknown) => void }) => void) => {
+          cb({ add: (t) => void tools.push(t as Record<string, unknown>) })
+          return { dispose() {} }
+        },
+      },
+    }
+    const resolved = await plugin.setup(ctx as never)
+    outstanding.push(() => {
+      ;(resolved as () => void)?.()
+      openTheGate()
+    })
+    return {
+      prompts,
+      interrupts,
+      store,
+      tool: (name) => {
+        const found = tools.find((entry) => entry.name === name) as unknown as ManualTool | undefined
+        if (found === undefined) throw new Error(`tool ${name} was not registered`)
+        return found
+      },
+      history: (id) => store.get(`scheduled-tasks/history/${id}`) as Runs | undefined,
+      jobState: (id) => store.get(`scheduled-tasks/${id}`) as Record<string, unknown> | undefined,
+      list: async () => (await (tools.find((e) => e.name === "list") as ManualTool).execute({})).output,
+      logged: () => [...consoleLines],
+      release: openTheGate,
+    }
+  }
+
+  /** A `* * * * *` job already owed an occurrence, so one tick decides it. */
+  const dueJob = (id: string, prompt: string, over: Record<string, unknown> = {}): Record<string, unknown> => ({
+    id,
+    schedule: "* * * * *",
+    timezone: "UTC",
+    prompt,
+    ...over,
+  })
+
+  const seeded = (start: number, ...ids: string[]): Record<string, unknown> =>
+    Object.fromEntries(ids.map((id) => [`scheduled-tasks/${id}`, { version: STATE_VERSION, lastRun: start - 5 * MINUTE_MS }]))
+
+  const countOf = (harness: Manual, text: string): number =>
+    harness.prompts.filter((entry) => entry.text === text).length
+
+  /**
+   * One job's entry from `schedules_list`, by id.
+   *
+   * `toMatchObject([…])` against the whole array would pin the job count too, which is not what any
+   * assertion below is about — and a failure would then read as a diff of every field of every
+   * job rather than as "this job's `running` flag was wrong".
+   */
+  async function listed(harness: Manual, id: string): Promise<Record<string, unknown>> {
+    const jobs = (await harness.list()).jobs as Array<Record<string, unknown>>
+    const found = jobs.find((entry) => entry.id === id)
+    if (found === undefined) throw new Error(`schedules_list did not report a job with id ${id}`)
+    return found
+  }
+
+  /** Advance the injected clock until `predicate` holds, or give up after `budgetMs`. */
+  async function advanceUntil(predicate: () => boolean, budgetMs: number, stepMs = MIN_TICK_MS): Promise<boolean> {
+    for (let elapsed = 0; elapsed <= budgetMs; elapsed += stepMs) {
+      if (predicate()) return true
+      await vi.advanceTimersByTimeAsync(stepMs)
+    }
+    return predicate()
+  }
+
+  // -------------------------------------------------------------------
+  // The bound — acceptance box 1.
+  // -------------------------------------------------------------------
+
+  it(
+    "bounds a hung manual trigger at the job's runTimeout and records the timeout",
+    async () => {
+      // The scenario the description promised and the code never delivered. `runTimeout` is
+      // floored at one minute, so this runs on an injected clock: `advanceTimersByTimeAsync`
+      // delivers the bound timer, which is what makes this test *fail* rather than hang when the
+      // bound is absent. Pre-fix the tool awaited `prompt` with no timer at all, so nothing was
+      // delivered, `interrupts` stayed empty and the run never ended.
+      vi.useFakeTimers()
+      try {
+        const start = Date.now()
+        vi.setSystemTime(start)
+        const h = await manual({
+          hangPrompt: "never resolves",
+          jobs: [{ id: "hung", schedule: "@daily", prompt: "never resolves", runTimeout: "1m" }],
+          pluginOptions: { tickMs: MIN_TICK_MS, maxConcurrentRuns: 1 },
+        })
+
+        // The trigger is awaited the way a caller awaits it, so this test would hang rather than
+        // pass if the bound were not enforced. It is fired without awaiting so the clock can be
+        // advanced underneath it.
+        let settled: { output: Record<string, unknown> } | undefined
+        const triggered = h
+          .tool("run")
+          .execute({ id: "hung" })
+          .then((value) => void (settled = value))
+        await vi.advanceTimersByTimeAsync(0)
+        expect(countOf(h, "never resolves")).toBe(1)
+        expect(settled).toBeUndefined()
+
+        // Short of the bound: nothing recorded, nothing stopped, and the slot is still held.
+        await vi.advanceTimersByTimeAsync(MINUTE_MS - MIN_TICK_MS)
+        expect(h.history("hung")).toBeUndefined()
+        expect(h.interrupts).toEqual([])
+        expect(await listed(h, "hung")).toMatchObject({ running: true })
+        expect(countOf(h, "never resolves")).toBe(1)
+
+        // The bound. `advanceTimersByTimeAsync` flushes the microtask queue, so the returned value
+        // is observable without any extra settling.
+        await vi.advanceTimersByTimeAsync(2 * MIN_TICK_MS)
+        await triggered
+        // The tool call itself came back, bounded — the thing a caller is actually waiting on.
+        expect(settled).toBeDefined()
+        expect(settled!.output).toMatchObject({ id: "hung" })
+        expect(String(settled!.output.error)).toMatch(/exceeded runTimeout 1m/)
+
+        // Recorded as the `timeout` outcome no manual path ever produced before, in the job's own
+        // history ring — the same one a scheduled run writes.
+        expect(h.history("hung")).toMatchObject([
+          { outcome: "timeout", sessionID: "ses_manual", model: "session default" },
+        ])
+        expect(String(h.history("hung")![0]!.error)).toMatch(/exceeded runTimeout 1m/)
+        expect(String(h.history("hung")![0]!.error)).toMatch(/interrupted/)
+        expect(h.interrupts).toEqual([{ sessionID: "ses_manual" }])
+
+        // The slot is free again, so a hung manual run cannot latch `maxConcurrentRuns` for the
+        // life of the process — the anti-starvation half.
+        expect(await listed(h, "hung")).toMatchObject({ running: false })
+      } finally {
+        vi.useRealTimers()
+      }
+    },
+    20_000,
+  )
+
+  it(
+    "says it abandoned the run when the host offers no way to interrupt it",
+    async () => {
+      // Honesty over convenience, and the same two-clause rule a scheduled overrun records: with
+      // no cancel primitive the await is abandoned, not stopped.
+      vi.useFakeTimers()
+      try {
+        const start = Date.now()
+        vi.setSystemTime(start)
+        const h = await manual({
+          hangPrompt: "never resolves",
+          interrupt: false,
+          jobs: [{ id: "hung", schedule: "@daily", prompt: "never resolves", runTimeout: "1m" }],
+          pluginOptions: { tickMs: MIN_TICK_MS, maxConcurrentRuns: 1 },
+        })
+
+        let settled: { output: Record<string, unknown> } | undefined
+        const triggered = h
+          .tool("run")
+          .execute({ id: "hung" })
+          .then((value) => void (settled = value))
+        await vi.advanceTimersByTimeAsync(0)
+        await vi.advanceTimersByTimeAsync(MINUTE_MS + MIN_TICK_MS)
+        await triggered
+
+        expect(settled).toBeDefined()
+        expect(String(settled!.output.error)).toMatch(/abandoned/)
+        expect(String(settled!.output.error)).not.toMatch(/was interrupted/)
+        expect(h.history("hung")![0]).toMatchObject({ outcome: "timeout" })
+        expect(String(h.history("hung")![0]!.error)).toMatch(/interrupt is unavailable/)
+        // Bounded all the same, so the slot is released without a cancel primitive existing.
+        expect(await listed(h, "hung")).toMatchObject({ running: false })
+      } finally {
+        vi.useRealTimers()
+      }
+    },
+    20_000,
+  )
+
+  // -------------------------------------------------------------------
+  // The cap — acceptance box 2.
+  // -------------------------------------------------------------------
+
+  it(
+    "refuses a manual trigger while the shared budget is spent, and says so in the result",
+    async () => {
+      // The half that was never there at all. Pre-fix the tool checked only
+      // `inFlight.has(job.id)` — whether *this* job was running — so it admitted a trigger
+      // alongside a scheduled run and blew `maxConcurrentRuns: 1` without noticing. Two jobs, one
+      // slot, the slot already taken by a hung scheduled run: the manual trigger must be refused,
+      // and must say why, because the caller here is a person who asked for a run.
+      vi.useFakeTimers()
+      try {
+        const start = Date.now()
+        vi.setSystemTime(start)
+        const h = await manual({
+          hangPrompt: "never resolves",
+          jobs: [
+            dueJob("hung", "never resolves", { runTimeout: "1m" }),
+            { id: "other", schedule: "@daily", prompt: "the other prompt" },
+          ],
+          seed: seeded(start, "hung"),
+          pluginOptions: { tickMs: MIN_TICK_MS, maxConcurrentRuns: 1 },
+        })
+
+        await vi.advanceTimersByTimeAsync(0)
+        expect(countOf(h, "never resolves")).toBe(1)
+        // The scheduled run really holds the only slot, which is what the refusal below rests on.
+        expect(await listed(h, "hung")).toMatchObject({ running: true })
+
+        const out = await h.tool("run").execute({ id: "other" })
+
+        // Said in the result, not silently declined.
+        expect(out.output).toMatchObject({ id: "other" })
+        expect(String(out.output.error)).toMatch(/concurrency cap 1 reached/)
+        // And the refusal cost no prompt: the cap held.
+        expect(countOf(h, "the other prompt")).toBe(0)
+        // Recorded as skipped, so `schedules_history` explains the trigger that did not run.
+        expect(h.history("other")).toMatchObject([{ outcome: "skipped" }])
+        expect(String(h.history("other")![0]!.error)).toMatch(/concurrency cap 1 reached/)
+        expect(h.logged().filter((line) => line.includes("skipping on-demand trigger of other"))).toHaveLength(1)
+        // The hung job still holds its own slot — the refusal did not evict it.
+        expect(await listed(h, "hung")).toMatchObject({ running: true })
+      } finally {
+        vi.useRealTimers()
+      }
+    },
+    20_000,
+  )
+
+  it(
+    "holds its slot for the whole manual run, so a scheduled run cannot start alongside it",
+    async () => {
+      // The other direction of the cap, and the half that needs the `inFlight` *registration*
+      // rather than the check. One slot, taken by a hung manual run, and a scheduled job that comes
+      // due while it is held: the scheduled run must be refused and recorded, not admitted
+      // alongside. The check alone cannot do this — it asks whether *its own* job is running — so
+      // this is the assertion that distinguishes the two halves of cap participation.
+      vi.useFakeTimers()
+      try {
+        const start = Date.now()
+        vi.setSystemTime(start)
+        const h = await manual({
+          hangPrompt: "the manual prompt",
+          jobs: [
+            dueJob("scheduled", "the scheduled prompt"),
+            // A ten-minute bound, not the default: `advanceUntil` below has to walk the injected
+            // clock to the next minute boundary, which can be almost a full minute away and
+            // overshoots by a tick. A one-minute bound would then expire *inside the observation
+            // window* on roughly one run in six, and the test would be reporting the bound rather
+            // than the cap. The bound has its own tests; this one is about the slot.
+            { id: "manual", schedule: "@daily", prompt: "the manual prompt", runTimeout: "10m" },
+          ],
+          // `lastRun: start` on purpose: the scheduled job is *not* due at the trigger, so the
+          // only thing that can stop it is the slot the manual run is holding.
+          seed: { "scheduled-tasks/scheduled": { version: STATE_VERSION, lastRun: start } },
+          pluginOptions: { tickMs: MIN_TICK_MS, maxConcurrentRuns: 1 },
+        })
+
+        await vi.advanceTimersByTimeAsync(0)
+        expect(countOf(h, "the scheduled prompt")).toBe(0)
+
+        let settled: { output: Record<string, unknown> } | undefined
+        const triggered = h
+          .tool("run")
+          .execute({ id: "manual" })
+          .then((value) => void (settled = value))
+        await vi.advanceTimersByTimeAsync(0)
+        expect(countOf(h, "the manual prompt")).toBe(1)
+        // Registered: the tool's own list view says the job is running, and that flag is read from
+        // the same `inFlight` set `tick` measures its shared budget from.
+        expect(await listed(h, "manual")).toMatchObject({ running: true })
+
+        // The scheduled job comes due on the next minute boundary, with the only slot held.
+        expect(
+          await advanceUntil(() => h.logged().some((line) => line.includes("skipping scheduled")), 2 * MINUTE_MS),
+        ).toBe(true)
+        const skips = h.logged().filter((line) => line.includes("skipping scheduled"))
+        for (const line of skips) expect(line).toContain("concurrency cap reached (1/1)")
+        // Never admitted alongside: one prompt total for the scheduled job, and the manual one
+        // still the only run in flight.
+        expect(countOf(h, "the scheduled prompt")).toBe(0)
+        expect(countOf(h, "the manual prompt")).toBe(1)
+
+        // Release the manual run so nothing is left pending, and confirm the tool call returns.
+        h.release()
+        await vi.advanceTimersByTimeAsync(0)
+        await triggered
+        expect(settled).toMatchObject({ output: { id: "manual" } })
+        expect(settled!.output.error).toBeUndefined()
+      } finally {
+        vi.useRealTimers()
+      }
+    },
+    20_000,
+  )
+
+  it(
+    "gives the slot back on every path, so a manual trigger cannot starve the schedule",
+    async () => {
+      // The release half, and it is the one a starvation bug would hide in. Four exits: the normal
+      // one, the bound, a throwing host, and a trigger that never dispatches at all (no session).
+      // Each is followed by a second trigger that must be admitted, so "released" is observed
+      // through the cap rather than through an in-memory flag.
+      vi.useFakeTimers()
+      try {
+        const start = Date.now()
+        vi.setSystemTime(start)
+        const h = await manual({
+          hangPrompt: "never resolves",
+          jobs: [
+            { id: "first", schedule: "@daily", prompt: "never resolves", runTimeout: "1m" },
+            { id: "second", schedule: "@daily", prompt: "the second prompt" },
+          ],
+          pluginOptions: { tickMs: MIN_TICK_MS, maxConcurrentRuns: 1 },
+        })
+
+        // Normal exit: the slot comes back, so the next trigger is admitted.
+        const ok = await h.tool("run").execute({ id: "second" })
+        expect(ok.output).toMatchObject({ id: "second" })
+        expect(await listed(h, "second")).toMatchObject({ running: false })
+
+        // Bound exit: a hung run gives the slot up at `runTimeoutMs`, so the schedule is not
+        // starved by it for the life of the process.
+        let settled: { output: Record<string, unknown> } | undefined
+        const triggered = h
+          .tool("run")
+          .execute({ id: "first" })
+          .then((value) => void (settled = value))
+        await vi.advanceTimersByTimeAsync(0)
+        expect(await listed(h, "first")).toMatchObject({ running: true })
+        await vi.advanceTimersByTimeAsync(MINUTE_MS + MIN_TICK_MS)
+        await triggered
+        expect(settled).toBeDefined()
+        expect(await listed(h, "first")).toMatchObject({ running: false })
+
+        // And the slot is genuinely reusable, not merely unreported.
+        const after = await h.tool("run").execute({ id: "second" })
+        expect(after.output.error).toBeUndefined()
+        expect(countOf(h, "the second prompt")).toBe(2)
+      } finally {
+        vi.useRealTimers()
+      }
+    },
+    20_000,
+  )
+
+  // -------------------------------------------------------------------
+  // The lease — acceptance box 4.
+  // -------------------------------------------------------------------
+
+  it(
+    "keeps the job's run lease live for a manual run, so no tick re-admits it",
+    async () => {
+      // The job-scoped lease, which is the half that keeps a second prompt out of a session whose
+      // turn is still going. `maxConcurrentRuns: 2` with a single job is the sharp version: one run
+      // holds one of two slots, so the cap provably cannot refuse the next occurrence and only the
+      // lease can. Asserted through the skip *reason*, which is the one place the two signals are
+      // distinguishable.
+      vi.useFakeTimers()
+      try {
+        const real = Date.now()
+        // Parked 45s into a minute with a three-minute bound, so the run spans three re-decisions
+        // at 15s, 75s and 135s. Cron is minute-resolution, so three boundaries means three genuine
+        // chances to observe the lease rather than one chance at a lucky offset.
+        const start = real - (real % MINUTE_MS) + 45_000
+        vi.setSystemTime(start)
+        const h = await manual({
+          hangPrompt: "slow run",
+          jobs: [dueJob("slow", "slow run", { runTimeout: "3m" })],
+          // `lastRun: start`, not `start - 5m`: the job owes nothing at the trigger, so the first
+          // occurrence falls *inside* the manual run. Seeding a backlog instead would put a
+          // scheduled run in flight first and make the manual run the second prompt, which tests
+          // the wrong thing — the lease has to be the reason the occurrence inside the run is
+          // refused, and that is only visible if the occurrence is the first thing the tick meets.
+          seed: { "scheduled-tasks/slow": { version: STATE_VERSION, lastRun: start } },
+          pluginOptions: { tickMs: MIN_TICK_MS, maxConcurrentRuns: 2 },
+        })
+
+        await vi.advanceTimersByTimeAsync(0)
+        expect(countOf(h, "slow run")).toBe(0)
+
+        let settled: { output: Record<string, unknown> } | undefined
+        const triggered = h
+          .tool("run")
+          .execute({ id: "slow" })
+          .then((value) => void (settled = value))
+        await vi.advanceTimersByTimeAsync(0)
+        expect(countOf(h, "slow run")).toBe(1)
+
+        // Every re-decision strictly inside the manual run: the job comes due at 15s, 75s and 135s.
+        await vi.advanceTimersByTimeAsync(3 * MINUTE_MS - MIN_TICK_MS)
+        const skips = h.logged().filter((line) => line.includes("skipping slow"))
+        expect(skips.length).toBeGreaterThan(0)
+        for (const line of skips) expect(line).toContain("previous run still in flight")
+        // Never a second prompt into the busy session, and never a cap refusal either — which is
+        // what makes this the *lease* rather than the cap.
+        expect(countOf(h, "slow run")).toBe(1)
+        expect(h.logged().some((line) => line.includes("concurrency cap reached"))).toBe(false)
+
+        h.release()
+        await vi.advanceTimersByTimeAsync(0)
+        await triggered
+        expect(settled).toBeDefined()
+      } finally {
+        vi.useRealTimers()
+      }
+    },
+    20_000,
+  )
+
+  it(
+    "drops the run lease when the trigger ends, so the job is not suppressed afterwards",
+    async () => {
+      // The other half of the lease, and the one that bites: a lease left armed would keep
+      // `isRunOutstanding` true after the run is over and suppress every future occurrence of a
+      // job nobody is running. This is why `openRunLease` clears the interval *and* the marker in
+      // one idempotent closer.
+      vi.useFakeTimers()
+      try {
+        const start = Date.now()
+        vi.setSystemTime(start)
+        const h = await manual({
+          jobs: [dueJob("quick", "the quick prompt")],
+          seed: seeded(start, "quick"),
+          pluginOptions: { tickMs: MIN_TICK_MS, maxConcurrentRuns: 2 },
+        })
+
+        await vi.advanceTimersByTimeAsync(0)
+        const out = await h.tool("run").execute({ id: "quick" })
+        expect(out.output).toMatchObject({ id: "quick" })
+        expect(h.history("quick")).toMatchObject([{ outcome: "ok" }, { outcome: "ok" }])
+
+        // Well past the bound, so any surviving renewal interval would have fired several times.
+        await vi.advanceTimersByTimeAsync(30 * MINUTE_MS)
+
+        // The job is schedulable again: neither a lease nor a slot outlived the run.
+        expect(await listed(h, "quick")).toMatchObject({ running: false })
+        expect(h.logged().some((line) => line.includes("previous run still in flight"))).toBe(false)
+      } finally {
+        vi.useRealTimers()
+      }
+    },
+    20_000,
+  )
+
+  it(
+    "refuses a manual trigger while another instance holds the writer lease",
+    async () => {
+      // The cross-process half (ADR 0003), and the reason the description had to stop saying
+      // "lease rules" without a position: the writer lease is taken by the *tick*, and pre-fix a
+      // manual trigger was served from a process that does not hold it — a second writer writing
+      // to the same job's state, which is precisely what the lock exists to prevent.
+      const foreignPath = leasePath(dir, `${PROJECT}-foreign`)
+      mkdirSync(join(foreignPath, ".."), { recursive: true })
+      writeFileSync(foreignPath, JSON.stringify({ pid: process.pid + 1, heartbeat: Date.now() }))
+      try {
+        const h = await manual({
+          projectID: `${PROJECT}-foreign`,
+          jobs: [dueJob("other", "the other prompt")],
+          seed: seeded(Date.now(), "other"),
+          pluginOptions: { tickMs: MIN_TICK_MS, maxConcurrentRuns: 1 },
+        })
+
+        // Reported as foreign, so the state the refusal rests on is observable rather than implied.
+        const listing = await h.list()
+        expect(listing.leaseForeign).toBe(true)
+        expect(listing.leaseHeld).toBe(false)
+        // The job is still listed: a refusal is not a disappearance.
+        expect((listing.jobs as Array<Record<string, unknown>>)[0]).toMatchObject({ id: "other" })
+
+        const out = await h.tool("run").execute({ id: "other" })
+
+        expect(out.output).toMatchObject({ id: "other" })
+        expect(String(out.output.error)).toMatch(/writer lease/)
+        expect(String(out.output.error)).toContain(foreignPath)
+        expect(h.prompts).toEqual([])
+        // No record either: nothing ran, so there is no run to record. (A refusal is not a run.)
+        expect(h.history("other")).toBeUndefined()
+      } finally {
+        rmSync(foreignPath, { force: true })
+      }
+    },
+    20_000,
+  )
+
+  it("still dispatches when the lease directory is unusable, which is not the same as foreign", async () => {
+    // The degradation ADR 0003 chose over disabling the scheduler: if the lock directory cannot be
+    // created, the instance runs *without* arbitration rather than refusing every run. Gating the
+    // tool on `held` instead of `foreign` would silently convert that degradation into a dead
+    // trigger — a manual run nobody could start by hand, in a project whose jobs still fire.
+    const blocker = join(dir, "blocker")
+    writeFileSync(blocker, "x")
+    // mkdir of `<blocker>/<project>/writer.lock` fails because `blocker` is a file, so
+    // `acquireLease` degrades to `held: false, foreign: false`.
+    const store = new Map<string, unknown>()
+    const prompts: Record<string, unknown>[] = []
+    const tools: Array<Record<string, unknown>> = []
+    const previous = process.env[DATA_DIR_ENV]
+    process.env[DATA_DIR_ENV] = blocker
+    try {
+      writeFileSync(
+        join(dir, ".opencode", "schedules.json"),
+        JSON.stringify({ version: 1, jobs: [{ id: "j", schedule: "@daily", prompt: "p" }] }),
+      )
+      const resolved = await plugin.setup({
+        location: { directory: dir, project: { id: PROJECT } },
+        storage: {
+          get: async (k: string) => store.get(k),
+          set: async (k: string, v: unknown) => void store.set(k, v),
+          remove: async (k: string) => void store.delete(k),
+        },
+        session: {
+          create: async () => ({ id: "ses_manual" }),
+          prompt: async (input: Record<string, unknown>) => {
+            prompts.push(input)
+            return { id: "inbox_1" }
+          },
+        },
+        tool: {
+          transform: async (cb: (editor: { add?: (t: unknown) => void }) => void) => {
+            cb({ add: (t) => void tools.push(t as Record<string, unknown>) })
+            return { dispose() {} }
+          },
+        },
+      } as never)
+      outstanding.push(() => void (resolved as () => void)?.())
+
+      const listing = await (tools.find((e) => e.name === "list") as ManualTool).execute({})
+      expect(listing.output).toMatchObject({ leaseHeld: false, leaseForeign: false })
+
+      const out = await (tools.find((e) => e.name === "run") as ManualTool).execute({ id: "j" })
+      expect(out.output.error).toBeUndefined()
+      expect(prompts).toHaveLength(1)
+    } finally {
+      if (previous === undefined) delete process.env[DATA_DIR_ENV]
+      else process.env[DATA_DIR_ENV] = previous
+    }
+  })
+
+  it("takes the run lease, renews it inside the window, and gives it back exactly once", async () => {
+    // The lease rule on its own, pinned without a clock, because the two in-flight signals are
+    // deliberately redundant (see the timeout suite's note): in the scheduler they cannot be told
+    // apart, so the lease's own contract is asserted against the helper directly.
+    vi.useFakeTimers()
+    try {
+      const start = Date.now()
+      vi.setSystemTime(start)
+      const record: JobState = { version: STATE_VERSION }
+      const close = openRunLease(record, MINUTE_MS)
+
+      // Taken at `now + runTimeoutMs`, the same window `isLeaseLive` reads.
+      expect(record.leaseUntil).toBe(start + MINUTE_MS)
+      expect(isLeaseLive(record, start + 1)).toBe(true)
+
+      // Renewed on the `leaseRenewalMs` schedule, and the renewal outlasts the run's own bound.
+      await vi.advanceTimersByTimeAsync(leaseRenewalMs(MINUTE_MS))
+      expect(record.leaseUntil).toBeGreaterThan(start + MINUTE_MS)
+
+      // Given back on close…
+      close()
+      expect(record.leaseUntil).toBeUndefined()
+      expect(isLeaseLive(record, start)).toBe(false)
+
+      // …and an armed renewal cannot outlive it, which is what would suppress every future
+      // occurrence of a job nobody is running.
+      const after = record.leaseUntil
+      await vi.advanceTimersByTimeAsync(4 * MINUTE_MS)
+      expect(record.leaseUntil).toBe(after)
+      // Idempotent, because it is called from a `finally` that may run on any path.
+      expect(() => close()).not.toThrow()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  // -------------------------------------------------------------------
+  // The description — acceptance boxes 5 and 6.
+  // -------------------------------------------------------------------
+
+  it("states in its own description only what the code enforces", async () => {
+    // The sentence is not decoration: it is the text a model reads when deciding how to call the
+    // tool, so a clause the code does not keep is how a caller comes to rely on a bound that is not
+    // there. Pinned here on each mechanism by name, so a future edit that keeps the promise and
+    // drops the enforcement — or the reverse — fails loudly in one place.
+    const h = await manual({ jobs: [{ id: "j", schedule: "@daily", prompt: "p" }] })
+    const description = h.tool("run").description
+
+    // Concurrency.
+    expect(description).toMatch(/maxConcurrentRuns/)
+    // The bound, and the primitive that enforces it.
+    expect(description).toMatch(/runTimeout/)
+    expect(description).toMatch(/interrupt/)
+    // Both halves of the lease: the cross-process writer lease and the per-job run lease.
+    expect(description).toMatch(/writer lease/)
+    // The record, so "the same rules" includes being visible afterwards.
+    expect(description).toMatch(/history/)
+    // And it no longer promises the rules without saying what they do — the old wording claimed
+    // three properties in six words and named none of the mechanisms.
+    expect(description.length).toBeGreaterThan(100)
+  })
+
+  it("reports the outcome of every manual run, so a caller is never told 'ok' for a run that timed out", async () => {
+    // The shape of the tool's answer, across all four exits. `error` is the refusal/failure channel
+    // and its absence is the success signal, so an exit that failed silently would look like a
+    // success to the caller.
+    vi.useFakeTimers()
+    try {
+      const start = Date.now()
+      vi.setSystemTime(start)
+      const h = await manual({
+        hangPrompt: "never resolves",
+        jobs: [
+          { id: "a", schedule: "@daily", prompt: "never resolves", runTimeout: "1m" },
+          { id: "b", schedule: "@daily", prompt: "the b prompt" },
+        ],
+        pluginOptions: { tickMs: MIN_TICK_MS, maxConcurrentRuns: 1 },
+      })
+
+      // Unknown id and missing id: still typed failures.
+      expect((await h.tool("run").execute({ id: "nope" })).output.error).toMatch(/no job with id/)
+      expect((await h.tool("run").execute({})).output.error).toMatch(/id is required/)
+
+      // Success: no error, and the admitted id the caller asked for.
+      const ok = await h.tool("run").execute({ id: "b" })
+      expect(ok.output.error).toBeUndefined()
+      expect(ok.output).toMatchObject({ id: "b", sessionID: "ses_manual", admitted: "inbox_1" })
+      expect(h.history("b")).toMatchObject([{ outcome: "ok" }])
+
+      // Timeout: an error, and never a bare success.
+      let settled: { output: Record<string, unknown> } | undefined
+      const triggered = h
+        .tool("run")
+        .execute({ id: "a" })
+        .then((value) => void (settled = value))
+      await vi.advanceTimersByTimeAsync(0)
+      await vi.advanceTimersByTimeAsync(MINUTE_MS + MIN_TICK_MS)
+      await triggered
+      expect(String(settled!.output.error)).toMatch(/exceeded runTimeout 1m/)
+      expect(h.history("a")).toMatchObject([{ outcome: "timeout" }])
+    } finally {
+      vi.useRealTimers()
+    }
+  }, 20_000)
 })
