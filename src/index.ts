@@ -18,6 +18,13 @@
  * therefore a pure predicate (`hasWork`) applied by one holder (`arm`) that setup, the
  * ephemeral tools and the end of every tick all call, rather than a decision made once.
  *
+ * **What a post goes through.** Every dispatch — recurring job, one-off, session loop —
+ * takes the same `applyJobTarget` path, is recorded in the same bounded run history, and
+ * spends from one per-tick concurrency budget. A loop posts into a **human's live session**,
+ * which is a tighter requirement than a background job rather than a looser one; what it may
+ * not do is switch that session's model or replace its permission rules, so a loop declares
+ * no target of its own and the shared path resolves — and reports — the session's own.
+ *
  * **Dependencies.** There is exactly one, and it is optional *at import time* (ADR 0004):
  * `yaml`, reached only through a guarded dynamic import that runs only when a markdown job
  * file exists. With no `.opencode/tasks/` directory this file imports nothing but `node:`
@@ -2089,11 +2096,40 @@ async function loadAllLoops(ctx: PluginContext, state: SchedulerState): Promise<
   }
 }
 
-async function saveLoops(ctx: PluginContext, loops: readonly SessionLoop[]): Promise<void> {
+async function saveLoops(ctx: PluginContext, sessionID: string, loops: readonly SessionLoop[]): Promise<void> {
   // A loop belongs to one session, so the key is that session's: a loop can never outlive
   // the session that asked for it, and a dead session's loops are simply unreachable.
-  const first = loops[0]
-  if (first !== undefined) await storageSet(ctx, `${LOOP_PREFIX}${first.sessionID}`, loops)
+  //
+  // The id comes from the **caller** — the session token `schedules_start_loop` /
+  // `schedules_stop_loop` already validated — never from the record being saved. That is
+  // what lets an *emptied* set be persisted at all: deriving the key from the first loop
+  // meant an empty set had no key, so a stop was never written and the next `start_loop`
+  // read the stale record back and resurrected the stopped loops (bug-loop-stop-does-not-
+  // persist-and-concurrency-bypass). The scoping property is unchanged — still exactly one
+  // key per session id, still re-derived on load.
+  const key = `${LOOP_PREFIX}${sessionID}`
+  if (loops.length > 0) {
+    await storageSet(ctx, key, loops)
+    return
+  }
+  // Stopping the last loop must leave a *persistent* "nothing here", not a silent no-op.
+  await storageRemove(ctx, key)
+}
+
+/**
+ * This session's loops, read from storage the first time they are needed.
+ *
+ * `Map.has`, deliberately, and not `loops.length > 0`: an empty list is the real, loaded
+ * answer after `stop_loop` (and after every loop expires), and treating empty as "not
+ * loaded yet" is what made a later `start_loop` re-read a stale record. The in-memory entry
+ * is written back so the storage read happens at most once per session.
+ */
+async function loopsFor(ctx: PluginContext, state: SchedulerState, sessionID: string): Promise<SessionLoop[]> {
+  const known = state.loops.get(sessionID)
+  if (known !== undefined) return known
+  const loaded = await loadLoops(ctx, sessionID)
+  state.loops.set(sessionID, loaded)
+  return loaded
 }
 
 // ---------------------------------------------------------------------------
@@ -2238,6 +2274,28 @@ async function storageSet(ctx: PluginContext, key: string, value: unknown): Prom
 }
 
 /**
+ * Record that a key holds **nothing**, rather than leaving whatever it held in place.
+ *
+ * Deleting is the honest form, but it is not universal: `remove` is optional on the plugin
+ * storage surface, exactly like `set`. So a host that cannot delete gets an explicit empty
+ * record, which reads back as "nothing here" through the same normalizer. Either way the
+ * answer survives a restart — which is the whole point, because the alternative (writing
+ * nothing and treating *absent* as *empty*) let a stopped loop resurrect from its own
+ * stale record.
+ */
+async function storageRemove(ctx: PluginContext, key: string): Promise<void> {
+  try {
+    if (typeof ctx.storage?.remove === "function") {
+      await ctx.storage.remove(key)
+      return
+    }
+  } catch (error) {
+    logOnce("storage-remove", `storage delete failed (${error instanceof Error ? error.message : String(error)}); writing an empty record instead`)
+  }
+  await storageSet(ctx, key, [])
+}
+
+/**
  * A runtime-provided session id, accepted only when it looks like an opaque token.
  *
  * A loop is scoped by this, so an odd or hostile value must not become a storage key.
@@ -2276,6 +2334,11 @@ type SchedulerState = {
   oneOffs: OneOffTask[]
   /** In-session loops, keyed by the owning session id. */
   loops: Map<string, SessionLoop[]>
+  /**
+   * Ids with a run outstanding — a job's run or a loop's post — so the concurrency cap is
+   * global rather than per-kind. Ids are namespaced by construction (`oneoff_*`, `loop_*` vs
+   * a file-defined job id), so the two sets cannot collide in practice.
+   */
   inFlight: Set<string>
   fileError?: string
   invalid: InvalidJob[]
@@ -2546,6 +2609,100 @@ async function runOneOff(
 }
 
 /**
+ * Record one loop post against the bounded run history, exactly as a job run and a one-off
+ * are recorded: due instant, start, outcome, resolved model, bounded error.
+ *
+ * A loop used to be invisible here — it posted and nothing said so. Every run is billable,
+ * and a loop is a *recurring* billable run into a live session, so "what did this loop do
+ * last" has to have the same answer "what did this job do last" does.
+ */
+async function recordLoopRun(
+  ctx: PluginContext,
+  state: SchedulerState,
+  loop: SessionLoop,
+  sessionID: string,
+  dueAt: number,
+  outcome: RunStatus,
+  model: string,
+  error?: string,
+): Promise<void> {
+  state.history.set(
+    loop.id,
+    pushHistory(state.history.get(loop.id) ?? [], {
+      dueAt,
+      startedAt: Date.now(),
+      outcome,
+      model,
+      sessionID,
+      ...(error !== undefined ? { error } : {}),
+    }),
+  )
+  await saveHistory(ctx, state, loop.id)
+}
+
+/**
+ * Post one due loop into the session that owns it.
+ *
+ * Goes through `applyJobTarget` for the same reason a one-off does: an ephemeral path that
+ * skips the target path is a loophole. What that means *here* is narrower than for a job,
+ * and deliberately so — a loop posts into the **live session a human is using**, so it must
+ * not switch that session's model or agent and must not replace its permission rules.
+ * `SessionLoop` carries no `agent`, `model` or `permissions`, so the shared call applies
+ * nothing and only *resolves and reports* what the session will spend. When the two paths
+ * ever diverge, this is the one place that would have to change — which is the point of
+ * sharing it rather than open-coding a `prompt` call here.
+ *
+ * Never throws out of here (invariant 3): the failure is recorded and the loop lives on.
+ */
+async function postLoop(
+  ctx: PluginContext,
+  state: SchedulerState,
+  loop: SessionLoop,
+  sessionID: string,
+  dueAt: number,
+): Promise<void> {
+  if (typeof ctx.session?.prompt !== "function") {
+    logOnce("no-prompt", "ctx.session.prompt is unavailable; session loops cannot post")
+    await recordLoopRun(ctx, state, loop, sessionID, dueAt, "failed", "unknown", "ctx.session.prompt is unavailable")
+    return
+  }
+
+  let outcome: RunStatus = "failed"
+  let model = "unknown"
+  try {
+    model = await applyJobTarget(ctx, loop, sessionID)
+    logLine(
+      `loop ${loop.id} posting into its own session (every ${Math.round(loop.intervalMs / MINUTE_MS)}m, model ${model})`,
+    )
+    // Queue, so a loop cannot interleave with a human typing into the same session.
+    await ctx.session.prompt({ sessionID, text: loop.prompt, delivery: "queue" })
+    outcome = "ok"
+  } catch (error) {
+    const message = clip(error instanceof Error ? error.message : String(error), 300)
+    logLine(`loop ${loop.id} failed: ${message}`)
+    await recordLoopRun(ctx, state, loop, sessionID, dueAt, "failed", model, message)
+    return
+  }
+  await recordLoopRun(ctx, state, loop, sessionID, dueAt, outcome, model)
+}
+
+/**
+ * A loop's lifetime as a short, honest label for the log.
+ *
+ * The expiry line used to say "expired after 3 days" whatever `ttl` the caller asked for,
+ * which is only true when they did not ask for one. The actual granted lifetime is the
+ * difference between `expiresAt` and `createdAt`, so that is what is stated.
+ */
+function loopLifetime(loop: SessionLoop): string {
+  const ms = Math.max(0, loop.expiresAt - loop.createdAt)
+  // Largest whole unit that fits, so the line reads like the `ttl` the caller wrote.
+  if (ms >= 24 * 60 * MINUTE_MS) return `${Math.round(ms / (24 * 60 * MINUTE_MS))}d`
+  if (ms >= 60 * MINUTE_MS) return `${Math.round(ms / (60 * MINUTE_MS))}h`
+  if (ms >= MINUTE_MS) return `${Math.round(ms / MINUTE_MS)}m`
+  return `${Math.round(ms / 1000)}s`
+}
+
+/**
  * Point the target session at the job's agent and model before dispatching.
  *
  * A job that names no model **inherits the session default**, which for an unattended
@@ -2711,40 +2868,82 @@ async function tick(ctx: PluginContext, state: SchedulerState, lease: Lease, max
     decisions.push(decision)
   }
 
+  // One slot counter for the whole tick, so the three drains below share a single budget:
+  // recurring decisions, loop posts and one-offs each consume from it. Reading it only in the
+  // job loop is what let 3 due loops post in one tick under `maxConcurrentRuns: 1`.
+  let claimed = state.inFlight.size + decisions.length
+
   // Loops fire only into the session that owns them, and never outlive that session.
   for (const [sessionID, loops] of state.loops) {
     if (loops.length === 0) continue
     const surviving: SessionLoop[] = []
+    let dirty = false
     for (const loop of loops) {
       if (loop.expiresAt <= now) {
-        logLine(`loop ${loop.id} expired after 3 days and was disabled`)
+        logLine(`loop ${loop.id} expired after ${loopLifetime(loop)} and was disabled`)
+        // Persisted, not just dropped from memory: an expiry that survives in memory but not
+        // in storage comes back whole after a restart, which is how a stopped loop kept
+        // posting.
+        dirty = true
         continue
       }
       surviving.push(loop)
       if (loop.nextRunAt > now) continue
+
+      // A due loop is a billable model request into someone's live session — a *tighter*
+      // requirement than a background job, not a looser one — so it goes through the same
+      // admission as everything else. The occurrence is consumed either way; the difference
+      // is recorded, never queued, exactly like a due one-off below.
+      const dueAt = loop.nextRunAt
       // Re-arm first: a crash must not double-post on the next tick.
       loop.nextRunAt = now + loop.intervalMs
-      if (typeof ctx.session?.prompt === "function") {
-        logLine(`loop ${loop.id} posting into its own session (every ${Math.round(loop.intervalMs / MINUTE_MS)}m)`)
-        void ctx.session
-          .prompt({ sessionID, text: loop.prompt, delivery: "queue" })
-          .catch((error: unknown) => {
-            logOnce(`loop-${loop.id}`, `post failed (${error instanceof Error ? error.message : String(error)})`)
-          })
+      dirty = true
+
+      if (claimed >= maxConcurrent) {
+        logLine(`skipping loop ${loop.id}: concurrency cap reached (${claimed}/${maxConcurrent})`)
+        await recordLoopRun(
+          ctx,
+          state,
+          loop,
+          sessionID,
+          dueAt,
+          "skipped",
+          "session default",
+          `no free run slot: concurrency cap ${maxConcurrent} reached`,
+        )
+        continue
       }
+
+      claimed += 1
+      // In flight for the rest of the tick, exactly as a job run is: a second loop due in the
+      // same session must see the slot taken rather than double-posting into one session.
+      state.inFlight.add(loop.id)
+      void postLoop(ctx, state, loop, sessionID, dueAt)
+        .catch((error: unknown) => {
+          logOnce(`loop-${loop.id}`, `post failed (${error instanceof Error ? error.message : String(error)})`)
+        })
+        .finally(() => {
+          state.inFlight.delete(loop.id)
+        })
     }
-    if (surviving.length !== loops.length) {
+    if (dirty) {
       state.loops.set(sessionID, surviving)
-      await saveLoops(ctx, surviving)
+      // `nextRunAt` moves on every post, so this write is what stops a loop from replaying
+      // the same occurrence after a restart.
+      await saveLoops(ctx, sessionID, surviving)
     }
   }
 
   // One-offs are drained after recurring jobs so a one-off never starves a schedule.
   const due = state.oneOffs.filter((task) => task.dueAt <= now)
   if (due.length > 0) {
-    const free = Math.max(0, maxConcurrent - state.inFlight.size - decisions.length)
-    const claimed = due.slice(0, free)
+    // The same shared budget the loop drain spent from: a tick that already spent its slots
+    // on jobs and loop posts has none left, and recomputing `state.inFlight.size` here would
+    // hand out a second full budget in the same tick.
+    const free = Math.max(0, maxConcurrent - claimed)
+    const admitted = due.slice(0, free)
     const skipped = due.slice(free)
+    claimed += admitted.length
 
     if (skipped.length > 0) {
       // **Skipped and recorded, never queued** (spec 001 § concurrency, ADR 0002) — the same
@@ -2778,7 +2977,7 @@ async function tick(ctx: PluginContext, state: SchedulerState, lease: Lease, max
     state.oneOffs = state.oneOffs.filter((task) => !dueIds.has(task.id))
     await saveOneOffs(ctx, state.oneOffs)
 
-    for (const task of claimed) {
+    for (const task of admitted) {
       const entry = task.id
       void runOneOff(ctx, state, task).then(async (outcome) => {
         // A completed one-off survives only in history, then is gone (ADR 0006).
@@ -2918,8 +3117,11 @@ function buildTools(
         // Restore this session's loops from storage FIRST, so a loop survives a reload and
         // so the cap is measured against what actually exists rather than against an empty
         // in-memory map. Checking the cap before restoring silently overwrote stored loops.
-        const existing = state.loops.get(sessionID) ?? []
-        const restored = existing.length > 0 ? existing : await loadLoops(ctx, sessionID)
+        //
+        // "Loaded" means `Map.has`, not "non-empty": after `stop_loop` the stored answer for
+        // this session is an empty list, and reading it as "not loaded yet" is what brought
+        // stopped loops back from the stale record.
+        const restored = await loopsFor(ctx, state, sessionID)
         if (restored.length >= DEFAULT_LOOP_CAP) {
           return {
             output: {
@@ -2937,7 +3139,7 @@ function buildTools(
           nextRunAt: now + validated.task.intervalMs,
         }
         state.loops.set(sessionID, [...restored, loop])
-        await saveLoops(ctx, state.loops.get(sessionID)!)
+        await saveLoops(ctx, sessionID, state.loops.get(sessionID)!)
         // The first loop in a project with no jobs is the *only* thing that makes the tick
         // worth running, and this call happens long after `setup` decided there was nothing
         // to do. Re-decide rather than asking for a reload.
@@ -2968,11 +3170,13 @@ function buildTools(
         if (sessionID === undefined) {
           return { output: { error: "no calling session" } }
         }
-        const existing = state.loops.get(sessionID) ?? (await loadLoops(ctx, sessionID))
+        const existing = await loopsFor(ctx, state, sessionID)
         const id = asString(input.id)
         if (id === undefined) {
           state.loops.set(sessionID, [])
-          await saveLoops(ctx, [])
+          // Persisted, not just emptied in memory: this is the write whose absence let a
+          // later `start_loop` read the stale record and resurrect every stopped loop.
+          await saveLoops(ctx, sessionID, [])
           // Removing work can empty a project, and an empty project owes the writer lease back
           // rather than polling for the rest of the process's life.
           arm()
@@ -2990,7 +3194,7 @@ function buildTools(
         }
         const remaining = existing.filter((loop) => loop.id !== id)
         state.loops.set(sessionID, remaining)
-        await saveLoops(ctx, remaining)
+        await saveLoops(ctx, sessionID, remaining)
         arm()
         logLine(`stopped loop ${id}`)
         return {
