@@ -17,6 +17,7 @@ import plugin, {
   leaseRenewalMs,
   loadJobs,
   loadMarkdownJobs,
+  logPath,
   mergeJobSources,
   setYamlReader,
   splitFrontmatter,
@@ -4674,5 +4675,294 @@ describe("ephemeral history is readable and bounded (bug-oneoff-history-unreadab
     // …and at least the length of the run before the clock now. A completion stamp lands exactly
     // on "now", so this is the assertion that separates the two.
     expect(startedAt).toBeLessThanOrEqual(Date.now() - 30_000)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// bug-tool-boundary-throws-and-ask-not-recorded
+//
+// Two defects, one theme: what a run does is only true if it is *recorded*.
+// M2 — the tool boundary let a host rejection escape uncaught. B5 — the
+// ask-as-deny report existed only as a log line nobody could read back.
+// ---------------------------------------------------------------------------
+
+describe("the tool boundary and the ask-as-deny report (bug-tool-boundary-throws-and-ask-not-recorded)", () => {
+  const PROJECT = "boundary"
+
+  let dir: string
+  let restoreEnv: string | undefined
+  let consoleLines: string[]
+  let realConsoleError: typeof console.error
+  const outstanding: Array<() => void> = []
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "st-boundary-"))
+    mkdirSync(join(dir, ".opencode"), { recursive: true })
+    restoreEnv = process.env[DATA_DIR_ENV]
+    process.env[DATA_DIR_ENV] = join(dir, "state")
+    realConsoleError = console.error
+    consoleLines = []
+    console.error = (...args: unknown[]): void => void consoleLines.push(args.map(String).join(" "))
+  })
+
+  afterEach(() => {
+    for (const dispose of outstanding.splice(0).reverse()) {
+      try {
+        dispose()
+      } catch {
+        /* a failing teardown must not mask the assertion before it */
+      }
+    }
+    console.error = realConsoleError
+    if (restoreEnv === undefined) delete process.env[DATA_DIR_ENV]
+    else process.env[DATA_DIR_ENV] = restoreEnv
+    rmSync(dir, { recursive: true, force: true })
+    vi.useRealTimers()
+  })
+
+  type BoundaryTool = {
+    execute: (input: Record<string, unknown>) => Promise<{ output: Record<string, unknown> }>
+  }
+
+  type Runs = Array<Record<string, unknown>>
+
+  type Boundary = {
+    tool: (name: string) => BoundaryTool
+    prompts: Record<string, unknown>[]
+    /** Every line the plugin logged this test, as a user sees them on stderr. */
+    logged: () => string[]
+    /** The per-project `scheduler.log`, read the way a user reads it. */
+    logFile: () => string
+    /** A job's stored run records, in the shape `pushHistory` wrote them. */
+    stored: (id: string) => Runs | undefined
+  }
+
+  /**
+   * A plugin over a store, a prompt surface and a `permission.rules` that can be made to reject.
+   *
+   * `rulesError` is the whole of M2: `permission.rules` is the one host promise T4 added to the
+   * dispatch path, and a host is free to reject it. Everything else is the ordinary shape the
+   * rest of the suite uses.
+   */
+  async function boundary(
+    options: {
+      jobs?: unknown[]
+      seed?: Record<string, unknown>
+      /** Make `ctx.permission.rules` reject with this message. */
+      rulesError?: string
+      pluginOptions?: Record<string, unknown>
+    } = {},
+  ): Promise<Boundary> {
+    const rulesError = options.rulesError
+    const store = new Map<string, unknown>(Object.entries(options.seed ?? {}))
+    if (options.jobs !== undefined) {
+      writeFileSync(join(dir, ".opencode", "schedules.json"), JSON.stringify({ version: 1, jobs: options.jobs }))
+    }
+    const tools: Array<Record<string, unknown>> = []
+    const prompts: Record<string, unknown>[] = []
+    const ctx: Record<string, unknown> = {
+      ...(options.pluginOptions === undefined ? {} : { options: options.pluginOptions }),
+      location: { directory: dir, project: { id: PROJECT } },
+      storage: {
+        get: async (key: string) => store.get(key),
+        set: async (key: string, value: unknown) => void store.set(key, value),
+        remove: async (key: string) => void store.delete(key),
+      },
+      session: {
+        create: async () => ({ id: "ses_boundary" }),
+        prompt: async (input: Record<string, unknown>) => {
+          prompts.push(input)
+          return { id: `inbox_${prompts.length}` }
+        },
+      },
+      permission: {
+        rules: async () => {
+          if (rulesError !== undefined) throw new Error(rulesError)
+        },
+      },
+      tool: {
+        transform: async (cb: (editor: { add?: (t: unknown) => void }) => void) => {
+          cb({ add: (t) => void tools.push(t as Record<string, unknown>) })
+          return { dispose() {} }
+        },
+      },
+    }
+    const resolved = await plugin.setup(ctx as never)
+    outstanding.push(() => void (resolved as () => void)?.())
+    return {
+      prompts,
+      tool: (name: string): BoundaryTool => {
+        const found = tools.find((entry) => entry.name === name)
+        if (found === undefined) throw new Error(`tool ${name} was not registered`)
+        return found as unknown as BoundaryTool
+      },
+      logged: () => [...consoleLines],
+      logFile: (): string => {
+        const path = logPath(dir, PROJECT)
+        expect(existsSync(path)).toBe(true)
+        return readFileSync(path, "utf8")
+      },
+      stored: (id: string) => store.get(`scheduled-tasks/history/${id}`) as Runs | undefined,
+    }
+  }
+
+  /** A job due every minute and already owed an occurrence, so one tick decides it. */
+  const dueJob = (id: string, prompt: string, over: Record<string, unknown> = {}): Record<string, unknown> => ({
+    id,
+    schedule: "* * * * *",
+    timezone: "UTC",
+    prompt,
+    ...over,
+  })
+
+  const seeded = (start: number, ...ids: string[]): Record<string, unknown> =>
+    Object.fromEntries(ids.map((id) => [`scheduled-tasks/${id}`, { version: STATE_VERSION, lastRun: start - 5 * MINUTE_MS }]))
+
+  /** One run record in the shape `pushHistory` writes — typed, so the write-side clip is callable. */
+  const entry = (over: Partial<HistoryEntry> = {}): HistoryEntry => ({
+    dueAt: 1_000,
+    startedAt: 1_000,
+    outcome: "ok",
+    model: "opencode/space-bunny-free",
+    ...over,
+  })
+
+  /** An ask list no real job produces: more entries than the cap, each far longer than a cap. */
+  const oversizedAsks = (): string[] =>
+    Array.from({ length: 200 }, (_, n) => `action-${n}-${"x".repeat(4_000)}`)
+
+  /** Flush pending microtasks and 0/1ms timers on the injected clock, as a run is `void`-dispatched. */
+  async function settle(turns = 20): Promise<void> {
+    for (let n = 0; n < turns; n += 1) await vi.advanceTimersByTimeAsync(1)
+  }
+
+  // -------------------------------------------------------------------
+  // M2 — nothing throws out of the tool.
+  // -------------------------------------------------------------------
+
+  it("turns a rejecting permission.rules into an error result, a logged line and no prompt", async () => {
+    const h = await boundary({
+      jobs: [{ id: "guarded", schedule: "@daily", prompt: "p", permissions: { edit: "deny" } }],
+      rulesError: "permission backend exploded",
+    })
+
+    // Calling it directly is the assertion: pre-fix `applyJobTarget` was awaited *above* the
+    // try, so this rejected out of the tool (invariant 3 broken) instead of returning. A
+    // `resolves`/`rejects` matcher would read the same way, so the call is left bare to keep the
+    // raw rejection in the failure message.
+    const out = await h.tool("run").execute({ id: "guarded" })
+
+    // A normal typed result, naming what the host said — the shape every other tool returns.
+    expect(out.output).toMatchObject({ id: "guarded", error: "permission backend exploded" })
+    // The turn never started: rules that could not be applied must not admit a prompt.
+    expect(h.prompts).toHaveLength(0)
+    // Logged, exactly once, as a failure of *this* dispatch. A dispatch that fails with no log
+    // line is indistinguishable from an idle job, which is what the per-project log exists to
+    // prevent — and the reviewer's repro recorded zero log lines.
+    const failures = h.logged().filter((line) => line.includes("permission backend exploded"))
+    expect(failures).toHaveLength(1)
+    expect(failures[0]).toContain("trigger of guarded failed")
+    // …in the file a user actually reads, not only on stderr.
+    expect(h.logFile()).toContain("trigger of guarded failed: permission backend exploded")
+  })
+
+  it("still dispatches normally when the rules apply, so the boundary catches failures and not the job", async () => {
+    const h = await boundary({
+      jobs: [{ id: "guarded", schedule: "@daily", prompt: "the prompt", permissions: { edit: "deny" } }],
+    })
+
+    const out = await h.tool("run").execute({ id: "guarded" })
+
+    expect(out.output).toMatchObject({ id: "guarded", sessionID: "ses_boundary", admitted: "inbox_1" })
+    expect(out.output.error).toBeUndefined()
+    expect(h.prompts).toHaveLength(1)
+    expect(h.logged().filter((line) => line.includes("failed"))).toEqual([])
+  })
+
+  // -------------------------------------------------------------------
+  // B5 — the ask-as-deny report is in the record, not only in the log.
+  // -------------------------------------------------------------------
+
+  it("records the asks a run turned into denies, and states them in its own running line", async () => {
+    vi.useFakeTimers()
+    const start = Date.now()
+    vi.setSystemTime(start)
+    const h = await boundary({
+      jobs: [
+        // `bash: *` is `allow`, so only the action-level `edit: ask` is downgraded: the report has
+        // to name what actually became a deny, not every rule the job declared.
+        dueJob("asks", "the guarded prompt", { permissions: { edit: "ask", bash: { "*": "allow" } } }),
+        dueJob("plain", "the unguarded prompt"),
+      ],
+      seed: seeded(start, "asks", "plain"),
+      pluginOptions: { tickMs: MIN_TICK_MS, maxConcurrentRuns: 4 },
+    })
+
+    await vi.advanceTimersByTimeAsync(0)
+    await settle()
+    expect(h.prompts).toHaveLength(2)
+
+    // The record: readable back through the tool, which is the point. `schedules_list`'s
+    // `askAsDeny` answers "what *would* deny"; only the record answers "what *did*".
+    const guarded = (await h.tool("history").execute({ id: "asks" })).output.runs as Runs
+    expect(guarded).toHaveLength(1)
+    expect(guarded[0]).toMatchObject({ outcome: "ok", asksAsDeny: ["edit"] })
+    // …and it is what reached storage, so it survives a restart rather than living in memory.
+    expect(h.stored("asks")).toMatchObject([{ outcome: "ok", asksAsDeny: ["edit"] }])
+
+    // The `running` line the box names: the asks are folded into the run's own line, so the log
+    // and the record it is written from cannot describe different runs.
+    const running = h.logged().filter((line) => line.includes("running asks"))
+    expect(running).toHaveLength(1)
+    expect(running[0]).toContain("asks as deny: edit")
+    expect(h.logFile()).toContain("asks as deny: edit")
+
+    // A run with nothing downgraded carries no field at all, rather than an empty list: absence
+    // is the answer to "was anything downgraded here", and an empty array would say it twice.
+    const unguarded = (await h.tool("history").execute({ id: "plain" })).output.runs as Runs
+    expect(unguarded).toHaveLength(1)
+    expect(unguarded[0]).toMatchObject({ outcome: "ok" })
+    expect(unguarded[0]).not.toHaveProperty("asksAsDeny")
+  })
+
+  it("clips an ask list no real job produces — cardinality and length alike, on both sides", async () => {
+    // Write side first, and pinned on its own: this is what bounds what ever reaches storage.
+    const wroteList = pushHistory([], entry({ asksAsDeny: oversizedAsks() }))[0]!.asksAsDeny as string[]
+    expect(wroteList).toHaveLength(16)
+    for (const ask of wroteList) expect(ask.length).toBe(120)
+    // An empty or malformed list is dropped, not stored: `clipAsks` cannot *remove* a key, so
+    // this is the assertion that the entry destructures the field out before rebuilding.
+    expect(pushHistory([], entry({ asksAsDeny: [] }))[0]).not.toHaveProperty("asksAsDeny")
+    expect(pushHistory([], { ...entry(), asksAsDeny: "edit" } as unknown as HistoryEntry)[0]).not.toHaveProperty(
+      "asksAsDeny",
+    )
+
+    // Read side: a stored record can be hand-edited or written by a build with no bounds at
+    // all, so the clip has to exist here too and to agree with the one above.
+    vi.useFakeTimers()
+    vi.setSystemTime(Date.now())
+    const h = await boundary({
+      jobs: [{ id: "clipped", schedule: "@daily", prompt: "p" }],
+      seed: { "scheduled-tasks/history/clipped": [entry({ asksAsDeny: oversizedAsks() })] },
+    })
+
+    const runs = (await h.tool("history").execute({ id: "clipped" })).output.runs as Runs
+    expect(runs).toHaveLength(1)
+    const asks = runs[0]!.asksAsDeny as string[]
+    expect(asks).toHaveLength(16)
+    for (const ask of asks) expect(ask.length).toBe(120)
+  })
+
+  it("reports an ask downgraded on an on-demand trigger, which is queued like any other run", async () => {
+    const h = await boundary({
+      jobs: [{ id: "guarded", schedule: "@daily", prompt: "p", permissions: { edit: "ask" } }],
+    })
+
+    const out = await h.tool("run").execute({ id: "guarded" })
+
+    expect(out.output).toMatchObject({ id: "guarded", sessionID: "ses_boundary" })
+    const triggered = h.logged().filter((line) => line.includes("triggered guarded"))
+    expect(triggered).toHaveLength(1)
+    expect(triggered[0]).toContain("asks as deny: edit")
   })
 })

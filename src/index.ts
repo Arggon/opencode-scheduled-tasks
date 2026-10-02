@@ -733,6 +733,15 @@ export type HistoryEntry = {
   model: string
   /** Session the run used; omitted when none was available. */
   sessionID?: string
+  /**
+   * The `"ask"` rules this run silently turned into denies, as `action` or `action:resource`.
+   *
+   * Present only when the run had any, so its absence means "nothing was downgraded", which is a
+   * different answer from "this run is not known". It is what makes the ask-as-deny report a
+   * *record* rather than a log line a user has to go hunting for after the fact — the one
+   * permission event here that nobody is present to see.
+   */
+  asksAsDeny?: string[]
   error?: string
 }
 
@@ -1585,6 +1594,39 @@ const HISTORY_ERROR_MAX = 300
 const HISTORY_LABEL_MAX = 200
 
 /**
+ * How much of a run's ask-as-deny list one record keeps: the number of entries, and the length
+ * of each.
+ *
+ * Bounded like `HISTORY_ERROR_MAX` and for the same reason, with one difference that makes it
+ * necessary rather than merely tidy: `error` and `model` are single strings, while the ask list
+ * is an array **whose length nothing upstream bounds**. `validatePermissions` caps the actions a
+ * job may constrain but not the resource patterns under each one, so a single action can expand
+ * into an unbounded number of asks — and a stored record can be edited from outside entirely.
+ * Cardinality first, then each string, so the bound holds however the list was shaped.
+ */
+const HISTORY_ASK_ENTRIES_MAX = 16
+const HISTORY_ASK_LEN_MAX = 120
+
+/**
+ * Clip a run's ask-as-deny list: cardinality, then every element.
+ *
+ * Shared by `pushHistory` and `loadHistory` so a write side and a read side cannot disagree
+ * about what a record contains — the same rule the error clip follows.
+ */
+function clipAsks(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) return undefined
+  const out: string[] = []
+  // `slice` before the loop: a stored array of a million entries must not be walked.
+  for (const raw of value.slice(0, HISTORY_ASK_ENTRIES_MAX)) {
+    const ask = asString(raw)
+    if (ask !== undefined) out.push(clip(ask, HISTORY_ASK_LEN_MAX))
+  }
+  // An empty list carries the same information as an absent one — "nothing was downgraded" — so
+  // it is dropped rather than stored, and the field stays a report rather than a schema change.
+  return out.length === 0 ? undefined : out
+}
+
+/**
  * Append one run to a job's history, evicting oldest-first at the limit.
  *
  * Pure and exported so the eviction rule is testable without a clock or a session.
@@ -1597,13 +1639,18 @@ export function pushHistory(
   const bounded = Math.max(1, Math.min(MAX_HISTORY_LIMIT, Math.trunc(limit)))
   // Clipped here as well as in `loadHistory`: this is the write side, and the two have to agree
   // or the same run reads back differently depending on which one happened to see it.
+  // Destructured out first because a spread cannot *remove* a key: a record carrying an empty or
+  // malformed list must come back without the field, not with the raw one still attached.
+  const { asksAsDeny: rawAsks, ...rest } = entry
+  const asksAsDeny = clipAsks(rawAsks)
   const next = [
     ...history,
     {
-      ...entry,
-      ...(entry.error === undefined ? {} : { error: clip(entry.error, HISTORY_ERROR_MAX) }),
-      model: clip(entry.model, HISTORY_LABEL_MAX),
-      ...(entry.sessionID === undefined ? {} : { sessionID: clip(entry.sessionID, HISTORY_LABEL_MAX) }),
+      ...rest,
+      ...(rest.error === undefined ? {} : { error: clip(rest.error, HISTORY_ERROR_MAX) }),
+      ...(asksAsDeny === undefined ? {} : { asksAsDeny }),
+      model: clip(rest.model, HISTORY_LABEL_MAX),
+      ...(rest.sessionID === undefined ? {} : { sessionID: clip(rest.sessionID, HISTORY_LABEL_MAX) }),
     },
   ]
   // Evict oldest-first: the newest run is the one a reader wants.
@@ -2752,12 +2799,14 @@ async function loadHistory(ctx: PluginContext, key: string): Promise<HistoryEntr
     // arrived from outside. Bounded on read as well as on write, as the comment claims.
     const sessionID = asString(record.sessionID)
     const error = asString(record.error)
+    const asksAsDeny = clipAsks(record.asksAsDeny)
     entries.push({
       dueAt: record.dueAt,
       startedAt: record.startedAt,
       outcome: record.outcome,
       model: clip(record.model, HISTORY_LABEL_MAX),
       ...(sessionID !== undefined ? { sessionID: clip(sessionID, HISTORY_LABEL_MAX) } : {}),
+      ...(asksAsDeny !== undefined ? { asksAsDeny } : {}),
       ...(error !== undefined ? { error: clip(error, HISTORY_ERROR_MAX) } : {}),
     })
   }
@@ -2859,6 +2908,7 @@ async function runOneOff(ctx: PluginContext, state: SchedulerState, task: OneOff
   // before it finished, so a completion stamp records the bound rather than the run.
   const startedAt = Date.now()
   let model = "unknown"
+  let asksAsDeny: string[] = []
   let sessionID: string | undefined
   const record = (outcome: RunStatus, error?: string): Promise<void> =>
     recordRun(ctx, state, "oneoff", task.id, {
@@ -2867,6 +2917,7 @@ async function runOneOff(ctx: PluginContext, state: SchedulerState, task: OneOff
       outcome,
       model,
       ...(sessionID !== undefined ? { sessionID } : {}),
+      ...(asksAsDeny.length === 0 ? {} : { asksAsDeny }),
       ...(error !== undefined ? { error } : {}),
     })
 
@@ -2889,9 +2940,11 @@ async function runOneOff(ctx: PluginContext, state: SchedulerState, task: OneOff
       await record("failed", "ctx.session.create resolved a session with no id")
       return
     }
-    model = await applyJobTarget(ctx, task, sessionID)
+    const target = await applyJobTarget(ctx, task, sessionID)
+    model = target.model
+    asksAsDeny = target.asksAsDeny
     logLine(
-      `running one-off ${task.id} (due ${new Date(task.dueAt).toISOString()}, model ${model}, runTimeout ${runTimeoutLabel(task.runTimeoutMs)})`,
+      `running one-off ${task.id} (due ${new Date(task.dueAt).toISOString()}, model ${model}, runTimeout ${runTimeoutLabel(task.runTimeoutMs)}${asksClause(asksAsDeny)})`,
     )
     // Bounded by the same `boundRun` a recurring job run uses, and for the same reason: a
     // one-off carries a `runTimeoutMs` that was parsed and clamped like a job's, and a bound that
@@ -2975,7 +3028,10 @@ async function postLoop(
   let outcome: RunStatus = "failed"
   let model = "unknown"
   try {
-    model = await applyJobTarget(ctx, loop, sessionID)
+    // A loop carries no `permissions`, so `asksAsDeny` is always empty here — and that is the
+    // point of routing through the shared call rather than around it: a loop cannot post into
+    // its own session with rules nobody declared, and the record shows it carried none.
+    model = (await applyJobTarget(ctx, loop, sessionID)).model
     logLine(
       `loop ${loop.id} posting into its own session (every ${Math.round(loop.intervalMs / MINUTE_MS)}m, model ${model})`,
     )
@@ -3024,13 +3080,6 @@ function loopLifetime(loop: SessionLoop): string {
 }
 
 /**
- * Point the target session at the job's agent and model before dispatching.
- *
- * A job that names no model **inherits the session default**, which for an unattended
- * recurring job is usually a paid model. That is why the resolved model is echoed in the
- * `running` line: the log is where you see which model is being billed.
- */
-/**
  * The part of a task that decides *how* it is dispatched.
  *
  * Structural rather than `JobDefinition`, so a one-off and a recurring job share this path
@@ -3043,7 +3092,34 @@ type DispatchTarget = {
   permissions?: PermissionSet
 }
 
-async function applyJobTarget(ctx: PluginContext, job: DispatchTarget, sessionID: string): Promise<string> {
+/** What `applyJobTarget` resolved, for the caller to report and to record. */
+type AppliedTarget = {
+  /**
+   * The model this run will be billed on. A task that names no model **inherits the session
+   * default**, which for an unattended recurring job is usually a paid model — which is why this
+   * is echoed in the `running` line: the log is where you see which model is being billed.
+   */
+  model: string
+  /**
+   * The `"ask"` rules this run turns into denies; empty when the task declares none.
+   *
+   * An `ask` in an unattended run has nobody to answer it, so it **is** a deny — reported rather
+   * than left to time out, and the warnings come from opencode-tasks (ADR 0007). Returned rather
+   * than logged here because the caller owns the line that reports it and the record that keeps
+   * it, and one fact reported in one place cannot describe two different runs.
+   */
+  asksAsDeny: string[]
+}
+
+/**
+ * Point the target session at the task's agent, model and permissions before dispatching, and
+ * report what that resolved to.
+ *
+ * Both returned facts are the caller's to state: the resolved model in the run line and the run
+ * record, the ask list in both. A task that declares no permissions — every loop — gets an empty
+ * list rather than a special case here.
+ */
+async function applyJobTarget(ctx: PluginContext, job: DispatchTarget, sessionID: string): Promise<AppliedTarget> {
   if (job.agent !== undefined && typeof ctx.session?.switchAgent === "function") {
     await ctx.session.switchAgent({ sessionID, agent: job.agent })
   }
@@ -3058,21 +3134,30 @@ async function applyJobTarget(ctx: PluginContext, job: DispatchTarget, sessionID
   // Permission rules are applied AFTER agent/model and BEFORE the prompt is admitted, so a
   // scheduled run is already constrained when its turn starts. Re-applied every run rather
   // than assumed to persist, because `rules` replaces session state (ADR 0005).
-  const asks = job.permissions === undefined ? [] : collectAsks(job.permissions)
+  const asksAsDeny = job.permissions === undefined ? [] : collectAsks(job.permissions)
   if (job.permissions !== undefined) {
     if (typeof ctx.permission?.rules === "function") {
       await ctx.permission.rules({ sessionID, permissions: [job.permissions] })
     } else {
       logOnce("no-permission-rules", "ctx.permission.rules is unavailable; the job runs with session defaults")
     }
-    // An "ask" in an unattended run has nobody to answer it, so it is a deny. Reported
-    // rather than left to time out — and the warnings come from opencode-tasks (ADR 0007).
-    if (asks.length > 0) {
-      logLine(`job ${job.id} declares "ask" permissions with nobody to answer them; treated as deny: ${asks.join(", ")}`)
-    }
   }
 
-  return job.model === undefined ? "session default" : `${job.model.providerID}/${job.model.id}`
+  return {
+    model: job.model === undefined ? "session default" : `${job.model.providerID}/${job.model.id}`,
+    asksAsDeny,
+  }
+}
+
+/**
+ * How a dispatch line states the asks it turns into denies, or nothing at all when there are
+ * none.
+ *
+ * Folded into the line the run already logs rather than emitted beside it: one line per dispatch,
+ * so the log and the record it is written from cannot describe different runs.
+ */
+function asksClause(asksAsDeny: readonly string[]): string {
+  return asksAsDeny.length === 0 ? "" : `, asks as deny: ${asksAsDeny.join(", ")}`
 }
 
 /**
@@ -3201,6 +3286,7 @@ async function runJob(
   // Collected in the `finally` so a thrown run still lands in the history.
   let outcome: RunStatus = "failed"
   let model = "unknown"
+  let asksAsDeny: string[] = []
   let sessionID: string | undefined
 
   try {
@@ -3217,10 +3303,12 @@ async function runJob(
       record.lastError = "no session available for this job"
       return
     }
-    model = await applyJobTarget(ctx, job, sessionID)
+    const target = await applyJobTarget(ctx, job, sessionID)
+    model = target.model
+    asksAsDeny = target.asksAsDeny
 
     logLine(
-      `running ${job.id} (schedule "${job.schedule}" ${job.timezone}, model ${model}, session ${job.session}, runTimeout ${runTimeoutLabel(job.runTimeoutMs)})`,
+      `running ${job.id} (schedule "${job.schedule}" ${job.timezone}, model ${model}, session ${job.session}, runTimeout ${runTimeoutLabel(job.runTimeoutMs)}${asksClause(asksAsDeny)})`,
     )
 
     // `prompt` admits the turn; what bounds the run is the timer in `boundRun`, which is the only
@@ -3259,6 +3347,7 @@ async function runJob(
       outcome,
       model,
       ...(sessionID !== undefined ? { sessionID } : {}),
+      ...(asksAsDeny.length === 0 ? {} : { asksAsDeny }),
       ...(record.lastError !== undefined ? { error: record.lastError } : {}),
     })
     await saveState(ctx, state, job.id)
@@ -3776,6 +3865,7 @@ function buildTools(
             outcome: entry.outcome,
             model: entry.model,
             ...(entry.sessionID !== undefined ? { sessionID: entry.sessionID } : {}),
+            ...(entry.asksAsDeny !== undefined ? { asksAsDeny: entry.asksAsDeny } : {}),
             ...(entry.error !== undefined ? { error: entry.error } : {}),
           }))
         return {
@@ -3826,18 +3916,25 @@ function buildTools(
         if (typeof ctx.session?.prompt !== "function") {
           return { output: { id: job.id, error: "ctx.session.prompt is unavailable" } }
         }
-        const sessionID = await sessionFor(ctx, state, job)
-        if (sessionID === undefined) {
-          return { output: { id: job.id, error: "no session available for this job" } }
-        }
-        const model = await applyJobTarget(ctx, job, sessionID)
+        // Everything that can reject on the host is inside this `try`, and that is the whole
+        // boundary. `sessionFor` and `applyJobTarget` were awaited *above* it, so a rejection from
+        // `session.create`, `switchAgent`, `switchModel` or `permission.rules` escaped the tool
+        // uncaught — invariant 3 (never break a session) broken, with nothing in the scheduler
+        // log to show the dispatch failed. The host owns every one of those promises.
         try {
+          const sessionID = await sessionFor(ctx, state, job)
+          if (sessionID === undefined) {
+            return { output: { id: job.id, error: "no session available for this job" } }
+          }
+          const { model, asksAsDeny } = await applyJobTarget(ctx, job, sessionID)
           const admitted = await ctx.session.prompt({
             sessionID,
             text: job.prompt,
             delivery: "queue",
           })
-          logLine(`triggered ${job.id} on demand (model ${model})`)
+          // Reported even though a tool trigger is attended: the turn is queued, so the ask is
+          // downgraded before anyone can answer it, exactly as in a scheduled run.
+          logLine(`triggered ${job.id} on demand (model ${model}${asksClause(asksAsDeny)})`)
           return {
             output: {
               id: job.id,
@@ -3846,9 +3943,11 @@ function buildTools(
             },
           }
         } catch (error) {
-          return {
-            output: { id: job.id, error: clip(error instanceof Error ? error.message : String(error), 500) },
-          }
+          const message = clip(error instanceof Error ? error.message : String(error), 500)
+          // Logged as well as returned: a dispatch that fails silently is indistinguishable from
+          // an idle job, which is what the per-project log exists to prevent.
+          logLine(`trigger of ${job.id} failed: ${message}`)
+          return { output: { id: job.id, error: message } }
         }
       },
     },

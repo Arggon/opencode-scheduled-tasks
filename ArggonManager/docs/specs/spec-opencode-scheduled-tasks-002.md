@@ -121,7 +121,8 @@ tools.schedules.*   list · run · schedule · cancel · start_loop · stop_loop
 
 - [ ] Each job keeps a bounded ring buffer of its most recent runs (default last 10).
 - [ ] Each entry records the due instant, start, outcome (`ok`/`failed`/`timeout`/`skipped`),
-      the resolved model, and a bounded error string.
+      the resolved model, a bounded error string, and — when the run downgraded an `"ask"` rule
+      to a deny — which rules it downgraded, bounded in both count and length.
 - [ ] `schedules_history` returns a job's history, newest first, bounded and pagination-free.
 - [ ] The buffer is capped and **oldest entries are evicted**; history can never grow unbounded.
 - [ ] An unknown job id returns a typed error naming the id, not an empty success.

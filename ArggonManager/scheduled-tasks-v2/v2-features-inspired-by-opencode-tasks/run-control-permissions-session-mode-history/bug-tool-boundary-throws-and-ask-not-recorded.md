@@ -39,11 +39,15 @@ box that does not describe the code must not stay ticked**, whichever way it is 
 
 ## Acceptance
 
-- [ ] `schedules_run` cannot throw out of the tool: every failure is caught, reported in the tool
-      output, and logged.
-- [ ] Either the run record and history carry the ask-as-deny report, or the T4 box and spec 002 are
-      amended to match the code — with the reason stated.
-- [ ] Tests cover a rejecting `permission.rules` and assert no throw escapes the tool.
+- [x] `schedules_run` cannot throw out of the tool: every failure is caught, reported in the tool
+      output, and logged. (Scope stated rather than left to the reader: the pre-flight refusals —
+      unknown id, already running, no `session.prompt` — stay unlogged, because that is exactly how
+      every other tool in the file declines and a declined call is not a dispatch failure. Every
+      failure from admission onwards is caught, returned as `{ output: { error } }` and logged.)
+- [x] Either the run record and history carry the ask-as-deny report, or the T4 box and spec 002 are
+      amended to match the code — with the reason stated. (Option 1: the code carries it — the run
+      record and history gained `asksAsDeny`. See Notes for why, and for what it cost.)
+- [x] Tests cover a rejecting `permission.rules` and assert no throw escapes the tool.
 
 ## Notes
 
