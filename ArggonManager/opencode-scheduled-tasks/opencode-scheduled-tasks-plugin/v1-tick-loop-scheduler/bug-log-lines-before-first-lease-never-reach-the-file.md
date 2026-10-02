@@ -8,6 +8,7 @@ labels: []
 priority: p2
 created: "2026-10-02"
 updated: "2026-10-02"
+depends_on: [bug-storageless-degradation-unrecorded]
 ---
 <!--
   Placement (v0): ArggonManager/opencode-scheduled-tasks/opencode-scheduled-tasks-plugin/v1-tick-loop-scheduler/bug-log-lines-before-first-lease-never-reach-the-file.md
