@@ -1555,6 +1555,55 @@ export function resolveDue(
   return { kind: "run", job, occurrence }
 }
 
+/**
+ * The durable record for one job, created in place if it is not there yet.
+ *
+ * Reading through this rather than `state.states[job.id] ?? { … }` matters for any run started
+ * outside `tick`: `tick` creates the record for every job it considers, so a scheduled run never
+ * noticed, but a manual `schedules_run` of a job the tick has not reached (or of a *disabled* job,
+ * which `tick` skips before the record exists) would otherwise take its run lease on a throwaway
+ * object — a lease nothing reads, which is precisely the lease this path exists to take.
+ */
+function jobState(state: SchedulerState, jobId: string): JobState {
+  const existing = state.states[jobId]
+  if (existing !== undefined) return existing
+  const created: JobState = { version: STATE_VERSION }
+  state.states[jobId] = created
+  return created
+}
+
+/**
+ * Take the per-job run lease for one dispatch, renewing it while the run is in flight, and hand
+ * back the single closer that gives it up.
+ *
+ * The lease is the job-scoped half of ADR 0003's single-writer rule: `isRunOutstanding` reads
+ * `leaseUntil`, so a tick will not admit a second prompt into a session whose run is still going —
+ * for a scheduled run, a one-off and a manual trigger alike. All three go through here rather than
+ * each open-coding the interval, because "the same lease rules" is only true while there is one
+ * implementation of them.
+ *
+ * Renewal runs on `leaseRenewalMs` (half the bound), never from the tick heartbeat: see
+ * `isRunOutstanding` for why the two signals must not be conflated.
+ *
+ * The closer is idempotent and clears the interval **before** the marker, so it can be called from
+ * a `finally` on any path — success, timeout or throw — and an armed renewal can never outlive the
+ * run it belongs to and suppress the next occurrence of a job nobody is running.
+ */
+export function openRunLease(record: JobState, runTimeoutMs: number): () => void {
+  record.leaseUntil = Date.now() + runTimeoutMs
+  const renew = setInterval(() => {
+    record.leaseUntil = Date.now() + runTimeoutMs
+  }, leaseRenewalMs(runTimeoutMs))
+  renew.unref?.()
+  let closed = false
+  return () => {
+    if (closed) return
+    closed = true
+    clearInterval(renew)
+    record.leaseUntil = undefined
+  }
+}
+
 /** Repair a persisted record: an unknown version or a corrupt entry re-initializes. */
 export function normalizeState(value: unknown): JobState {
   if (value === null || typeof value !== "object" || Array.isArray(value)) return { version: STATE_VERSION }
@@ -3170,8 +3219,17 @@ function runTimeoutLabel(ms: number): string {
   return ms % MINUTE_MS === 0 ? `${Math.round(ms / MINUTE_MS)}m` : `${Math.round(ms / 1000)}s`
 }
 
-/** What a bounded dispatch produced: it settled, or it blew the bound. */
-type BoundedRun = { outcome: "ok" } | { outcome: "timeout"; stopped: boolean }
+/**
+ * What a bounded dispatch produced: it settled — carrying the value `dispatch` resolved with — or
+ * it blew the bound.
+ *
+ * `value` is what makes a bounded dispatch usable by a caller that needs the dispatch's own result
+ * (`schedules_run` returns the admitted inbox id). Discarding it would force such a caller to
+ * capture the value out of band, which is how a bounded run and the value it produced come to
+ * disagree. It is absent on the timeout path because there is no such value: the dispatch is
+ * abandoned, not completed.
+ */
+type BoundedRun = { outcome: "ok"; value: unknown } | { outcome: "timeout"; stopped: boolean }
 
 /**
  * Await one dispatch for at most `timeoutMs`, and stop the session if it overruns.
@@ -3195,8 +3253,8 @@ async function boundRun(
   dispatch: () => Promise<unknown>,
 ): Promise<BoundedRun> {
   let timer: ReturnType<typeof setTimeout> | undefined
-  const expiry = new Promise<"expired">((resolve) => {
-    timer = setTimeout(() => resolve("expired"), timeoutMs)
+  const expiry = new Promise<{ kind: "expired" }>((resolve) => {
+    timer = setTimeout(() => resolve({ kind: "expired" }), timeoutMs)
     // Never hold the process open just to notice that a run overran.
     timer.unref?.()
   })
@@ -3204,16 +3262,19 @@ async function boundRun(
   // inside the `try`, where the `finally` can still clear the timer. `Promise.race` attaches a
   // handler to both sides, so a dispatch abandoned by the timeout that rejects later is handled
   // too — no unhandled rejection escapes the abandoned promise.
+  //
+  // The settled value is carried through rather than dropped: a caller that reports what the
+  // dispatch admitted needs it, and it is only knowable here.
   const work = Promise.resolve()
     .then(dispatch)
-    .then(() => "settled" as const)
-  let raced: "settled" | "expired"
+    .then((value) => ({ kind: "settled" as const, value }))
+  let raced: { kind: "settled"; value: unknown } | { kind: "expired" }
   try {
     raced = await Promise.race([work, expiry])
   } finally {
     if (timer !== undefined) clearTimeout(timer)
   }
-  if (raced === "settled") return { outcome: "ok" }
+  if (raced.kind === "settled") return { outcome: "ok", value: raced.value }
   return { outcome: "timeout", stopped: await stopRun(ctx, sessionID) }
 }
 
@@ -3271,17 +3332,13 @@ async function runJob(
   dueAt: number,
 ): Promise<void> {
   const now = Date.now()
-  const record = state.states[job.id] ?? { version: STATE_VERSION }
-  record.leaseUntil = now + job.runTimeoutMs
+  const record = jobState(state, job.id)
 
   // The lease is renewed for as long as this run is legitimately in flight, from run liveness and
   // not from the tick heartbeat — see `isRunOutstanding` for why the two must not be conflated.
   // Half the bound, so the lease always outlasts the run's remaining life; and the bound below is
   // the only thing that can end the run, so there is nothing here for a renewal to paper over.
-  const renewLease = setInterval(() => {
-    record.leaseUntil = Date.now() + job.runTimeoutMs
-  }, leaseRenewalMs(job.runTimeoutMs))
-  renewLease.unref?.()
+  const releaseLease = openRunLease(record, job.runTimeoutMs)
 
   // Collected in the `finally` so a thrown run still lands in the history.
   let outcome: RunStatus = "failed"
@@ -3339,8 +3396,7 @@ async function runJob(
   } finally {
     // Renewal first, then the lease itself: from here the run is over, so a lease that outlived
     // it would suppress the next occurrence of a job that is no longer running.
-    clearInterval(renewLease)
-    record.leaseUntil = undefined
+    releaseLease()
     await recordRun(ctx, state, "job", job.id, {
       dueAt,
       startedAt: now,
@@ -3542,6 +3598,9 @@ function buildTools(
   currentLease: () => Lease,
   arm: () => void,
   tickMs: number,
+  // The cap as configured, so `schedules_run` measures a manual trigger against the same budget
+  // `tick` spends rather than against a second, independently-clamped copy of it.
+  maxConcurrent: number,
 ): ToolRegistration[] {
   return [
     {
@@ -3892,7 +3951,21 @@ function buildTools(
     },
     {
       name: "run",
-      description: "Trigger one scheduled job now, obeying the same concurrency, timeout and lease rules.",
+      // Every clause here is enforced below, and the tests name each one: the cap (the shared
+      // `claimed` budget), the bound (`boundRun` + `runTimeoutMs` + `interrupt`), the lease (the
+      // writer lease this instance holds, and the per-job run lease it takes), and the record
+      // (`recordRun`, so a manual run lands in the same ring a scheduled one writes).
+      //
+      // The sentence used to promise the first three while the code did none of them, which is why
+      // it is now specific rather than reassuring: a caller reading "the same rules" has to be
+      // able to find the code that keeps them. `admitted` is the settled dispatch value, which is
+      // why the bound can keep this tool's return honest — see `boundRun`.
+      description:
+        "Trigger one scheduled job now, under the same rules a scheduled run obeys: it takes a slot " +
+        "from the shared maxConcurrentRuns budget and holds the job's run lease for its duration, is " +
+        "bounded by the job's runTimeout (interrupting the session on overrun), is refused while " +
+        "another instance holds the writer lease, and records ok/timeout/failed/skipped in the job's " +
+        "history.",
       input: {
         type: "object",
         properties: { id: { type: "string", description: "Job id, as reported by schedules_list." } },
@@ -3910,44 +3983,150 @@ function buildTools(
         if (job === undefined) {
           return { output: { error: `no job with id "${id}"`, ids: state.jobs.map((entry) => entry.id) } }
         }
-        if (state.inFlight.has(job.id)) {
-          return { output: { id: job.id, error: "job is already running" } }
-        }
         if (typeof ctx.session?.prompt !== "function") {
           return { output: { id: job.id, error: "ctx.session.prompt is unavailable" } }
         }
-        // Everything that can reject on the host is inside this `try`, and that is the whole
-        // boundary. `sessionFor` and `applyJobTarget` were awaited *above* it, so a rejection from
-        // `session.create`, `switchAgent`, `switchModel` or `permission.rules` escaped the tool
-        // uncaught — invariant 3 (never break a session) broken, with nothing in the scheduler
-        // log to show the dispatch failed. The host owns every one of those promises.
-        try {
-          const sessionID = await sessionFor(ctx, state, job)
-          if (sessionID === undefined) {
-            return { output: { id: job.id, error: "no session available for this job" } }
+        // **Concurrency**, first of the three and the reason this is not a bare `prompt`. The
+        // single budget every dispatch shares, measured the same way `tick` measures it, so a
+        // manual trigger and a scheduled run compete for the same slots instead of running
+        // alongside each other.
+        //
+        // The writer lease is read *through* (`currentLease`), never captured at build time: it is
+        // acquired lazily when work first appears and re-decided on every `arm`, so a snapshot
+        // would report a stale holder. A foreign holder means another live instance owns this
+        // project's runs (ADR 0003), and a second writer is exactly what that ADR exists to
+        // prevent — so the trigger is refused with the reason, not silently dropped. The degraded
+        // case (`held: false` because the lock directory could not be created) is *not* foreign and
+        // still runs, which is the degradation ADR 0003 chose over disabling the scheduler.
+        const lease = currentLease()
+        if (lease.foreign) {
+          return {
+            output: {
+              id: job.id,
+              error: `another OpenCode instance holds the writer lease at ${lease.path}; a manual trigger is a dispatch, so it is refused here rather than run from two writers`,
+            },
           }
-          const { model, asksAsDeny } = await applyJobTarget(ctx, job, sessionID)
-          const admitted = await ctx.session.prompt({
-            sessionID,
-            text: job.prompt,
-            delivery: "queue",
+        }
+        if (state.inFlight.has(job.id)) {
+          return { output: { id: job.id, error: "job is already running" } }
+        }
+        const startedAt = Date.now()
+        // `dueAt` is the decision instant, not a schedule: a manual trigger has no occurrence, so
+        // it is stamped into both fields and the record reads as what happened rather than as a
+        // schedule it was never part of.
+        //
+        // `model` and `asksAsDeny` default to what a scheduled run of this job records before it
+        // knows the answer, so a refusal or an early failure is a well-formed record rather than a
+        // hollow one.
+        const record = (
+          outcome: RunStatus,
+          error?: string,
+          model = "unknown",
+          sessionID?: string,
+          asksAsDeny: readonly string[] = [],
+        ): Promise<void> =>
+          recordRun(ctx, state, "job", job.id, {
+            dueAt: startedAt,
+            startedAt,
+            outcome,
+            model,
+            ...(sessionID !== undefined ? { sessionID } : {}),
+            ...(asksAsDeny.length === 0 ? {} : { asksAsDeny: [...asksAsDeny] }),
+            ...(error !== undefined ? { error } : {}),
           })
+        if (state.inFlight.size >= maxConcurrent) {
+          // Said, not silent. `schedules_run` is a human-initiated call, so the caller is a person
+          // who asked for a run and is owed the reason it did not happen — and the record says the
+          // same thing, so the ring a scheduled run writes explains this one too.
+          const reason = `no free run slot: concurrency cap ${maxConcurrent} reached (${state.inFlight.size} in flight)`
+          logLine(`skipping on-demand trigger of ${job.id}: ${reason}`)
+          await record("skipped", reason)
+          return { output: { id: job.id, error: reason } }
+        }
+        // **Registration**, and it is the other half of the cap: the slot is taken by joining the
+        // same `inFlight` set `tick` counts, so a scheduled run cannot start alongside this one,
+        // and it is released on every path below — timeout, throw and refusal alike.
+        state.inFlight.add(job.id)
+        // **Lease**, per job: the same run lease a scheduled run takes, renewed on the same
+        // schedule and dropped in the same place, so `isRunOutstanding` holds the job outstanding
+        // for a manual run exactly as it does for a scheduled one. A tick cannot re-admit a job
+        // whose manual run is still going.
+        const releaseLease = openRunLease(jobState(state, job.id), job.runTimeoutMs)
+        let outcome: RunStatus = "failed"
+        let model = "unknown"
+        let asksAsDeny: readonly string[] = []
+        let sessionID: string | undefined
+        try {
+          // Everything that can reject on the host is inside this `try`, and that is the whole
+          // boundary. `sessionFor` and `applyJobTarget` were awaited *above* it, so a rejection
+          // from `session.create`, `switchAgent`, `switchModel` or `permission.rules` escaped the
+          // tool uncaught — invariant 3 (never break a session) broken, with nothing in the
+          // scheduler log to show the dispatch failed. The host owns every one of those promises.
+          sessionID = await sessionFor(ctx, state, job)
+          if (sessionID === undefined) {
+            const reason = "no session available for this job"
+            logLine(`trigger of ${job.id} failed: ${reason}`)
+            await record("failed", reason)
+            return { output: { id: job.id, error: reason } }
+          }
+          const target = await applyJobTarget(ctx, job, sessionID)
+          model = target.model
+          // The asks a run turns into denies belong in the record, not only in the log line: a
+          // manual run is a billable run of this job, so `schedules_history` answers for it exactly
+          // as it does for a scheduled one.
+          asksAsDeny = target.asksAsDeny
+          // Bound to a local, because the narrowing above does not survive into the closure below.
+          const prompt = ctx.session.prompt
+          // **Bound**, the same `boundRun` every scheduled dispatch goes through: this job's
+          // `runTimeoutMs`, `ctx.session.interrupt` on overrun, and an honest outcome either way.
+          // Pre-fix this awaited `ctx.session.prompt` directly, so a hung manual run hung the tool
+          // call forever — unbounded, and unbounded while holding a `maxConcurrentRuns` slot.
+          const bounded = await boundRun(ctx, sessionID, job.runTimeoutMs, () =>
+            prompt({
+              sessionID,
+              text: job.prompt,
+              delivery: "queue",
+            }),
+          )
+          if (bounded.outcome === "timeout") {
+            outcome = "timeout"
+            const reason = timeoutReason(job.runTimeoutMs, bounded.stopped)
+            logLine(`trigger of ${job.id} timed out: ${reason}`)
+            await record("timeout", reason, model, sessionID, asksAsDeny)
+            return { output: { id: job.id, error: reason } }
+          }
+          outcome = "ok"
           // Reported even though a tool trigger is attended: the turn is queued, so the ask is
           // downgraded before anyone can answer it, exactly as in a scheduled run.
           logLine(`triggered ${job.id} on demand (model ${model}${asksClause(asksAsDeny)})`)
+          await record("ok", undefined, model, sessionID, asksAsDeny)
           return {
             output: {
               id: job.id,
               sessionID,
-              admitted: sessionIdOf(admitted) ?? "",
+              admitted: sessionIdOf(bounded.value) ?? "",
             },
           }
         } catch (error) {
+          outcome = "failed"
           const message = clip(error instanceof Error ? error.message : String(error), 500)
           // Logged as well as returned: a dispatch that fails silently is indistinguishable from
           // an idle job, which is what the per-project log exists to prevent.
           logLine(`trigger of ${job.id} failed: ${message}`)
+          await record("failed", message, model, sessionID, asksAsDeny)
           return { output: { id: job.id, error: message } }
+        } finally {
+          // Renewal first, then the lease itself, then the slot — the same order `runJob` uses,
+          // and on every path. A manual trigger must not be able to starve scheduled work by
+          // holding the cap: a hung run gives the slot up at its bound, and a throw gives it up
+          // here.
+          releaseLease()
+          state.inFlight.delete(job.id)
+          if (outcome === "ok") {
+            // Persisted only when the run succeeded, so a manual trigger cannot rewrite the
+            // schedule's own cursor (`lastRun`/`nextRun` belong to `resolveDue`).
+            await saveState(ctx, state, job.id)
+          }
         }
       },
     },
@@ -4088,7 +4267,7 @@ const definition: PluginDefinition = {
       runTick()
     }
 
-    const registered = registerTools(ctx, state, () => lease, arm, tickMs)
+    const registered = registerTools(ctx, state, () => lease, arm, tickMs, maxConcurrent)
     if (registered) disposers.push(registered)
     disposers.push(disarm)
 
@@ -4127,6 +4306,7 @@ function registerTools(
   currentLease: () => Lease,
   arm: () => void,
   tickMs: number,
+  maxConcurrentRuns: number,
 ): (() => void) | undefined {
   try {
     const transform = ctx.tool?.transform
@@ -4137,7 +4317,7 @@ function registerTools(
     let registration: unknown
     const pending = transform((editor: ToolEditorLike) => {
       editor.namespace?.({ name: TOOL_NAMESPACE, description: TOOL_NAMESPACE_DESCRIPTION })
-      for (const tool of buildTools(ctx, state, currentLease, arm, tickMs)) editor.add?.(tool)
+      for (const tool of buildTools(ctx, state, currentLease, arm, tickMs, maxConcurrentRuns)) editor.add?.(tool)
     })
     if (pending !== undefined && typeof (pending as Promise<unknown>).then === "function") {
       void (pending as Promise<unknown>).then(
