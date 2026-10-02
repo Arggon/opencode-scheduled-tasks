@@ -8,7 +8,7 @@ labels: []
 priority: p2
 created: "2026-10-02"
 updated: "2026-10-02"
-depends_on: [bug-tick-cost-grows-with-sleep-not-with-jobs]
+depends_on: [bug-log-lines-before-first-lease-never-reach-the-file]
 ---
 <!--
   Placement (v0): ArggonManager/opencode-scheduled-tasks/opencode-scheduled-tasks-plugin/v1-tick-loop-scheduler/task-measure-first-tick-stall-after-long-sleep.md
