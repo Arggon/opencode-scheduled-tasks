@@ -4,6 +4,7 @@ status: in_progress
 id: bug-oneoff-history-unreadable-and-storage-unbounded
 title: One-off history is unreadable and storage keys accumulate
 assignee: arggon
+branch: fix/bug-oneoff-history-unreadable-and-storage-unbounded
 parent: ephemeral-tasks-one-offs-and-session-loops
 labels: []
 created: "2026-10-02"
