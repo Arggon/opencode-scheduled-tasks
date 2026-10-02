@@ -154,12 +154,11 @@ Every run is a real model request, so the scheduler is deliberately conservative
   no free slot is **skipped and recorded**, never queued.
 - A failed run is **not** retried within its occurrence. Trigger a re-run with
   `schedules_run`.
-- **Known gap:** `runTimeout` is parsed, clamped and recorded, but it does **not** currently bound
-  a run — nothing interrupts a prompt that never resolves. So a job whose turn triggers a permission
-  request nobody will answer will hang, hold its `maxConcurrentRuns` slot, and let its writer lease
-  expire mid-run, which a second OpenCode instance can then reclaim. Tracked as
-  `bug-run-timeout-never-enforced`. Treat `runTimeout` as configuration that is not yet enforced,
-  not as a safety bound.
+- Every run is **bounded by `runTimeout`** (default `15m`). On overrun the scheduler calls
+  `ctx.session.interrupt` for that session, records the outcome as `timeout`, and releases its
+  concurrency slot — so a turn that triggers a permission request nobody will ever answer cannot
+  wedge the scheduler or starve every other job. If the host has no `interrupt`, the run is
+  abandoned rather than interrupted, and the record says which happened.
 
 ## Observability
 
