@@ -1,11 +1,11 @@
 ---
 type: initiative
-status: todo
+status: done
 id: scheduled-tasks-v2
 title: "Scheduled tasks v2: adopt-and-extend"
 labels: []
 created: "2026-10-02"
-updated: "2026-10-02"
+updated: "2026-10-03"
 ---
 <!--
   Placement (v0): ArggonManager/scheduled-tasks-v2/scheduled-tasks-v2.md (initiative index; required).

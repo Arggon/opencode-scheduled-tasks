@@ -1,12 +1,12 @@
 ---
 type: epic
-status: todo
+status: done
 id: v2-features-inspired-by-opencode-tasks
 title: v2 features inspired by opencode-tasks
 parent: scheduled-tasks-v2
 labels: []
 created: "2026-10-02"
-updated: "2026-10-02"
+updated: "2026-10-03"
 ---
 <!--
   Placement (v0): ArggonManager/scheduled-tasks-v2/v2-features-inspired-by-opencode-tasks/v2-features-inspired-by-opencode-tasks.md (epic index; required).

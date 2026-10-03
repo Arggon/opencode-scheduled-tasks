@@ -1,6 +1,6 @@
 ---
 type: bug
-status: in_progress
+status: done
 id: bug-history-says-no-job-with-id-for-a-cancelled-oneoff
 title: "schedules_history answers \"no job with id\" for a cancelled one-off, which had a valid id"
 assignee: arggon
@@ -10,7 +10,6 @@ labels: []
 priority: p3
 created: "2026-10-03"
 updated: "2026-10-03"
-claimed_at: "2026-10-03T11:23:10.136Z"
 depends_on: [task-assert-v1-identical-with-no-markdown-dir]
 ---
 <!--
@@ -64,11 +63,17 @@ repeatedly been right to file — and the alternative is losing the finding beca
       a run.
 - [x] Tests cover cancelled-one-off and unknown-id **as separate cases**, so they cannot collapse into
       the same answer again. Mutation-check by making a cancelled task look unknown.
-- [ ] If the README documents `schedules_history`'s failure modes, add the cancelled case there.
+- [x] If the README documents `schedules_history`'s failure modes, add the cancelled case there.
       **Left unticked deliberately: the README is not this item's lane** (it is not in the worktree's
       change set, and the coordinator holds that wording). What the change makes the README's current
       text false is recorded under "What changed" below, with the exact replacement sentences, so the
       coordinator can apply them verbatim.
+      **Applied by the coordinator** (README was outside the worker's lane), in all three places it
+      named: the `schedules_cancel` bullet gains the distinct "was already cancelled and never ran"
+      message; the one-off-lifecycle bullet records that a cancelled one-off leaves a bounded tombstone;
+      and the history section's "unknown id" bullet now lists live ids across all three kinds and is
+      followed by a new bullet for the cancelled / stopped / expired ending. The worker's verbatim
+      wording, applied as given.
 
 ## What changed
 
