@@ -106,3 +106,72 @@ probably fine are nonetheless open.
 
 Sequence after the four false-box bugs are filed, so this does not compete for `src/index.ts` with
 them. Do not edit `src/index.ts` beyond adding tests.
+
+### 2026-10-03 @ses_effd2905cffeg7rQfNPZnLEFGt
+## Mutation evidence — every tick is backed by a red, not by belief
+
+All twelve boxes are ticked with the test that turns red, and the mutation is named. Method: edit src/index.ts, run only the named test, restore, confirm green. src/index.ts is untouched in the commit (git diff src/ is empty).
+
+**Box 89** (amended) — existing test 'keeps last-known-good jobs and surfaces the error on malformed JSON', one assertion added, plus the existing 'still reports a corrupt schedules.json when markdown jobs are carrying the schedule'.
+- RED: the inert-project notice takes its no-error wording unconditionally (the fileError-undefined ternary → true).
+- RED: the read-failure branch dropped (readProblem → undefined).
+
+**Box 96** — new test 'drops a tick that fires while the previous one is still running, instead of nesting it'.
+- RED: the re-entrancy guard neutered (if (ticking) return → if (false) return).
+
+**Box 107** — new test 'records a failed scheduled run: status, the message it threw, and no retry inside the occurrence'.
+- RED: runJob's catch gutted (lastStatus = failed and lastError both removed).
+
+**Box 135** — existing test 'reports jobs, next run and status through schedules_list', two assertions added, plus the new 135/158 test.
+- RED (twice): the ISO conversion replaced by the raw epoch for nextRun/lastRun.
+
+**Box 157** — existing test 'degrades to session defaults and logs once when ctx.permission.rules is missing', one assertion added, plus the new per-tick test 'logs a repeated identical failure once across five ticks'.
+- RED (twice): the once-guard deleted from logOnce (if (logged.has(key)) return removed).
+
+**Box 158** — new test 'reports every field the box names, and both instants as absolute ISO-8601'.
+- RED: lastStatus/lastError replaced with null — **on the new test only**. The existing-test addition stays GREEN under this mutation, because a never-run job's status already is null. The box note says exactly that, rather than letting the addition look load-bearing.
+
+**Box 162** — new test 'echoes the resolved model in the run's own line', plus the existing order test 'switches the session to the job's model before dispatching the prompt'.
+- RED: the resolved model dropped from runJob's running line.
+- RED: the switchModel call removed from applyJobTarget.
+
+**Box 165** — existing test 'records the asks a run turned into denies, and states them in its own running line', one assertion added.
+- RED: the same 'model dropped from the running line' mutation as 162 — one mutant, two boxes.
+
+**Box 176** — new test 'never holds the server process open to poll a schedule: the tick interval is unref'd'.
+- RED: timer.unref() removed. The test asserts the property (handle.hasRef() is false) on a real handle, not that a call was made.
+
+**Box 178** (amended) — new test 'keeps a hostile project id inside the lease directory, whichever separator it brings'.
+- RED: the id sanitizer deleted from leasePath.
+- The companion 'composes the lockfile path with the host's own separator' test is it.runIf(win32): **skipped on this Linux runner, so not mutation-checked**, and the box note labels it encoded-not-verified.
+
+**Box 179** — new test 'stops everything the cleanup promised: the interval, the lease and the tool registration'. Three effects, three separate reds.
+- RED: clearInterval(timer) removed from disarm.
+- RED: lease.release() removed from disarm.
+- RED: the registration's disposer never pushed into disposers.
+
+**Box 186** — new test 'leaves a removed job's state behind and never uses it again, unless the id returns'.
+- RED: setup deletes the state of every job missing from the file — the audit's own proposed mutation.
+
+## Why 96 looked unpinnable, and was not
+
+The audit's note was right and its conclusion was off. Deleting the guard left the suite green **because a re-entrant tick re-reads a window the first one already consumed**, so nothing observable happened. The only place tick awaits before deciding anything is a storage write on the skip path, and resolveDue is synchronous, so the window is microtasks wide. Parking that write holds the first tick open across a real interval boundary with a second job that has not been evaluated yet; the re-entrant tick then has work it would dispatch, and the guard is the only thing stopping it. Same idea as the slow ctx.storage.set the audit guessed at, made deterministic.
+
+## Gates, all green on the worktree
+
+    npx tsc --noEmit                exit 0
+    npx vitest run                  exit 0 — 298 passed | 1 skipped (299)
+    npx tsx harness/smoke.ts        exit 0 — PASS
+    arggon validate                 ok (0 warnings, convention v5)
+    arggon spec validate            ok (4 docs, 0 warnings)
+    arggon spec analyze             clean (2 specs scanned)
+
+Baseline was 289; the suite still finishes in ~35.6 s, unchanged. Every new test uses fake timers or a parked promise — nothing waits on a wall clock and no test walks the occurrence search.
+
+## Two amendments and one finding I did not fix
+
+- **Box 89 amended.** reloadJobs is called exactly once, from setup, against a state.jobs that is empty at that moment, so the 'retain the last-known-good job set' early return has no caller with a populated job set. That is a dead branch, not a missing test, and ticking it would tick dead code. Amended to the reachable invariant — a broken file costs the project neither its jobs nor its silence — which is pinned by two tests and two reds. The audit offered exactly this amendment.
+- **Box 178 amended.** 'behave on Windows' is not observable on a Linux runner; the audit said so in as many words. Narrowed to the confinement the suite can keep true, plus a platform-gated assertion labelled encoded-not-verified rather than counted as a tick.
+- **Found, not fixed, because it is a src change.** The id sanitizer keeps the dot, so a project id of exactly '..' composes to join(base, '..', 'writer.lock') — one level ABOVE the lease base directory. leasePath/logPath would then write a lockfile outside their own directory. The new test deliberately does not assert that escaping form as if it were correct, and the box note says so. Coordinator's call: a one-line fix (reject an id that sanitizes to '.' or '..') or a documented limit.
+
+Files: test/index.test.ts (596 lines added, 4 changed) and the spec 001 notes. No README, no package.json, no spec 002 — untouched, for the wave to stay file-disjoint.
