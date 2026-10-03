@@ -3190,6 +3190,17 @@ type SchedulerState = {
    * bound nothing and every one-off would leave a ring behind for the life of the session.
    */
   ephemeralKeys: Map<string, number>
+  /**
+   * Ephemeral ids this process retired while they had **no runs**, keyed by their history key.
+   *
+   * The memory half of a tombstone: an id that was cancelled, stopped or expired before it ever
+   * fired is a real id with a real ending, and it has to be answerable as one — including on a
+   * host that persists nothing, where this map is the only copy. Keyed by the key rather than
+   * the id so the one line that drops an evicted key drops its tombstone with it, and so it is
+   * bounded by exactly the cap `retainEphemeralHistoryKey` already enforces: an id whose key the
+   * cap has discarded has no retained record left to be honest about.
+   */
+  retired: Map<string, EphemeralTombstone>
 }
 
 /**
@@ -3269,6 +3280,15 @@ const HISTORY_OUTPUT = {
     session: { type: "string" },
     runs: { type: "array" },
     limit: { type: "number" },
+    // Presence-only, and the whole point of the retired answer: an id that was real and left
+    // before it ever ran is reported as such, so "cancelled" never has to be spelled
+    // "no job with id". Absent means "not retired" — a pending, running or finished id.
+    status: {
+      type: "string",
+      description:
+        'Present only when this id was retired before it ever ran: "cancelled" (a pending one-off), "stopped" (a session loop) or "expired" (a loop\'s lifetime ran out). Its runs are then empty by construction, not by loss.',
+    },
+    at: { type: "string", description: "When it was retired, ISO-8601. Present only alongside `status`." },
     historyUnavailable: { type: "string" },
   },
 }
@@ -3375,7 +3395,8 @@ async function loadStates(ctx: PluginContext, state: SchedulerState): Promise<vo
 async function loadAllHistory(ctx: PluginContext, state: SchedulerState): Promise<void> {
   for (const job of state.jobs) {
     const key = historyKey("job", job.id)
-    state.history.set(key, await loadHistory(ctx, key))
+    // Jobs only, so a tombstone is never in play here — only `runs` is taken, deliberately.
+    state.history.set(key, (await loadHistory(ctx, key)).runs)
   }
 }
 
@@ -3414,6 +3435,52 @@ function isEphemeralHistoryKey(key: string): boolean {
 /** An id this plugin generated, as opposed to one a job file declares. */
 function isEphemeralId(id: string): boolean {
   return /^oneoff_/.test(id) || /^loop_/.test(id)
+}
+
+/** The kinds of ephemeral id that can be retired, which is exactly the ephemeral half of `HistoryKind`. */
+type EphemeralKind = "oneoff" | "loop"
+
+/** How a task left the live lists without ever running — the word the reader gets back. */
+type RetiredState = "cancelled" | "stopped" | "expired"
+
+const RETIRED_STATES: readonly string[] = ["cancelled", "stopped", "expired"]
+
+/**
+ * A tombstone: an ephemeral id that was real, was removed from every live list, and had **no
+ * runs** when it went.
+ *
+ * Deliberately not a `HistoryEntry`, and never one — there is no run to describe, so inventing
+ * an entry with a synthetic `dueAt` and an outcome would put a lie in the same list a caller
+ * reads to find out what ran. It exists because the alternative was worse and was reported from
+ * the live host: a one-off created, cancelled and never run came back from `schedules_history`
+ * as `no job with id "oneoff_…"`, which tells the caller they guessed the id wrong when the id
+ * was theirs and valid. The five states a reader can be shown — pending, dispatching, finished,
+ * retired, unknown — are different facts, and this is the fourth.
+ *
+ * It lives under the id's **own** history key, so `retainEphemeralHistoryKey` bounds it by the
+ * same cap that bounds run records and evicts it by the same rule. One key per retired id, one
+ * shape per key that is never a run.
+ */
+type EphemeralTombstone = { retired: true; at: number; how: RetiredState }
+
+function isRetiredState(value: unknown): value is RetiredState {
+  return typeof value === "string" && RETIRED_STATES.includes(value)
+}
+
+/**
+ * A stored tombstone, rebuilt rather than trusted.
+ *
+ * Same discipline as `loadHistory`: an id can come from a hand-edited store or an older build,
+ * so the shape is checked field by field and anything unrecognised is dropped — which lands the
+ * id back on "unknown", the one answer that is true of a record that says nothing usable.
+ */
+function readTombstone(value: unknown): EphemeralTombstone | undefined {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return undefined
+  const record = value as Record<string, unknown>
+  if (record.retired !== true) return undefined
+  if (typeof record.at !== "number" || !Number.isFinite(record.at)) return undefined
+  if (!isRetiredState(record.how)) return undefined
+  return { retired: true, at: record.at, how: record.how }
 }
 
 /**
@@ -3482,6 +3549,10 @@ async function retainEphemeralHistoryKey(ctx: PluginContext, state: SchedulerSta
     // `isEphemeralHistoryKeyRecord`, which is what refuses anything outside it.
     await storageRemove(ctx, entry.key)
     state.history.delete(entry.key)
+    // A tombstone goes with the key it describes, and this is the only place that can be true:
+    // an evicted key has left no record behind, so an id still claiming to have been retired
+    // would be answering from something the cap deliberately discarded. Pinned by the cap test.
+    state.retired.delete(entry.key)
   }
   state.ephemeralKeys = new Map(kept.map((entry) => [entry.key, entry.at]))
   await storageSet(ctx, EPHEMERAL_INDEX_KEY, kept)
@@ -3493,10 +3564,24 @@ function isEphemeralHistoryKeyRecord(value: unknown): value is EphemeralHistoryK
   return typeof record.key === "string" && isEphemeralHistoryKey(record.key) && typeof record.at === "number"
 }
 
-/** Read one run history, tolerating absent or corrupt storage (spec 002 § Persistence). */
-async function loadHistory(ctx: PluginContext, key: string): Promise<HistoryEntry[]> {
+/**
+ * What a history key holds: run records, a tombstone, or both of neither.
+ *
+ * One read, because a key under this plugin's ephemeral namespace can now be either an array of
+ * runs or a tombstone, and reading twice to find out which would double the storage calls on the
+ * read path to answer a question one call answers. `runs` is empty in both the tombstone and the
+ * absent case, which is exactly what an id with nothing to show should carry.
+ */
+type StoredHistory = { runs: HistoryEntry[]; retired?: EphemeralTombstone }
+
+/** Read one history key, tolerating absent or corrupt storage (spec 002 § Persistence). */
+async function loadHistory(ctx: PluginContext, key: string): Promise<StoredHistory> {
   const stored = await storageGet(ctx, key)
-  if (!Array.isArray(stored)) return []
+  // A tombstone is the other legitimate shape this key can hold. Checked first so a retired id
+  // reads as retired rather than as an absent array, which is the miss this bug was filed for.
+  const retired = readTombstone(stored)
+  if (retired !== undefined) return { runs: [], retired }
+  if (!Array.isArray(stored)) return { runs: [] }
   const entries: HistoryEntry[] = []
   for (const raw of stored) {
     if (raw === null || typeof raw !== "object") continue
@@ -3529,7 +3614,7 @@ async function loadHistory(ctx: PluginContext, key: string): Promise<HistoryEntr
       ...(error !== undefined ? { error: clip(error, HISTORY_ERROR_MAX) } : {}),
     })
   }
-  return entries.slice(-MAX_HISTORY_LIMIT)
+  return { runs: entries.slice(-MAX_HISTORY_LIMIT) }
 }
 
 async function saveHistory(ctx: PluginContext, state: SchedulerState, key: string): Promise<void> {
@@ -3563,7 +3648,18 @@ async function recordRun(
 }
 
 /** What an id turned out to be, and the runs recorded against it. */
-type HistoryOwner = { kind: HistoryKind; session?: string; runs: HistoryEntry[] }
+type HistoryOwner = {
+  kind: HistoryKind
+  session?: string
+  runs: HistoryEntry[]
+  /**
+   * Set only when the id was retired while it had no runs — cancelled, stopped or expired before
+   * it ever fired. Carried alongside an **empty** `runs`, never in place of a run record: it is
+   * how the reader is told the id was real and what became of it, which is the answer `unknown`
+   * cannot give without telling the caller their id was wrong.
+   */
+  retired?: EphemeralTombstone
+}
 
 /**
  * Which history an id belongs to, and whether this plugin can still answer for it.
@@ -3580,6 +3676,12 @@ type HistoryOwner = { kind: HistoryKind; session?: string; runs: HistoryEntry[] 
  * behind, and on a host with no storage they are the only copy there will ever be. Storage alone
  * — the shape this function had after the namespacing fix — turned a one-off that demonstrably ran
  * into `no job with id`, which is the symptom the previous item existed to eliminate.
+ *
+ * **Five states, not four.** Pending, dispatching, finished, retired and unknown each answer a
+ * different question, and the retired one used to fall into unknown: a cancelled one-off has no
+ * runs to find, so it came back as `no job with id "oneoff_…"`, telling the caller they had
+ * guessed an id the plugin had just handed them. Runs are still preferred over a tombstone below,
+ * so an id that ran and was then stopped keeps its record and gains nothing.
  */
 async function resolveHistoryOwner(ctx: PluginContext, state: SchedulerState, id: string): Promise<HistoryOwner | undefined> {
   const job = state.jobs.find((entry) => entry.id === id)
@@ -3602,25 +3704,85 @@ async function resolveHistoryOwner(ctx: PluginContext, state: SchedulerState, id
     return { kind: "loop", session: sessionID, runs: state.history.get(historyKey("loop", id)) ?? [] }
   }
 
-  // Gone from every live list, which is the normal state of a finished one-off.
-  for (const kind of ["oneoff", "loop"] as const) {
+  // Gone from every live list, which is the normal state of a finished one-off and the exact
+  // state of a cancelled one. Runs first, from this process's ring and then from storage; a
+  // tombstone only where there are none, because a run and a retirement cannot both be true.
+  for (const kind of ["oneoff", "loop"] as EphemeralKind[]) {
     const key = historyKey(kind, id)
     const runs = state.history.get(key) ?? []
     if (runs.length > 0) return { kind, runs }
+    const inMemory = state.retired.get(key)
+    if (inMemory !== undefined) return { kind, runs: [], retired: inMemory }
     const stored = await loadHistory(ctx, key)
-    if (stored.length > 0) return { kind, runs: stored }
+    if (stored.runs.length > 0) return { kind, runs: stored.runs }
+    if (stored.retired !== undefined) return { kind, runs: [], retired: stored.retired }
   }
   if (!isEphemeralId(id)) return undefined
   // A pre-fix build wrote ephemeral history flat, under the id itself, and never removed it.
   // Adopt it: copy it to the namespaced key so this and every later read agree, then delete the
   // leaked key — which is the one thing `storage.remove` can now be relied on to do.
   const legacy = historyKey("job", id)
-  const runs = await loadHistory(ctx, legacy)
+  const { runs } = await loadHistory(ctx, legacy)
   if (runs.length === 0) return undefined
   await storageSet(ctx, historyKey("oneoff", id), runs)
   await storageRemove(ctx, legacy)
   await retainEphemeralHistoryKey(ctx, state, historyKey("oneoff", id))
   return { kind: "oneoff", runs }
+}
+
+/**
+ * Leave a tombstone for an ephemeral id that is leaving the live lists with no runs.
+ *
+ * Called from the three places that remove one — `schedules_cancel`, `schedules_stop_loop` and a
+ * loop's expiry in `tick` — so "this id was real and never ran" is one decision with one write
+ * path rather than three call sites that could disagree about when it applies.
+ *
+ * **Never over a run.** A loop that posted and was then stopped keeps its record and gains
+ * nothing: the two facts are exclusive, and a tombstone beside real runs would report an ending
+ * the task never reached. Checked in this process's ring *and* in storage, because after a
+ * restart the runs are on disk and the ring is empty — the case that would otherwise tombstone a
+ * loop that had been posting for hours.
+ *
+ * Retained through `retainEphemeralHistoryKey`, so a tombstone is capped by the same
+ * `MAX_EPHEMERAL_HISTORY_KEYS` as the run records beside it and evicted by the same rule. That
+ * is the answer to the growth this could otherwise cause: one key per retired id, bounded, and an
+ * id past the cap is honestly unknown again rather than remembered forever.
+ */
+async function retireEphemeral(
+  ctx: PluginContext,
+  state: SchedulerState,
+  kind: EphemeralKind,
+  id: string,
+  how: RetiredState,
+): Promise<void> {
+  const key = historyKey(kind, id)
+  if ((state.history.get(key) ?? []).length > 0) return
+  const stored = await loadHistory(ctx, key)
+  if (stored.runs.length > 0) return
+  const tombstone: EphemeralTombstone = { retired: true, at: Date.now(), how }
+  state.retired.set(key, tombstone)
+  await storageSet(ctx, key, tombstone)
+  await retainEphemeralHistoryKey(ctx, state, key)
+}
+
+/**
+ * Whether an id this plugin minted has already been retired, and how.
+ *
+ * Memory first, storage second, for the same reason `resolveHistoryOwner` does: on a host that
+ * persists nothing this process's own map is the only copy there is. A stored tombstone that does
+ * not validate is not adopted, so a hand-edited or corrupt record leaves the id retired *and* with
+ * no ending to report — which is the honest state, and never one this invents.
+ */
+async function readRetired(
+  ctx: PluginContext,
+  state: SchedulerState,
+  kind: EphemeralKind,
+  id: string,
+): Promise<EphemeralTombstone | undefined> {
+  // Only this plugin's own generated ids can carry one, so a job id is answered without a read.
+  if (!isEphemeralId(id)) return undefined
+  const key = historyKey(kind, id)
+  return state.retired.get(key) ?? (await loadHistory(ctx, key)).retired
 }
 
 /**
@@ -4369,6 +4531,10 @@ async function tick(ctx: PluginContext, state: SchedulerState, lease: Lease, max
         // in storage comes back whole after a restart, which is how a stopped loop kept
         // posting.
         dirty = true
+        // Same tombstone as a stop, with its own word: a loop whose lifetime ran out before it
+        // ever posted is gone from every live list with nothing to find, and "expired" is the
+        // truth where "unknown" is not. `retireEphemeral` declines when it has runs.
+        await retireEphemeral(ctx, state, "loop", loop.id, "expired")
         continue
       }
       surviving.push(loop)
@@ -4610,6 +4776,10 @@ function buildTools(
           // Persisted, not just emptied in memory: this is the write whose absence let a
           // later `start_loop` read the stale record and resurrect every stopped loop.
           await saveLoops(ctx, sessionID, [])
+          // Each loop that never posted leaves a tombstone, so `schedules_history` can answer for
+          // a stopped loop id instead of calling it unknown. One write per loop, capped by
+          // `retireEphemeral` exactly like the run records.
+          for (const loop of existing) await retireEphemeral(ctx, state, "loop", loop.id, "stopped")
           // Removing work can empty a project, and an empty project owes the writer lease back
           // rather than polling for the rest of the process's life.
           arm()
@@ -4628,6 +4798,10 @@ function buildTools(
         const remaining = existing.filter((loop) => loop.id !== id)
         state.loops.set(sessionID, remaining)
         await saveLoops(ctx, sessionID, remaining)
+        // The reachable case this fix exists for on the loop side: a loop stopped before it ever
+        // fired is in no live list and has no runs to find, so without a tombstone its id came
+        // back as "no job with id" — the same wrong answer a cancelled one-off used to get.
+        await retireEphemeral(ctx, state, "loop", id, "stopped")
         arm()
         logLine(`stopped loop ${id}`)
         return {
@@ -4703,8 +4877,20 @@ function buildTools(
         const before = state.oneOffs.length
         const target = state.oneOffs.find((task) => task.id === id)
         if (target === undefined) {
-          // Naming the id matters: "no such one-off" and "already ran" are different
-          // answers, and an agent retrying needs to know which happened.
+          // Naming the id matters: "no such one-off", "already cancelled" and "already ran" are
+          // different answers, and an agent retrying needs to know which happened. The cancelled
+          // case is read from the tombstone rather than inferred, because the fallback sentence
+          // below — "it may have already run" — is false for a task this tool cancelled and it
+          // never dispatched.
+          const retired = await readRetired(ctx, state, "oneoff", id)
+          if (retired !== undefined && retired.how === "cancelled") {
+            return {
+              output: {
+                error: `one-off "${id}" was already cancelled and never ran`,
+                pending: before,
+              },
+            }
+          }
           return {
             output: {
               error: `no pending one-off with id "${id}" (it may have already run; check schedules_history)`,
@@ -4714,6 +4900,9 @@ function buildTools(
         }
         state.oneOffs = state.oneOffs.filter((task) => task.id !== id)
         await saveOneOffs(ctx, state.oneOffs)
+        // Before the return, and not after the log: a cancel with no tombstone is an id the caller
+        // cannot ask about afterwards, which is what made it come back as "no job with id".
+        await retireEphemeral(ctx, state, "oneoff", id, "cancelled")
         arm()
         logLine(`cancelled one-off ${id}`)
         return { output: { id, cancelled: true, pending: state.oneOffs.length } }
@@ -4723,7 +4912,9 @@ function buildTools(
       name: "history",
       description:
         "Return recent runs for a job, a one-off or a session loop, newest first: due and start instants, outcome, resolved model, " +
-        "and any error. A run carries inMemoryOnly on a host with no storage: it is readable for this session and not after it.",
+        "and any error. A run carries inMemoryOnly on a host with no storage: it is readable for this session and not after it. " +
+        "A task that was cancelled, stopped or expired before it ever ran carries status (cancelled, stopped, expired) with an empty " +
+        "run list, so a valid id is never reported as one that does not exist.",
       input: {
         type: "object",
         properties: {
@@ -4753,12 +4944,16 @@ function buildTools(
           return {
             output: {
               error: `no job with id "${id}"`,
-              // Jobs plus what is still pending: the live ids this plugin can name. A completed
-              // one-off is deliberately absent — it has no pending record to name it by, which
-              // is the whole reason the lookup above had to reach into storage.
+              // Every id that is **live right now**, across all three kinds: a job, a pending
+              // one-off, or a running session loop. An id that has already left those lists is
+              // deliberately absent — a finished or retired one has no live record to name it by,
+              // which is why the lookup above reaches into memory and storage at all. Loops are
+              // included because a mistyped loop id was previously answered with a list that
+              // could not contain it, which is the "you guessed" message this branch already is.
               ids: [
                 ...state.jobs.map((entry) => entry.id),
                 ...state.oneOffs.map((task) => task.id),
+                ...[...state.loops.values()].flatMap((loops) => loops.map((loop) => loop.id)),
               ],
               // A completed one-off or loop is named by neither list, so on a host that cannot
               // read storage the two remaining explanations — "never ran" and "ran, and the
@@ -4801,6 +4996,14 @@ function buildTools(
             // session, a job may reuse one, and a one-off has a fresh session every time.
             kind: owner.kind,
             ...(owner.session !== undefined ? { session: owner.session } : {}),
+            // A **success**, not an error: the id was the caller's, it was cancelled or stopped
+            // before it ever ran, and that is an answer they can act on. `runs` is empty beside it
+            // by construction rather than by loss, and neither field ever accompanies a run
+            // record — `resolveHistoryOwner` prefers runs, so an id that ran keeps its runs and
+            // gains no ending it never reached.
+            ...(owner.retired !== undefined
+              ? { status: owner.retired.how, at: new Date(owner.retired.at).toISOString() }
+              : {}),
             runs,
             limit,
           },
@@ -5024,6 +5227,7 @@ const definition: PluginDefinition = {
       invalid: [],
       storageAvailable: storageMissing.length === 0,
       ephemeralKeys: new Map(),
+      retired: new Map(),
     }
 
     // Options are read once, from the `plugins: [{ package, options }]` object form. The job

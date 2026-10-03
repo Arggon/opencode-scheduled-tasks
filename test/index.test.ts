@@ -10411,3 +10411,448 @@ describe("the v1 contract, stated positively (task-assert-v1-identical-with-no-m
     expect(h.store.get("scheduled-tasks/history/nightly")).toHaveLength(2)
   })
 })
+// =====================================================================
+// (bug-history-says-no-job-with-id-for-a-cancelled-oneoff)
+//
+// The live dogfood sequence, on the deployed build: schedule a one-off,
+// cancel it, ask what it did.
+//
+//   schedules_schedule({ prompt: "…", dueIn: "24h" })  -> { id: "oneoff_…", pending: 1 }
+//   schedules_cancel({ id: "oneoff_…" })               -> { cancelled: true, pending: 0 }
+//   schedules_history({ id: "oneoff_…" })              -> { error: 'no job with id "oneoff_…"' }
+//
+// The id was the caller's own and valid. It named a one-off that was created and then cancelled,
+// so it never ran and has no runs — and the message it got back says the caller got the id wrong,
+// which is the wrong conclusion drawn from a message that looks authoritative.
+//
+// `resolveHistoryOwner` already separated pending, dispatching and finished from unknown, each
+// with the words that answer a different question. A cancelled one-off is a fourth with no runs
+// to find, so it fell through into unknown. A loop stopped before it ever fired is the same shape,
+// which the item asks about rather than assumes — and so is one that expires before its first
+// post.
+//
+// So the block pins one rule: a retired ephemeral id is **named**. Every case below asserts the
+// absence of the other answer as well as the presence of its own, because the whole defect was
+// one message serving two states — a test that only checked "an error came back" would have
+// passed before the fix.
+// =====================================================================
+describe("a retired ephemeral id is named, not called unknown (bug-history-says-no-job-with-id-for-a-cancelled-oneoff)", () => {
+  /** One fixed instant, so every ISO string below is a constant rather than a shape check. */
+  const NOON = Date.parse("2026-10-03T12:00:00.000Z")
+
+  let dir: string
+  let restoreEnv: string | undefined
+  let consoleLines: string[]
+  let realConsoleError: typeof console.error
+  const outstanding: Array<() => void> = []
+
+  /**
+   * Project ids for the hosts below.
+   *
+   * `logOnce` dedups per project id on a module-level set that outlives a single test, so two
+   * hosts sharing one would share a degradation line and the second would assert against nothing.
+   */
+  let instances = 0
+
+  beforeEach(() => {
+    vi.useFakeTimers()
+    vi.setSystemTime(NOON)
+    dir = mkdtempSync(join(tmpdir(), "st-retired-"))
+    mkdirSync(join(dir, ".opencode"), { recursive: true })
+    // A project with no jobs at all: every id below is minted by a tool, never read from a file.
+    writeFileSync(join(dir, ".opencode", "schedules.json"), JSON.stringify({ version: 1, jobs: [] }))
+    restoreEnv = process.env[DATA_DIR_ENV]
+    process.env[DATA_DIR_ENV] = join(dir, "state")
+    realConsoleError = console.error
+    consoleLines = []
+    console.error = (...args: unknown[]): void => void consoleLines.push(args.map(String).join(" "))
+  })
+
+  afterEach(() => {
+    for (const dispose of outstanding.splice(0).reverse()) {
+      try {
+        dispose()
+      } catch {
+        /* a failing teardown must not mask the assertion that ran before it */
+      }
+    }
+    console.error = realConsoleError
+    if (restoreEnv === undefined) delete process.env[DATA_DIR_ENV]
+    else process.env[DATA_DIR_ENV] = restoreEnv
+    rmSync(dir, { recursive: true, force: true })
+    vi.useRealTimers()
+  })
+
+  type Tool = {
+    execute: (
+      input: Record<string, unknown>,
+      context?: { sessionID?: unknown },
+    ) => Promise<{ output: Record<string, unknown> }>
+  }
+
+  type Retired = {
+    tool: (name: string) => Tool
+    store: Map<string, unknown>
+    prompts: Record<string, unknown>[]
+    /** Every key the host actually deleted, in order. */
+    removed: string[]
+    cleanup: () => void
+  }
+
+  /**
+   * One plugin instance over a `get`/`set`/`remove` store.
+   *
+   * `scan` is offered because that is the host surface loops are restored through at setup, and
+   * the store can be handed in rather than created so a second instance can be brought up over
+   * what the first one wrote — which is the only honest way to test that the record outlives the
+   * process that made it.
+   */
+  async function instance(
+    options: { store?: Map<string, unknown>; seed?: Record<string, unknown>; tickMs?: number } = {},
+  ): Promise<Retired> {
+    const store = options.store ?? new Map<string, unknown>(Object.entries(options.seed ?? {}))
+    const prompts: Record<string, unknown>[] = []
+    const removed: string[] = []
+    const tools: Array<Record<string, unknown>> = []
+    const resolved = await plugin.setup({
+      ...(options.tickMs === undefined ? {} : { options: { tickMs: options.tickMs } }),
+      location: { directory: dir, project: { id: `retired-${(instances += 1)}` } },
+      storage: {
+        get: async (key: string) => store.get(key),
+        set: async (key: string, value: unknown) => void store.set(key, value),
+        // Records the call *and* performs it: a double that only logged the intent would let a
+        // test assert an eviction while the key stayed on disk.
+        remove: async (key: string) => {
+          removed.push(key)
+          store.delete(key)
+        },
+        scan: async (input: { prefix?: string }) => ({
+          entries: [...store.entries()]
+            .filter(([key]) => key.startsWith(input.prefix ?? ""))
+            .map(([key, value]) => ({ key, value })),
+        }),
+      },
+      session: {
+        create: async () => ({ id: "ses_retired" }),
+        prompt: async (input: Record<string, unknown>) => {
+          prompts.push(input)
+          return { id: `inbox_${prompts.length}` }
+        },
+      },
+      tool: {
+        transform: async (cb: (editor: { add?: (tool: unknown) => void }) => void) => {
+          cb({ add: (tool) => void tools.push(tool as Record<string, unknown>) })
+          return { dispose() {} }
+        },
+      },
+    } as never)
+    const cleanup = (): void => void (resolved as () => void)?.()
+    outstanding.push(cleanup)
+    return {
+      store,
+      prompts,
+      removed,
+      cleanup,
+      tool: (name: string): Tool => {
+        const found = tools.find((entry) => entry.name === name)
+        if (found === undefined) throw new Error(`tool ${name} was not registered`)
+        return found as unknown as Tool
+      },
+    }
+  }
+
+  /** Flush pending microtasks and 0/1ms timers on the injected clock. */
+  async function settle(turns = 20): Promise<void> {
+    for (let n = 0; n < turns; n += 1) await vi.advanceTimersByTimeAsync(1)
+  }
+
+  /** A one-off far enough out that no tick can fire it: the subject of every cancellation here. */
+  const later = (): Record<string, unknown> => ({ prompt: "the one-off prompt", dueIn: "2h" })
+
+  /** A loop on an interval no tick here can reach, so it cannot post before it is stopped. */
+  const slowLoop = (): Record<string, unknown> => ({ prompt: "the loop prompt", every: "1h" })
+
+  /** The history key a tombstone shares with the run records of one ephemeral id. */
+  const oneOffKey = (id: string): string => `scheduled-tasks/history/oneoff/${id}`
+
+  // -------------------------------------------------------------------
+  // The reported case, and the answer it now gets.
+  // -------------------------------------------------------------------
+
+  it("answers for a cancelled one-off with the cancellation, not with a miss", async () => {
+    const h = await instance()
+    const id = ((await h.tool("schedule").execute(later())).output.id) as string
+    expect(id).toMatch(/^oneoff_/)
+    expect((await h.tool("cancel").execute({ id })).output).toMatchObject({ cancelled: true })
+
+    // The exact live repro, and the claim: an error is what told the caller they had guessed.
+    const read = (await h.tool("history").execute({ id })).output
+    expect(read.error).toBeUndefined()
+    expect(read.id).toBe(id)
+    expect(read.kind).toBe("oneoff")
+    // The ending is on the answer itself, not implied by an empty list: "no runs" alone is what a
+    // *pending* one-off says, and the two must not look alike.
+    expect(read.status).toBe("cancelled")
+    expect(read.at).toBe("2026-10-03T12:00:00.000Z")
+    expect(read.runs).toEqual([])
+    // …and nothing on this answer suggests a wrong guess, which is what the `ids` list of a miss does.
+    expect("ids" in read).toBe(false)
+  })
+
+  it("stores the cancellation as a tombstone beside the runs it replaced, never as a run", async () => {
+    const h = await instance()
+    const id = ((await h.tool("schedule").execute(later())).output.id) as string
+    await h.tool("cancel").execute({ id })
+
+    // The shape is the point. A fabricated entry — a synthetic `dueAt`, an outcome, a model —
+    // would put "it ran" into the list a caller reads to find out what ran, and an array here is
+    // exactly that. What is stored says only that the id existed and how it ended.
+    const stored = h.store.get(oneOffKey(id))
+    expect(stored).toEqual({ retired: true, at: NOON, how: "cancelled" })
+    expect(Array.isArray(stored)).toBe(false)
+    // Nothing dispatched, because nothing ran: asserted on the host, not on a log line.
+    expect(h.prompts).toEqual([])
+  })
+
+  it("still calls an unknown id a miss, and lists the ids that are live", async () => {
+    const h = await instance()
+    const pending = ((await h.tool("schedule").execute(later())).output.id) as string
+    const live = ((await h.tool("schedule").execute(later())).output.id) as string
+    const cancelled = ((await h.tool("schedule").execute(later())).output.id) as string
+    await h.tool("cancel").execute({ id: cancelled })
+
+    const miss = (await h.tool("history").execute({ id: "oneoff_neverminted" })).output
+    expect(String(miss.error)).toMatch(/no job with id "oneoff_neverminted"/)
+    // The retired answer must not leak onto an id that genuinely is not known — the other half of
+    // "these are different states", and what makes the pair above a pair rather than one answer.
+    expect(miss.status).toBeUndefined()
+    expect(miss.at).toBeUndefined()
+    expect(miss.runs).toBeUndefined()
+    // Live ids, so the list is a place to look rather than a suggestion that the guess failed.
+    expect(miss.ids).toEqual([pending, live])
+    // The cancelled one is absent, and that is now honest: it is answerable, by asking about it.
+    expect((miss.ids as string[])).not.toContain(cancelled)
+    expect((await h.tool("history").execute({ id: cancelled })).output.status).toBe("cancelled")
+  })
+
+  it("names a pending one-off as pending, never as retired", async () => {
+    const h = await instance()
+    const id = ((await h.tool("schedule").execute(later())).output.id) as string
+
+    const read = (await h.tool("history").execute({ id })).output
+    expect(read.error).toBeUndefined()
+    expect(read.runs).toEqual([])
+    // Empty runs, and *no* ending: the live-list answer comes first, so a tombstone written by a
+    // later cancellation of the same id could never claim this one had already ended.
+    expect(read.status).toBeUndefined()
+    expect(read.at).toBeUndefined()
+  })
+
+  // -------------------------------------------------------------------
+  // The case the item asks about rather than assumes: a loop stopped
+  // before it ever fired, and one whose lifetime ran out first.
+  // -------------------------------------------------------------------
+
+  it("names a loop stopped before it fired, which has no runs to find", async () => {
+    const h = await instance()
+    const call = { sessionID: "ses_abc" }
+    const id = ((await h.tool("start_loop").execute(slowLoop(), call)).output.id) as string
+    expect(id).toMatch(/^loop_/)
+    expect((await h.tool("stop_loop").execute({ id }, call)).output.loops).toEqual([])
+
+    // Reachable and previously wrong: the loop is in no live list, its history key is absent, and
+    // the id the caller was just handed came back as "no job with id".
+    const read = (await h.tool("history").execute({ id })).output
+    expect(read.error).toBeUndefined()
+    expect(read.kind).toBe("loop")
+    expect(read.status).toBe("stopped")
+    expect(read.at).toBe("2026-10-03T12:00:00.000Z")
+    expect(read.runs).toEqual([])
+  })
+
+  it("names every loop stopped at once, through the same single-id path", async () => {
+    const h = await instance()
+    const call = { sessionID: "ses_abc" }
+    const first = ((await h.tool("start_loop").execute(slowLoop(), call)).output.id) as string
+    const second = ((await h.tool("start_loop").execute(slowLoop(), call)).output.id) as string
+    expect((await h.tool("stop_loop").execute({}, call)).output.loops).toEqual([])
+
+    // "Stop all" is the other route out of the live lists, and it is the one an agent reaches for
+    // without naming ids — so the ids it stopped must be answerable afterwards too.
+    for (const id of [first, second]) {
+      const read = (await h.tool("history").execute({ id })).output
+      expect(read.status).toBe("stopped")
+      expect(read.runs).toEqual([])
+    }
+  })
+
+  it("names a loop that expired before its first post, and not a stop", async () => {
+    const h = await instance({ tickMs: MIN_TICK_MS, seed: {
+      // Already past its lifetime and not due, so the drain retires it without posting: the third
+      // route out of the live lists, and the only one nothing asked for.
+      "scheduled-tasks/loop/ses_abc": [
+        {
+          id: "loop_doomed",
+          prompt: "the loop prompt",
+          intervalMs: MINUTE_MS,
+          nextRunAt: NOON + 60 * MINUTE_MS,
+          expiresAt: NOON - 1_000,
+          createdAt: NOON - 60 * MINUTE_MS,
+        },
+      ],
+    } })
+    await settle()
+    // Two ticks is a bound, not a wait: the first one retires the loop, the second confirms the
+    // tick drained rather than having stalled on the first.
+    await vi.advanceTimersByTimeAsync(MIN_TICK_MS * 2)
+    await settle()
+    expect(h.prompts).toEqual([])
+
+    const read = (await h.tool("history").execute({ id: "loop_doomed" })).output
+    expect(read.error).toBeUndefined()
+    expect(read.kind).toBe("loop")
+    expect(read.status).toBe("expired")
+    expect(read.runs).toEqual([])
+  })
+
+  it("keeps the runs of a loop that posted before it was stopped, and adds no ending", async () => {
+    const h = await instance({ seed: {
+      "scheduled-tasks/loop/ses_abc": [
+        {
+          id: "loop_poster",
+          prompt: "the loop prompt",
+          intervalMs: MINUTE_MS,
+          nextRunAt: NOON + 60 * MINUTE_MS,
+          expiresAt: NOON + 60 * MINUTE_MS,
+          createdAt: NOON,
+        },
+      ],
+      "scheduled-tasks/history/loop/loop_poster": [
+        { dueAt: NOON - 60_000, startedAt: NOON - 60_000, outcome: "ok", model: "opencode/space-bunny-free", sessionID: "ses_abc" },
+      ],
+    } })
+    const call = { sessionID: "ses_abc" }
+    expect((await h.tool("stop_loop").execute({ id: "loop_poster" }, call)).output.loops).toEqual([])
+
+    // Runs are preferred to a tombstone, and a tombstone is never written over them: a task that
+    // ran and was then stopped did not end by being stopped, and saying so would be the same class
+    // of wrong answer as the miss this fix removed.
+    const read = (await h.tool("history").execute({ id: "loop_poster" })).output
+    expect(read.error).toBeUndefined()
+    expect(read.runs).toMatchObject([{ outcome: "ok", sessionID: "ses_abc" }])
+    expect(read.status).toBeUndefined()
+    expect(read.at).toBeUndefined()
+    // Untouched on disk too: the run record is the copy that has to survive a restart, so a
+    // tombstone written over it would lose the run rather than annotate it.
+    expect(h.store.get("scheduled-tasks/history/loop/loop_poster")).toMatchObject([{ outcome: "ok" }])
+  })
+
+  // -------------------------------------------------------------------
+  // The record outlives the process, and it is bounded like the one it
+  // sits beside.
+  // -------------------------------------------------------------------
+
+  it("still names a cancelled one-off after a restart, from the persisted record", async () => {
+    const store = new Map<string, unknown>()
+    const first = await instance({ store })
+    const id = ((await first.tool("schedule").execute(later())).output.id) as string
+    await first.tool("cancel").execute({ id })
+    first.cleanup()
+
+    // A second instance over the same store: its memory holds nothing, so this answer can only
+    // come from what was persisted — which is the half a memory-only fix would leave missing.
+    const second = await instance({ store })
+    const read = (await second.tool("history").execute({ id })).output
+    expect(read.error).toBeUndefined()
+    expect(read.kind).toBe("oneoff")
+    expect(read.status).toBe("cancelled")
+    expect(read.runs).toEqual([])
+  })
+
+  it("caps tombstones with the run records they share a key with", async () => {
+    // The index seeded to the cap, so the cancellation below is the one key over it and the oldest
+    // is evicted. This is the bound that makes a per-id record affordable at all: one key per
+    // retired id, capped like every other ephemeral key, and nothing unbounded anywhere.
+    const index = Array.from({ length: MAX_EPHEMERAL_HISTORY_KEYS }, (_, n) => ({
+      key: `scheduled-tasks/history/oneoff/old${n}`,
+      at: n + 1,
+    }))
+    const h = await instance({ seed: { "scheduled-tasks/history/ephemeral": index } })
+    const id = ((await h.tool("schedule").execute(later())).output.id) as string
+    await h.tool("cancel").execute({ id })
+
+    // Retired *and* retained: a tombstone that never reached the cap would be an unbounded map.
+    expect((await h.tool("history").execute({ id })).output.status).toBe("cancelled")
+    expect(h.store.get("scheduled-tasks/history/ephemeral")).toHaveLength(MAX_EPHEMERAL_HISTORY_KEYS)
+    // The oldest ephemeral key went with it, in storage and in this process's memory, so an id
+    // whose record the cap discarded is honestly unknown again rather than remembered forever.
+    expect(h.store.has("scheduled-tasks/history/oneoff/old0")).toBe(false)
+    expect(h.removed).toContain("scheduled-tasks/history/oneoff/old0")
+    const dropped = (await h.tool("history").execute({ id: "oneoff_old0" })).output
+    expect(dropped.status).toBeUndefined()
+    expect(String(dropped.error)).toMatch(/no job with id "oneoff_old0"/)
+  })
+
+  it("forgets a tombstone of its own once the cap discards the key it describes", async () => {
+    // The same cap reached by cancelling rather than by seeding, so the key that falls off is one
+    // **this process** minted and holds a tombstone for. That is the half a cap test seeded from
+    // the index cannot reach: the in-memory tombstone has to go with the key, or the answer would
+    // outlive the record it describes and the "bounded" claim would be true only on disk.
+    const h = await instance()
+    const ids: string[] = []
+    for (let n = 0; n <= MAX_EPHEMERAL_HISTORY_KEYS; n += 1) {
+      ids.push(((await h.tool("schedule").execute(later())).output.id) as string)
+      await h.tool("cancel").execute({ id: ids[n]! })
+    }
+
+    // The oldest is gone from both halves: nothing on disk…
+    expect(h.store.has(oneOffKey(ids[0]!))).toBe(false)
+    expect(h.removed).toContain(oneOffKey(ids[0]!))
+    // …and nothing in memory, which is the assertion that fails when only the storage key is
+    // deleted. It reads as unknown again rather than as a cancellation it can no longer stand behind.
+    const dropped = (await h.tool("history").execute({ id: ids[0]! })).output
+    expect(dropped.status).toBeUndefined()
+    expect(String(dropped.error)).toMatch(new RegExp(`no job with id "${ids[0]}"`))
+    // And the newest is untouched: the cap drops exactly one, not the rest with it.
+    expect((await h.tool("history").execute({ id: ids.at(-1)! })).output.status).toBe("cancelled")
+    expect(h.store.get("scheduled-tasks/history/ephemeral")).toHaveLength(MAX_EPHEMERAL_HISTORY_KEYS)
+  }, 60_000)
+
+  // -------------------------------------------------------------------
+  // The same wrong answer, one tool over: `schedules_cancel` on an id it
+  // had already cancelled.
+  // -------------------------------------------------------------------
+
+  it("tells a repeated cancel that the task was cancelled, not that it may have run", async () => {
+    const h = await instance()
+    const id = ((await h.tool("schedule").execute(later())).output.id) as string
+    await h.tool("cancel").execute({ id })
+
+    // The fallback sentence on this path is "it may have already run" — false for a task this
+    // plugin cancelled and never dispatched, and the same wrong conclusion reached from a
+    // different tool. Read from the tombstone rather than inferred from the absence of the task.
+    const again = (await h.tool("cancel").execute({ id })).output
+    expect(String(again.error)).toMatch(new RegExp(`was already cancelled and never ran`))
+    expect(String(again.error)).not.toMatch(/already ran/)
+    expect(again.pending).toBe(0)
+    // And the two answers still agree with each other rather than contradicting: this tool and
+    // `schedules_history` are describing one event.
+    expect((await h.tool("history").execute({ id })).output.status).toBe("cancelled")
+  })
+
+  it("still offers schedules_history for a one-off that really did run", async () => {
+    const h = await instance()
+    // Due inside the grace window, so the first tick dispatches it and the run is recorded.
+    const id = ((await h.tool("schedule").execute({ prompt: "the one-off prompt", dueAt: NOON - 1_000 })).output.id) as string
+    await settle()
+    expect(h.prompts).toHaveLength(1)
+
+    // The other half of that message, which must keep saying what it says: this id is *not*
+    // retired, so the hint is still the right one and the fix must not have swallowed it.
+    const afterRun = (await h.tool("cancel").execute({ id })).output
+    expect(String(afterRun.error)).toMatch(/check schedules_history/)
+    const read = (await h.tool("history").execute({ id })).output
+    expect(read.runs).toMatchObject([{ outcome: "ok" }])
+    expect(read.status).toBeUndefined()
+  })
+})
