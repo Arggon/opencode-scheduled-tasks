@@ -1,13 +1,15 @@
 ---
 type: bug
-status: todo
+status: in_progress
 id: bug-log-lines-before-first-lease-never-reach-the-file
 title: "The first diagnostic lines never reach scheduler.log, because only acquireLease creates the log directory"
+assignee: arggon
 parent: v1-tick-loop-scheduler
 labels: []
 priority: p2
 created: "2026-10-02"
-updated: "2026-10-02"
+updated: "2026-10-03"
+claimed_at: "2026-10-03T00:23:23.963Z"
 depends_on: [bug-storageless-degradation-unrecorded]
 ---
 <!--
