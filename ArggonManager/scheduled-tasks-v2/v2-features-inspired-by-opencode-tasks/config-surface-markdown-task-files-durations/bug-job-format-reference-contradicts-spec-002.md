@@ -1,13 +1,15 @@
 ---
 type: bug
-status: todo
+status: in_progress
 id: bug-job-format-reference-contradicts-spec-002
 title: schedules_format advertises a runTimeout the parser rejects and omits permissions and session
+assignee: arggon
 parent: config-surface-markdown-task-files-durations
 labels: []
 priority: p2
 created: "2026-10-03"
 updated: "2026-10-03"
+claimed_at: "2026-10-03T05:40:58.156Z"
 depends_on: [task-t7-attribution-docs-and-v2-gate]
 ---
 <!--
