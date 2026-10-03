@@ -1,6 +1,6 @@
 ---
 type: task
-status: in_progress
+status: done
 id: task-t7-attribution-docs-and-v2-gate
 title: "Attribution, README docs, and the v2 gate"
 assignee: arggon
@@ -9,7 +9,6 @@ parent: config-surface-markdown-task-files-durations
 labels: []
 created: "2026-10-02"
 updated: "2026-10-03"
-claimed_at: "2026-10-03T05:11:52.152Z"
 depends_on: [task-pin-twelve-untested-spec-001-behaviours]
 ---
 <!--
@@ -59,11 +58,19 @@ See plan 002 §T7, spec 002, and ADR 0007.
 > and its author and links ADR 0007; ADR 0004 line 17, ADR 0005 line 21 and ADR 0006 line 27 each
 > cite it inline at the point of influence, each linking ADR 0007. Nothing to change.
 
-- [ ] A **v1 job file with no markdown directory behaves identically** — the upgrade is
-      additive, asserted by a test rather than claimed. **Closes by reference:** the test half
-      is `task-assert-v1-identical-with-no-markdown-dir`, filed because this item is docs and
-      the test file belonged to the other worker in the wave. The additive half is already
-      asserted; that item states the v1 contract positively for the rest.
+- [x] A **v1 job file with no markdown directory behaves identically** — the upgrade is
+
+      additive, asserted by a test rather than claimed. **Closed by
+      `task-assert-v1-identical-with-no-markdown-dir`**, 15 tests over a v1 file written with only the
+      fields spec 001's synopsis lists, on projects the harness proves have no `.opencode/tasks/`. Seven
+      hand-derived `nextRun` instants including `America/St_Johns` at both -2:30 and -3:30; a cadence
+      test over five consecutive readings in New York in both seasons, because a single instant would
+      not have shown today's p0. 17 mutations, all red; M02 and M10c each turned **exactly one** test
+      red out of 319, and both were added there.
+
+      **Scope stated deliberately:** v1 was never kept as a build, so this asserts the v1 contract
+      positively rather than diffing against one. It does not prove the two releases are
+      byte-identical in behaviour, and does not claim to.
 
 > **Not ticked — half the box is asserted; "behaves identically" is not.** `test/index.test.ts`
 > does assert the additive half, and strongly:
