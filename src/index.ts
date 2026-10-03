@@ -3772,6 +3772,38 @@ async function runJob(
   }
 }
 
+/**
+ * Hand the event loop back for exactly one turn.
+ *
+ * The job loop below is the only place in this file that can spend seconds of straight-line CPU.
+ * One job's `MAX_BACKLOG_SCAN` walk is ~24 ms on its own (6012 timezone lookups), and at
+ * `DEFAULT_MAX_JOBS` (100 jobs, each owing a capped backlog — which needs ≥17 h asleep) a hundred
+ * of them run back to back. Measured on this file (2026-10-03, 24 h backlog, `* * * * *`, UTC, the
+ * real `tick` driven through `setup`): **601 800 lookups, and a 2.45 s stretch in which no timer
+ * and no I/O callback ran at all** — `setImmediate` and `setTimeout(0)` markers queued during the
+ * walk both fired only after the last job had been evaluated.
+ *
+ * That gap is the whole difference between *busy* and *blocked*. The loop already interleaves
+ * microtasks — the skip path awaits a storage write — and microtasks do not end a turn, so nothing
+ * else in the host process gets to run for the length of the walk. This plugin runs inside the
+ * user's editor session, so an unbounded straight-line run here is invariant 3 failing outright,
+ * not a slow schedule.
+ *
+ * **A macrotask turn, and nothing weaker.** A microtask at this point would restore nothing, which
+ * is the measurement above rather than an assumption about it. `setImmediate` rather than
+ * `setTimeout(0)`: it is the check phase, so it costs one loop iteration with no timer clamping,
+ * and it cannot be queued behind another timer that has not expired.
+ *
+ * **Paid only where the walk was**, at the call site. The caller decides; this is just the turn.
+ * The bound it buys is a statement about **work**, not about a machine's clock: no blocking run is
+ * longer than one job's bounded walk, whatever the number of jobs behind it.
+ */
+function yieldToEventLoop(): Promise<void> {
+  return new Promise<void>((resolve) => {
+    setImmediate(resolve)
+  })
+}
+
 /** Evaluate every enabled job once. Re-entrancy is guarded by the caller. */
 async function tick(ctx: PluginContext, state: SchedulerState, lease: Lease, maxConcurrent: number): Promise<void> {
   lease.heartbeat()
@@ -3779,10 +3811,37 @@ async function tick(ctx: PluginContext, state: SchedulerState, lease: Lease, max
   const now = Date.now()
   const decisions: Array<Extract<TickDecision, { kind: "run" }>> = []
 
+  /**
+   * Occurrences walked since this tick last handed the event loop back.
+   *
+   * The bound is `MAX_BACKLOG_SCAN` because that is the unit of the work being bounded: one job's
+   * walk cannot exceed it, so a turn taken whenever the meter reaches it means **no blocking run is
+   * longer than one job's walk**, whatever the job count behind it. It is a count and not a clock
+   * so that the bound is the same on a fast machine and a slow one.
+   */
+  let walkedSinceTurn = 0
+
   for (const job of state.jobs) {
     if (!job.enabled) continue
     const spec = state.specs.get(job.id)
     if (spec === undefined) continue
+
+    // **Hand the loop back before the walk that would extend the current run.** Checked here, at the
+    // top, rather than after the decision below: the turn then separates walks, so a job that finds
+    // a backlog always begins a fresh blocking run and the run it begins is exactly one walk. The
+    // cost is a turn only on the ticks that would otherwise have blocked — measured at ~1.5 µs,
+    // against a tick that spends ~24 ms per capped backlog — so an ordinary tick pays nothing.
+    //
+    // Nothing the turn protects is affected by it: `resolveDue` decides **and** mutates the record
+    // before the meter is charged, `decisions` keeps the order the loop found, and the shared
+    // budget below is seeded from `decisions.length`, which a turn cannot reorder. What the turn
+    // *does* change is real and is the point — a run still in flight from an earlier tick may now
+    // settle while this loop waits, so `state.inFlight.size` can fall mid-loop. That can only free a
+    // slot, never hand one out twice: every admitted decision still costs exactly one.
+    if (walkedSinceTurn >= MAX_BACKLOG_SCAN) {
+      walkedSinceTurn = 0
+      await yieldToEventLoop()
+    }
 
     const record = state.states[job.id] ?? { version: STATE_VERSION }
     state.states[job.id] = record
@@ -3802,6 +3861,25 @@ async function tick(ctx: PluginContext, state: SchedulerState, lease: Lease, max
       state.inFlight.size + decisions.length,
       maxConcurrent,
     )
+    // Charge what this decision walked, in **occurrences** rather than in milliseconds — a count
+    // the tick already has, so the meter cannot drift from the work and the block it bounds is a
+    // statement about work rather than about one machine's clock.
+    //
+    // `backlogFound` is what makes the charge honest rather than merely cheap: it is true on exactly
+    // one decision per backlog — the one that ran the bounded counting walk to find the remainder
+    // and put it in the durable plan — and false on every replay off that plan, where the walk is a
+    // single search because the number travelled with the plan. So a replay tick is charged nothing,
+    // exactly as it spends nothing, and an ordinary tick is charged nothing, exactly as it spends
+    // nothing. Charging `dropped` on every decision would have put a turn per job on every replay
+    // tick, interrupting work that was never there.
+    if (decision?.occurrence.backlogFound === true) {
+      // The instants handed back were searched for before the remainder was counted, so they are
+      // part of what the decision cost. That term is what carries one capped walk past the bound on
+      // its own, which is why the turn is taken at the *top* of the next iteration rather than here:
+      // a single job's walk then never spends a turn interrupting nothing, and the tick it starts is
+      // a fresh blocking run.
+      walkedSinceTurn += (job.misfire === "backfill" ? job.maxCatchUp : 1) + decision.occurrence.dropped
+    }
     if (decision === undefined) continue
 
     if (decision.kind === "skip") {

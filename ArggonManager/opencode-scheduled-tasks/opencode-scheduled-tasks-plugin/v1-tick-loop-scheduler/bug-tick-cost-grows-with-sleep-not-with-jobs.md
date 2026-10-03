@@ -249,3 +249,60 @@ That last row is the find worth the reviewer's attention: a lower bound was bein
 Tests **245 → 252** (7 new: 6 unit + 1 plugin-level). `tsc --noEmit` clean; `vitest run` 252/252; `harness/smoke.ts` PASS; `arggon validate` ok (0 warnings); `arggon spec validate` ok; `arggon spec analyze` clean. `node_modules` untracked and unstaged. Commit `4e22019` on `fix/bug-tick-cost-grows-with-sleep-not-with-jobs`; four paths staged explicitly.
 
 **Untouched deliberately:** `README.md` (T7 owns docs), spec 002, any other item, and all of `src/index.ts` beyond the three cost comments.
+
+## The open question this report left, answered — `task-measure-first-tick-stall-after-long-sleep`
+
+The report above ended with: *"I did not verify whether the tick's async structure already yields to
+the event loop mid-loop (it awaits storage per job, which suggests it does) — so '2.3 s of blocked
+event loop' may be an overstatement."* This is that verification. It is here because this is where
+the measurements live.
+
+**It does not yield. It blocks, and for 2.45 s.** The predecessor's own conclusion stands; only its
+stated uncertainty is now resolved.
+
+**Method.** Four markers of three different scheduling classes were armed from inside the first
+`Intl.DateTimeFormat#formatToParts` call — the instant the decision loop provably began, with no hook
+into the plugin and no cooperation from it — and each recorded the lookup count it could see:
+`queueMicrotask`, a resolved-promise `then`, `setImmediate` (check phase), `setTimeout(0)` (timers
+phase). Driven through the real `tick` via `setup`, with the real clock and `timezone: "UTC"` pinned.
+Plus a self-rescheduling `setImmediate` canary recording its worst gap.
+
+**Result at 100 jobs, 24 h `* * * * *` backlog** — 601 800 lookups, reproducing the figure above
+exactly:
+
+| marker | fired at lookup # |
+|---|---|
+| `queueMicrotask` | 54 162 — **inside** the walk (first skip-branch `await saveState`) |
+| resolved-promise `then` | 54 162 — inside |
+| `setImmediate` | **601 800 — the last one** |
+| `setTimeout(0)` | **601 800 — the last one** |
+
+The canary independently recorded a single **2.45 s gap** in a 2.46 s tick. Across job counts:
+
+| jobs | lookups | longest stretch with no other work running |
+|---|---|---|
+| 1 | 6 018 | 46 ms (the whole tick) |
+| 10 | 60 180 | 271 ms |
+| 100 | 601 800 | **2 453 ms** |
+| 100, 720 h | 601 800 | **2 416 ms** |
+
+**Why this is conclusive rather than an inference from timing.** A microtask boundary provably does
+not end a turn — it drains the microtask queue and returns to the same event-loop turn's stack. So
+"the promise chain advanced while `setImmediate` and `setTimeout` did not" is a statement about the
+loop's structure, not about how fast the machine was. The predecessor was right that the loop awaits
+storage per job; the await is real, and it is also irrelevant to whether anything else can run.
+
+**The fix, and why this one.** `tick` now meters occurrences walked since the last turn and takes one
+`setImmediate` before any walk that would push the meter past a whole `MAX_BACKLOG_SCAN` — so *no
+blocking run is longer than one job's bounded walk*, whatever the job count. Bounded by work, not by a
+clock, so the bound is the same on any machine. The 100-job walk is now cut into **99 blocks**
+(deterministic), longest ~32–40 ms quiet; 0 turns on an ordinary tick, on a `backfill` replay, and on
+a backlog smaller than the bound.
+
+Yielding beat the other two candidates because they either shrink the stall without removing it
+(lowering the bound also weakens the number ADR 0002 exists to protect) or replace a known count with
+an unknown one (amortising the walk makes `droppedCapped` mean something new). `droppedCapped`,
+`MAX_BACKLOG_SCAN` = 1000 unexported, the durable `catchUp` plan and the count's agreement with the
+instants are all unchanged.
+
+Spec 001 box 124 now carries both bounds and is ticked.
