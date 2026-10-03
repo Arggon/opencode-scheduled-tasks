@@ -38,13 +38,25 @@ What actually shipped, as of 2026-10-02 — recorded after the fact, not a re-op
       only when the old one is absent.
 - [x] `schedules_format` returns the job-file reference — both config surfaces, the precedence
       rule, and the fields that carry a cost or permission consequence.
-- [ ] `.opencode/tasks/<id>.md` is **not** loaded. `schedules_format` documents the surface and
-      the precedence rule, but `src/index.ts` reads only `.opencode/schedules.json`; there is no
-      directory scan, no frontmatter parser and no merge. `task-t2` is the honest record.
+- [x] `.opencode/tasks/<id>.md` is loaded and merged by id with markdown winning, so a prompt can
+      live in version control as prose (`task-t2`, ADR 0004). `TASKS_DIR`, `loadMarkdownJobs` and
+      `mergeJobSources` are on `main`; verified live on a real host — `schedules_format` names both
+      surfaces and the precedence rule, and a JSON-only project resolves **no** package at all
+      (pinned by two tests: the static import list is exactly `["node:fs","node:os","node:path"]`,
+      and `setup` runs under an ESM resolve hook reporting every non-builtin resolution).
+
+      *This box was written on 2026-10-02 saying markdown was **not** loaded, which was true when
+      `task-chore-ci-and-doc-statuses-for-plugin-and-v2` wrote it and false once `task-t2` landed.
+      Nobody had updated it, so a `done` story carried a box asserting the feature was absent —
+      the exact failure the acceptance audit exists to catch, sitting in a closed item.*
 
 ## Notes
 
-Frontmatter `status` is left as-is on purpose: this story is half delivered (durations yes,
-markdown files no), so it is a coordinator call whether it closes as done or waits on T2.
-Recorded by `task-chore-ci-and-doc-statuses-for-plugin-and-v2`, which was scoped to docs and
-tracker statuses only.
+This story is **fully delivered** and closed `done`: durations by `task-t1`, markdown task files by
+`task-t2`.
+
+*History, kept because it explains the correction above.* When
+`task-chore-ci-and-doc-statuses-for-plugin-and-v2` wrote this body, markdown files had not shipped,
+so it recorded the story as half delivered and deliberately left the frontmatter `status` alone as a
+coordinator call. `task-t2` then landed and closed; the body was never revisited, which left a
+`done` story asserting in its own acceptance list that the feature it exists to deliver was absent.
