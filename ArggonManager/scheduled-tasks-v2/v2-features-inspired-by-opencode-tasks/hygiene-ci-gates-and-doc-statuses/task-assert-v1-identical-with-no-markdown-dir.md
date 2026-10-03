@@ -4,6 +4,7 @@ status: in_progress
 id: task-assert-v1-identical-with-no-markdown-dir
 title: No test asserts a v1 job file behaves identically when no markdown directory exists
 assignee: arggon
+branch: test/task-assert-v1-identical-with-no-markdown-dir
 parent: hygiene-ci-gates-and-doc-statuses
 labels: []
 priority: p1
