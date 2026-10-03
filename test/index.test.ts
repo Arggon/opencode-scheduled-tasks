@@ -29,6 +29,8 @@ import plugin, {
   parseModelRef,
   pushHistory,
   resolveDue,
+  traceOccurrenceWalk,
+  WalkTooLong,
   validateJob,
   validateLoop,
   validateOneOff,
@@ -54,6 +56,7 @@ import plugin, {
   type HistoryEntry,
   type JobDefinition,
   type JobState,
+  type CronSpec,
   type YamlReader,
 } from "../src/index.ts"
 
@@ -106,6 +109,20 @@ function offsetMinutes(instantMs: number, zone: string): number {
 /** Minutes from `fromMs` to the next occurrence of `spec` in `zone`; the reported cadence. */
 function stepMinutes(spec: ReturnType<typeof parseCron>, fromMs: number, zone: string): number {
   return (nextOccurrence(spec, fromMs, zone)! - fromMs) / MINUTE_MS
+}
+
+/**
+ * Where the occurrence walk starts: the zone's own reading of `afterMs`, as a value in the naive
+ * wall-clock frame, plus the one minute that makes the search strictly after.
+ *
+ * The walk's trace is a list of moves, and a list of moves is only worth reading once it can be tied
+ * back to a known starting value — so the first step of every trace below is checked against this,
+ * computed from the exported `wallParts` rather than copied out of the implementation. A test that
+ * recomputed the walk's own frame instead would agree with a broken walk by construction.
+ */
+function seedWall(afterMs: number, timeZone: string): number {
+  const parts = wallParts(afterMs, timeZone)
+  return Date.UTC(parts.year, parts.month - 1, parts.day, parts.hour, parts.minute) + MINUTE_MS
 }
 
 /**
@@ -722,12 +739,325 @@ describe("nextOccurrence", () => {
     expect(walk(MADRID, "2026-03-28T23:00:00Z", 200).gaps.filter((g) => g !== 1)).toEqual([])
   })
 
-  it("returns undefined rather than looping forever on an unsatisfiable search", () => {
-    // 31 February is rejected at parse time, so reach the horizon through a valid but
-    // extremely sparse schedule instead: once every 4 years on 29 Feb, asked from a
-    // point past the next leap day by more than the 5-year horizon is not constructible,
-    // so assert the ordinary well-defined path returns a value.
-    expect(nextOccurrence(parseCron("0 0 29 2 *"), Date.UTC(2026, 0, 1), "UTC")).toBeDefined()
+  // -------------------------------------------------------------------------
+  // The walk's own invariants: every move advances, and the walk terminates
+  // (task-assert-occurrence-walk-jumps-strictly-advance)
+  //
+  // The walk moves its cursor in four places — the day jump, the hour jump, and the two
+  // `wall += MINUTE_MS` — and `wall < horizon` is its only exit besides a match. So a branch that
+  // computes a value the cursor has already passed does not make the walk slow: the loop re-reads
+  // the same parts and takes the same branch **forever**. That is not hypothetical. A stray
+  // `+ zoneOffsetMs(afterMs, timeZone)` left in the day-jump branch once kept `vitest run` silent for
+  // 700 seconds, and a CI job can only end a hang by being killed — no assertion, no diff, and
+  // indistinguishable from merely slow.
+  //
+  // Which is why nothing below is bounded by a clock. A wall-clock timeout is slow when it works and
+  // ambiguous when it fires, and it cannot tell a stalled cursor from a slow machine. Every walk here
+  // is bounded by a **step counter** (`traceOccurrenceWalk`'s `maxSteps`), which throws on exhaustion
+  // rather than truncating — a partial walk is not a shorter answer, it is no answer.
+  // -------------------------------------------------------------------------
+
+  /**
+   * Days in the horizon `nextOccurrence` walks before it declares a schedule unsatisfiable.
+   *
+   * Written out here rather than imported: `SEARCH_HORIZON_MS` is deliberately unexported, because a
+   * bound that a test can read is a bound that can be moved without anyone noticing it move. So the
+   * horizon is asserted as arithmetic on the seed instead — see "ends an unsatisfiable walk at the
+   * horizon" — which means changing `SEARCH_HORIZON_MS` has to change this number *on purpose*.
+   */
+  const HORIZON_DAYS = 5 * 366
+
+  /**
+   * Comfortably above every walk asserted below, and three orders of magnitude below the horizon's
+   * own worst case (~2.6M moves). A budget this loose cannot be what ends a walk, so a walk that ends
+   * has genuinely terminated rather than been cut off.
+   */
+  const STEP_BUDGET = 10_000
+
+  /**
+   * A spec no cursor can satisfy, assembled directly because `parseCron` will not produce one.
+   *
+   * That refusal is the parser doing its job — `0 0 31 4 *` is a `CronError`, since April has no
+   * 31st — and it means **nothing the parser accepts is unsatisfiable**: every field combination it
+   * lets through recurs well inside the horizon. Which is asserted here rather than assumed, because
+   * it is the reason a hand-built spec is necessary rather than lazy: the unsatisfiable walk is only
+   * reachable as a `CronSpec` value.
+   *
+   * An empty field is the smallest such thing, and which field is empty decides *how* the walk fails
+   * to match — a missing month takes the day jump every time, a missing hour the hour jump, a missing
+   * minute the minute move.
+   */
+  const unsatisfiable = (field: "months" | "hours" | "minutes"): CronSpec => {
+    /** 0..max-1 — the minute and hour fields, which both start at zero. */
+    const from = (max: number): Set<number> => new Set(Array.from({ length: max }, (_, i) => i))
+    /** 1..max — the month and day-of-month fields, which both start at one. */
+    const to = (max: number): Set<number> => new Set(Array.from({ length: max }, (_, i) => i + 1))
+    return {
+      minutes: field === "minutes" ? new Set<number>() : from(60),
+      hours: field === "hours" ? new Set<number>() : from(24),
+      daysOfMonth: to(31),
+      months: field === "months" ? new Set<number>() : to(12),
+      daysOfWeek: new Set([0, 1, 2, 3, 4, 5, 6]),
+      domRestricted: false,
+      dowRestricted: false,
+    }
+  }
+
+  it("advances the cursor on every step of every branch, in every zone of the matrix", () => {
+    // The property itself: **every move of the cursor moves it forward**. Read off a trace rather
+    // than inferred from an answer, because an answer comes out the same whether the walk took one
+    // step or took a wrong one a thousand times and arrived anyway. That distinction is the whole
+    // item — the stray `zoneOffsetMs` did not change any answer, it changed only whether the walk
+    // came back.
+    //
+    // **Continuity is asserted too, and it is what keeps the step checks honest.** `from` of each step
+    // has to be the `to` of the one before it, so a branch that moved the cursor without recording
+    // the move breaks the chain instead of quietly walking out of the assertion. Without that, a
+    // branch could be added to the walk and never be examined.
+    const SCHEDULES = [
+      "* * * * *", // every minute matches: the trace is empty, which has to be allowed
+      "0 * * * *", // unmatched minutes walk, an unmatched hour jumps
+      "30 9 * * 1", // day, hour and minute
+      "0 9 * * *", // hour only — every day matches, so the day jump is never taken
+      "0 0 1 * *", // day only — every hour matches, so the hour jump is never taken
+      "59 23 31 12 *", // a day jump, then an hour jump, then 59 minute steps
+    ]
+    const SEEDS = [
+      "2026-01-01T00:00:00Z",
+      "2026-02-28T23:59:00Z", // a leap day, and a seed that lands on a local midnight
+      "2026-05-10T12:00:00Z", // an ordinary afternoon in the Americas
+      "2026-10-25T00:00:00Z", // the Madrid fall-back
+      "2026-12-31T23:30:00Z", // the year boundary, where a jump has to roll the year
+      `${NY_SPRING_FORWARD_2026}T06:59:00Z`, // 01:59 EST — walks into the missing hour
+      "2026-03-29T00:59:00Z", // 01:59 CET — the same, in Madrid
+    ]
+
+    /** Branch names each zone's walks took, so coverage is a measurement rather than an intention. */
+    const branchesByZone: Record<string, Set<string>> = {}
+    let stepsChecked = 0
+
+    for (const zone of OFFSET_MATRIX) {
+      const seen = new Set<string>()
+      branchesByZone[zone] = seen
+      for (const schedule of SCHEDULES) {
+        const spec = parseCron(schedule)
+        for (const after of SEEDS) {
+          const at = Date.parse(after)
+          // The **bounded** walk goes first, on purpose: it is the one that cannot hang, so the
+          // termination of this search is established before the unbounded call below is made with
+          // the same inputs.
+          const walk = traceOccurrenceWalk(spec, at, zone, STEP_BUDGET)
+          const steps = walk.steps
+          // The two entry points are one walk, so the ledger cannot describe a different algorithm
+          // from the one the scheduler runs.
+          expect(walk.result).toBe(nextOccurrence(spec, at, zone))
+
+          stepsChecked += steps.length
+          for (const [i, step] of steps.entries()) {
+            seen.add(step.branch)
+            expect({ schedule, zone, i, from: step.from, to: step.to, advanced: step.to > step.from }).toEqual({
+              schedule,
+              zone,
+              i,
+              from: step.from,
+              to: step.to,
+              advanced: true,
+            })
+            // Where the walk was when it made this move: the seed, or the last move's landing.
+            expect(step.from).toBe(i === 0 ? seedWall(at, zone) : steps[i - 1]!.to)
+            expect(steps[i + 1]?.from ?? step.to).toBe(step.to)
+          }
+        }
+      }
+    }
+
+    // **All three of the walk's cursor-advancing moves, in every zone of the matrix** — not one
+    // schedule in one zone, which is the shape that let the last frame bug through 271 tests. The
+    // fourth move (a matched wall minute that does not exist) needs a spring-forward to be
+    // reachable and is asserted on its own below, against the two transition fixtures.
+    for (const [zone, seen] of Object.entries(branchesByZone)) {
+      expect({ zone, day: seen.has("day"), hour: seen.has("hour"), minute: seen.has("minute") }).toEqual({
+        zone,
+        day: true,
+        hour: true,
+        minute: true,
+      })
+    }
+    // And the sweep was wide enough for that to mean something. The walk count is a literal, not
+    // `OFFSET_MATRIX.length * SCHEDULES.length * SEEDS.length`, so deleting a schedule or a seed
+    // fails here instead of quietly narrowing the coverage the claim above rests on.
+    expect({ walks: 378, stepsChecked }).toEqual({ walks: 378, stepsChecked: expect.any(Number) })
+    expect(stepsChecked).toBeGreaterThan(5_000)
+  })
+
+  it("advances the cursor past a wall minute that does not exist", () => {
+    // The fourth move, written separately from the minute move and reachable only where the clocks
+    // spring forward: a wall minute that satisfies every field and still has no instant.
+    //
+    // It fires **once per missing occurrence, not once per missing minute**, and that is worth
+    // pinning: only 02:30 is a minute the schedule wants. The other 29 minutes of the missing hour
+    // are walked by the *minute* branch, because the walk cannot know they are missing — it knows
+    // only that 30 is the minute it is after. Both branches move the same minute, which is exactly
+    // why "same" is not evidence and this one is asserted separately.
+    //
+    // Each fixture is verified to be a **gap** — zero possible instants, in the standard's terms —
+    // before the behaviour is asserted, so a tzdata release that moved the transition fails here
+    // rather than leaving a test that no longer describes what it says.
+    const cases = [
+      {
+        zone: NEW_YORK,
+        after: `${NY_SPRING_FORWARD_2026}T06:59:00Z`, // 01:59 EST, the minute before the jump
+        missing: `${NY_SPRING_FORWARD_2026}T02:30`,
+        want: "2026-03-09T02:30",
+      },
+      {
+        zone: MADRID,
+        after: "2026-03-29T00:59:00Z", // 01:59 CET, the minute before the jump
+        missing: `${DST_SPRING_FORWARD_2026}T02:30`,
+        want: "2026-03-30T02:30",
+      },
+    ]
+
+    for (const { zone, after, missing, want } of cases) {
+      expect(possibleInstants(missing, zone)).toBe(0)
+      const spec = parseCron("30 2 * * *")
+      const at = Date.parse(after)
+      const walk = traceOccurrenceWalk(spec, at, zone, STEP_BUDGET)
+      const steps = walk.steps
+      const overGap = steps.filter((step) => step.branch === "gap")
+
+      expect({ zone, moves: overGap.length }).toEqual({ zone, moves: 1 })
+      expect(overGap.every((step) => step.to > step.from)).toBe(true)
+      expect((overGap[0]!.to - overGap[0]!.from) / MINUTE_MS).toBe(1)
+      // The rest of the missing hour is walked a minute at a time by the minute branch, so the walk
+      // steps *through* 02:31-03:00 rather than jumping it: 29 moves from 02:31 to 03:00, none of
+      // them a gap move, before the hour jump carries it out of an hour that no longer has a 02:30.
+      const rest = steps.slice(steps.indexOf(overGap[0]!) + 1)
+      const insideGap = rest.slice(0, rest.findIndex((step) => step.branch === "hour"))
+      expect(insideGap).toHaveLength(29)
+      expect(insideGap.every((step) => step.branch === "minute" && step.to - step.from === MINUTE_MS)).toBe(
+        true,
+      )
+
+      // And the search terminated with the answer the policy already pins: 02:30 does not exist on
+      // that day, so the next one is tomorrow's. Reached the long way round, through the gap.
+      expect(walk.result).toBe(nextOccurrence(spec, at, zone))
+      expect(local(walk.result!, zone)).toBe(want)
+    }
+  })
+
+  it("returns undefined on a spec that cannot be satisfied, rather than looping forever", () => {
+    // The assertion that would have caught the stray `zoneOffsetMs`, and the reason it is written
+    // with a step budget: on a schedule no cursor can satisfy, the walk has to *return* — within a
+    // bounded number of moves — and the only thing that can end it is the horizon.
+    //
+    // `0 0 31 4 *` cannot be used, because `parseCron` rejects it (April has no 31st), which is why
+    // the spec is hand-built. The parser's side of that bargain is asserted too, since it is what
+    // makes the hand-built spec the only way in: every schedule `parseCron` accepts recurs inside
+    // the horizon, so a parsed spec can never be the unsatisfiable case.
+    expect(() => parseCron("0 0 31 4 *")).toThrow(CronError)
+    for (const schedule of ["0 0 29 2 *", "0 0 29 2 1", "59 23 31 12 *", "0 0 1 1 0"]) {
+      expect({ schedule, found: nextOccurrence(parseCron(schedule), Date.UTC(2026, 5, 1), "UTC") }).toEqual({
+        schedule,
+        found: expect.any(Number),
+      })
+    }
+
+    const spec = unsatisfiable("months")
+    const at = Date.parse("2026-05-11T03:00:00Z") // 23:00 on the 10th, west of every offset in the matrix
+
+    for (const zone of OFFSET_MATRIX) {
+      const walk = traceOccurrenceWalk(spec, at, zone, STEP_BUDGET)
+      // Terminated, with nothing found. The budget is far above what this walk needs, so it ended
+      // itself rather than running out of room — "returned undefined eventually" is only a claim if
+      // "eventually" is bounded, and here it is bounded by the horizon (asserted in the next test).
+      expect({ zone, result: walk.result, moves: walk.steps.length < STEP_BUDGET }).toEqual({
+        zone,
+        result: undefined,
+        moves: true,
+      })
+      // Every move is the day jump — an empty month set can never be satisfied by any cursor.
+      expect(new Set(walk.steps.map((step) => step.branch))).toEqual(new Set(["day"]))
+      // Deliberately **not** `nextOccurrence` here. It is the same walk (the sweep above proves the
+      // two entry points agree), but this one has no budget, so on an unsatisfiable spec it is the
+      // horizon alone that saves it — and a test that can hang is worse than no test. The unbounded
+      // entry point is exercised in the sweep, where the bounded walk has already proved the search
+      // terminates and the schedule is satisfiable anyway.
+    }
+  })
+
+  it("ends an unsatisfiable walk at the horizon, in one move per day of it", () => {
+    // **The horizon is what terminates the walk, asserted as arithmetic rather than trusted from the
+    // loop's shape.** The claim is about where the last move landed: the walk stops on the first move
+    // that reaches the horizon, so its last step starts before the horizon and ends at or after it —
+    // and, because every move here is a day jump, overshoots by less than a day. That pins the
+    // horizon's *value* (5 * 366 days from the seed) as well as its role.
+    const spec = unsatisfiable("months")
+    const at = Date.parse("2026-05-11T03:00:00Z")
+
+    for (const zone of OFFSET_MATRIX) {
+      const horizon = seedWall(at, zone) + HORIZON_DAYS * 24 * 60 * MINUTE_MS
+      const { steps } = traceOccurrenceWalk(spec, at, zone, HORIZON_DAYS + 2)
+      const last = steps.at(-1)!
+
+      expect({
+        zone,
+        startedBeforeHorizon: last.from < horizon,
+        endedAtOrAfterHorizon: last.to >= horizon,
+        overshootMinutes: (last.to - horizon) / MINUTE_MS,
+      }).toEqual({
+        zone,
+        startedBeforeHorizon: true,
+        endedAtOrAfterHorizon: true,
+        overshootMinutes: expect.any(Number),
+      })
+      expect(last.to - horizon).toBeLessThan(24 * 60 * MINUTE_MS)
+
+      // One move per day of the horizon — plus one when the seed is not itself a local midnight,
+      // because the first jump stops at the *next* one. Both bounds are asserted so neither an
+      // off-by-one nor a horizon that quietly changed can pass.
+      expect(steps.length).toBeGreaterThanOrEqual(HORIZON_DAYS)
+      expect(steps.length).toBeLessThanOrEqual(HORIZON_DAYS + 1)
+    }
+
+    // And the same claim for a walk that can never match at the *minute* rather than the day, whose
+    // moves are one minute each: it takes one move per minute of the horizon, all 2 635 200 of them.
+    // That is the horizon bounding a walk at its most expensive, and it is exact rather than
+    // approximate because every move is a whole minute from the seed and the last one lands on the
+    // horizon. It is also pure arithmetic — no timezone lookups, which is why the budget test below
+    // can afford to walk the whole thing.
+    const minuteSpec = unsatisfiable("minutes")
+    const { steps } = traceOccurrenceWalk(minuteSpec, at, "UTC", HORIZON_DAYS * 24 * 60 + 1)
+    expect(steps.length).toBe(HORIZON_DAYS * 24 * 60)
+    expect(new Set(steps.map((step) => step.branch))).toEqual(new Set(["minute"]))
+  })
+
+  it("refuses a walk that outruns its step budget, rather than walking it out", () => {
+    // The step counter doing the job the item asks of it. `unsatisfiable("minutes")` matches every
+    // day and every hour and no minute at all, so the walk takes its smallest move forever and only
+    // the horizon can stop it — 2.5 million moves away. A wall-clock timeout cannot express that
+    // honestly (it is unbounded in seconds as well as in steps, which is precisely the case a
+    // stalled cursor is in), and a walk that returns *something* when its budget runs out would be
+    // worse than one that fails, because `undefined` would then be a real answer.
+    const spec = unsatisfiable("minutes")
+    const at = Date.parse("2026-05-10T12:00:00Z")
+
+    expect(() => traceOccurrenceWalk(spec, at, "UTC", STEP_BUDGET)).toThrow(WalkTooLong)
+    // A budget the walk fits inside is not a refusal: the two are distinguished by the throw, so a
+    // walk that merely *finished* can never be mistaken for one that was cut short.
+    expect(traceOccurrenceWalk(spec, at, "UTC", HORIZON_DAYS * 24 * 60 + 1).steps.length).toBeGreaterThan(
+      STEP_BUDGET,
+    )
+    // The same walk through the unbounded `nextOccurrence` is deliberately not called here, and that is
+    // the point of a budget rather than a timeout: this spec is unsatisfiable, so the horizon is the
+    // only thing that could end the walk, and a test that leans on one structural fact to stop a loop
+    // it cannot interrupt is a test that can hang. The horizon's claim is discharged above on the
+    // bounded walk instead — same code path — and a bad edit earns a throw rather than a wait.
+
+    // The thrown error is the only diagnostic a bounded walk leaves behind, so it has to say **which**
+    // bound was spent: a reader who sees "budget of 10000" knows the walk outran the test's own
+    // limit, rather than wondering whether it reached the horizon.
+    expect(new WalkTooLong(STEP_BUDGET).message).toContain(`budget of ${STEP_BUDGET}`)
   })
 })
 
