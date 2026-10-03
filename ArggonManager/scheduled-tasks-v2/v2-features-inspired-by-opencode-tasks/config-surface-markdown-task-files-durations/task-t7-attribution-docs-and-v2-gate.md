@@ -60,7 +60,10 @@ See plan 002 §T7, spec 002, and ADR 0007.
 > cite it inline at the point of influence, each linking ADR 0007. Nothing to change.
 
 - [ ] A **v1 job file with no markdown directory behaves identically** — the upgrade is
-      additive, asserted by a test rather than claimed.
+      additive, asserted by a test rather than claimed. **Closes by reference:** the test half
+      is `task-assert-v1-identical-with-no-markdown-dir`, filed because this item is docs and
+      the test file belonged to the other worker in the wave. The additive half is already
+      asserted; that item states the v1 contract positively for the rest.
 
 > **Not ticked — half the box is asserted; "behaves identically" is not.** `test/index.test.ts`
 > does assert the additive half, and strongly:
@@ -79,7 +82,13 @@ See plan 002 §T7, spec 002, and ADR 0007.
 > running this wave, so this item reports the gap rather than writing the test. Spec 002 carries
 > the same finding in place, with the same evidence.
 
-- [ ] README's documented commands are executed verbatim by the dogfood run.
+- [x] README's documented commands are executed verbatim by the dogfood run. **Done by the
+      coordinator**, not the worker: all eight tools called from a live v2.0.22 session against
+      the deployed build, byte-identical to `src/index.ts`. Transcript in this item's comment.
+      It confirmed two behaviours beyond a response — `startedAt` equals `dueAt` for an
+      on-demand run (the dispatch instant), and `schedules_run` dispatches a job whose
+      `enabled` is `false`, which is the documented distinction between it and the schedule.
+      The README's `every` parameter name was checked against the tool and is correct.
 
 > **Not ticked — the v1 pages were dogfooded; the v2 ones this item adds were not.** The v1
 > install commands (`mkdir -p ~/.config/opencode/plugins/scheduled-tasks` → `cp src/index.ts` →
