@@ -149,11 +149,30 @@ job set.**
 
 ### Error states — empty/loading/error states
 
-- [ ] Malformed JSON in the job file retains the **last-known-good** job set, logs the
-      parse failure once, and makes `schedules_list` report the error alongside the jobs
-      still in force.
+- [x] A broken `.opencode/schedules.json` never disarms the project: it logs the parse failure
+      once, and `schedules_list` reports the error alongside whatever jobs are still in force.
+      The file is read **once**, at `setup`, so the job set in force is the one loaded there.
 
-> **Not ticked** — audit `task-audit-spec-001-acceptance-boxes`, 2026-10-02: the reachable half is pinned, the named half is unreachable. “Surfaces the error alongside the jobs still in force” is pinned by “keeps last-known-good jobs and surfaces the error on malformed JSON” and “still reports a corrupt schedules.json when markdown jobs are carrying the schedule”. **“Retains the last-known-good job set” cannot be observed or tested today**: `reloadJobs` is called exactly once, from `setup` (src/index.ts:4231), and there is no file watcher, so nothing ever reloads a broken file over a good job set — the retention branch (src/index.ts:2662) has no caller with a populated `state.jobs`. Deleting that branch leaves 234/234 green. Needs either a reload path plus a test, or an amendment that says the file is read once at setup.
+> **Amended + ticked** — `task-pin-twelve-untested-spec-001-behaviours`, 2026-10-03. The audit's
+> verdict below was right about what was untested and wrong to leave it as one box: the
+> **retention** clause describes a branch with no caller, so it is not a missing test, it is a
+> clause about a code path that does not exist. `reloadJobs` is called exactly once, from `setup`
+> (src/index.ts:4956), against a `state.jobs` that is `[]` at that moment, so the
+> "retain the last-known-good set" early return (src/index.ts:3180) can only ever retain nothing.
+> Rather than tick a claim about dead code, the box is amended to the invariant that is real and
+> testable — **a broken file costs the project neither its jobs nor its silence** — and the
+> retention branch is left in place as the defensive guard it is documented to be.
+>
+> - **The parse failure is named once, in the log** — pinned by "keeps last-known-good jobs and
+>   surfaces the error on malformed JSON" (added assertion: exactly one line naming
+>   `schedules.json:` *and what went wrong*). Mutation: making the inert-project notice take its
+>   no-error wording unconditionally fails that test and no other.
+> - **…and reported alongside the jobs still in force** — pinned by "still reports a corrupt
+>   schedules.json when markdown jobs are carrying the schedule": a project whose markdown jobs
+>   are carrying the schedule still lists them *and* the error. Mutation: dropping the read-failure
+>   branch fails that test.
+>
+> The audit's prior verdict, discharged: audit `task-audit-spec-001-acceptance-boxes`, 2026-10-02: the reachable half is pinned, the named half is unreachable. “Surfaces the error alongside the jobs still in force” is pinned by “keeps last-known-good jobs and surfaces the error on malformed JSON” and “still reports a corrupt schedules.json when markdown jobs are carrying the schedule”. **“Retains the last-known-good job set” cannot be observed or tested today**: `reloadJobs` is called exactly once, from `setup` (src/index.ts:4231), and there is no file watcher, so nothing ever reloads a broken file over a good job set — the retention branch (src/index.ts:2662) has no caller with a populated `state.jobs`. Deleting that branch leaves 234/234 green. Needs either a reload path plus a test, or an amendment that says the file is read once at setup.
 
 - [x] A job set with zero enabled jobs arms **no** timer; the plugin stays loaded and inert.
 
@@ -161,10 +180,23 @@ job set.**
 
 ### Concurrency — concurrency / idempotency
 
-- [ ] The tick loop never re-enters: a tick still running when the next tick fires is
+- [x] The tick loop never re-enters: a tick still running when the next tick fires is
       skipped, not queued.
 
-> **Not ticked** — audit `task-audit-spec-001-acceptance-boxes`, 2026-10-02: true, and **no test pins it**. The guard exists (`if (ticking) return`, src/index.ts:4258) and the tick does not re-enter — but deleting that line leaves 234/234 green, because a re-entrant tick re-reads a window the first one already consumed. Needs a test that holds a tick open across an interval boundary (a slow `ctx.storage.set`, say) and asserts the second tick is dropped rather than queued.
+> **Ticked** — `task-pin-twelve-untested-spec-001-behaviours`, 2026-10-03:
+> `test/index.test.ts` → “drops a tick that fires while the previous one is still running,
+> instead of nesting it (box 96)”. The window it needs is the one the audit said was missing: a
+> tick held open across an interval boundary. Two jobs, the first suppressed by a live run lease
+> so its state write is **parked** mid-tick and the second has not been looked at yet — a slow
+> `ctx.storage.set` is the only such window that exists, because `resolveDue` is synchronous. A
+> whole interval passes with the first tick in flight, and nothing is dispatched; release the
+> write and the *first* tick finishes the job itself, one run and one occurrence.
+>
+> Mutation: `if (ticking) return` → `if (false)` fails it, because the second tick then evaluates
+> the un-decided job and prompts. The audit's prior verdict was that deleting the guard left
+> 234/234 green — true, and the reason it was: **a re-entrant tick re-reads a window the first
+> one already consumed**, so nothing observable happened. This test parks the first tick *before*
+> it consumes anything, which is the only way to make the difference visible.
 
 - [x] A job with a run in flight whose next occurrence arrives records the occurrence as
       **skipped** and does not start a second run.
@@ -183,10 +215,19 @@ job set.**
 
 ### Failure — failure/retry/timeout
 
-- [ ] A failed run records `lastStatus: failed` and the error message, and is **not** retried
+- [x] A failed run records `lastStatus: failed` and the error message, and is **not** retried
       within that occurrence.
 
-> **Not ticked** — audit `task-audit-spec-001-acceptance-boxes`, 2026-10-02: true, and **no test pins it**. Gutting `runJob`’s catch — removing `lastStatus = "failed"` and `lastError` entirely — leaves 234/234 green: no test produces a *failed scheduled* run (the two prompt-rejection harnesses cover a loop post and a one-off, not a job). The “not retried within that occurrence” half is pinned by “collapses a backlog of eight to exactly one run under `skip`” and “advances nextRun even when nothing was due, so the next tick does not rescan”. Needs: a due job whose `session.prompt` rejects, asserting `lastStatus: "failed"`, the message, and no second run in the occurrence.
+> **Ticked** — `task-pin-twelve-untested-spec-001-behaviours`, 2026-10-03:
+> `test/index.test.ts` → “records a failed scheduled run: status, the message it threw, and no
+> retry inside the occurrence (box 107)”. A due job whose `session.prompt` rejects, which is the
+> case no test produced: `schedules_list` reports `lastStatus: "failed"` with the message, storage
+> holds it, `schedules_history` returns one record with `outcome: "failed"` and the same error —
+> and five further ticks *inside the same minute* produce no second attempt, which is the
+> occurrence half.
+>
+> Mutation: gutting the catch in `runJob` — removing `record.lastStatus = "failed"` and
+> `record.lastError` — fails it.
 
 - [x] A run exceeding `runTimeoutMs` has its session interrupted and records
       `lastStatus: timeout`.
@@ -317,10 +358,18 @@ job set.**
 
 > **Ticked** — audit `task-audit-spec-001-acceptance-boxes`, 2026-10-02: `test/index.test.ts` → “fires once, at the first occurrence, for an ambiguous fall-back time” (2026-10-25 02:30 twice; the answer is the CEST first pass, `00:30Z`, not the CET repeat).
 
-- [ ] `nextRun` reported by `schedules_list` is an absolute ISO-8601 instant, unambiguous
+- [x] `nextRun` reported by `schedules_list` is an absolute ISO-8601 instant, unambiguous
       regardless of the viewer's zone.
 
-> **Not ticked** — audit `task-audit-spec-001-acceptance-boxes`, 2026-10-02: true, and **no test pins it**. `schedules_list` does emit `new Date(record.nextRun).toISOString()`; replacing that with the raw epoch number leaves 234/234 green. Needs an assertion on the shape of `jobs[].nextRun` / `lastRun`.
+> **Ticked** — `task-pin-twelve-untested-spec-001-behaviours`, 2026-10-03: two tests, both
+> mutation-checked against the same change (`new Date(record.nextRun).toISOString()` → the raw
+> epoch, which fails each of them):
+> `test/index.test.ts` → “reports jobs, next run and status through `schedules_list`” (the one
+> assertion this test was missing: `jobs[0].nextRun` matches a `Z`-suffixed ISO instant, and so
+> does the `lastRun` the first tick has already armed), and “reports every field the box names, and
+> both instants as absolute ISO-8601 (boxes 135, 158)”, which checks both instants against a record
+> whose `lastRun` is a known epoch — so the assertion is about the *instant*, not about the shape
+> alone.
 
 ### Persistence — persistence/migration/rollback
 
@@ -399,30 +448,82 @@ job set.**
 >
 > **Prior verdict, discharged:** audit `task-audit-spec-001-acceptance-boxes`, 2026-10-02: The dual sink worked for every line emitted *after* the first lease — pinned by "turns a rejecting permission.rules into an error result, a logged line and no prompt" and "records the asks a run turned into denies, and states them in its own running line", which read `scheduler.log` back. But the log directory was created by `acquireLease`, which runs only when there is work to arm, so every line emitted before it never reached the file. Repro, fresh process, one enabled job, `ctx.storage.scan` absent: stderr got `ctx.storage.scan is unavailable, …` then `could not append to …/scheduler.log`, and `scheduler.log` did not exist; the same for an idle project.
 
-- [ ] A repeated identical failure logs **once**, not once per tick.
+- [x] A repeated identical failure logs **once**, not once per tick.
 
-> **Not ticked** — audit `task-audit-spec-001-acceptance-boxes`, 2026-10-02: true, and **no test pins it**. `logOnce` + the module-level `logged` set do deduplicate; making `logOnce` always emit leaves 234/234 green. Note that the test whose name promises this — “degrades to session defaults and logs once when ctx.permission.rules is missing” — asserts only that the run succeeds; it never counts a line.
+> **Ticked** — `task-pin-twelve-untested-spec-001-behaviours`, 2026-10-03: two tests, both failing
+> on the same mutation (deleting `if (logged.has(key)) return` from `logOnce`, so every call
+> emits): `test/index.test.ts` → “logs a repeated identical failure once across five ticks, not
+> once per tick (box 157)” — a due job whose `session.create` rejects, five minutes of ticks, one
+> line, while the failures themselves kept happening (so “once” is a dedupe, not a silence) — and
+> the assertion this line was always promising, added to “degrades to session defaults and logs
+> once when `ctx.permission.rules` is missing”, which never counted a line.
+>
+> The per-tick test uses `session.create` on purpose: its `logOnce` key is **per job**
+> (`session-create-<id>`), so the measurement cannot be silently spent by an earlier test in the
+> file, the way a host-wide notice's module-level guard can. That dependency is called out at the
+> assertion in the second test, which is the only consumer of `no-permission-rules`.
 
-- [ ] `schedules_list` reports per job: `id`, `schedule`, `timezone`, `enabled`, `nextRun`,
+- [x] `schedules_list` reports per job: `id`, `schedule`, `timezone`, `enabled`, `nextRun`,
       `lastRun`, `lastStatus`, `lastError`, and whether the lease is held elsewhere.
 
-> **Not ticked** — audit `task-audit-spec-001-acceptance-boxes`, 2026-10-02: true, and **no test pins it**. `schedules_list` reports every field the box lists, but the two that matter most are unpinned: replacing `lastStatus`/`lastError` with `null` leaves 234/234 green, and so does emitting `nextRun` as an epoch number instead of an ISO string. “reports jobs, next run and status through schedules_list” asserts `id`/`schedule`/`timezone`/`enabled` and that `leaseHeld` is a boolean; the foreign-lease half is pinned by “reports a lease held elsewhere instead of arming a second scheduler”.
+> **Ticked** — `task-pin-twelve-untested-spec-001-behaviours`, 2026-10-03. The two fields that
+> mattered most were the two unpinned ones, and they need a job with state to be worth asserting
+> on, so the load-bearing test is new and the shape test is an addition:
+>
+> - `test/index.test.ts` → **“reports every field the box names, and both instants as absolute
+>   ISO-8601 (boxes 135, 158)”** — a daily job whose stored record is a timed-out run, so
+>   `lastStatus: "timeout"`, `lastError` and `lastRun` all carry real values that a `?? null`
+>   could not satisfy, plus `leaseHeld`/`leaseForeign` read live rather than captured at build
+>   time. Mutation: replacing `lastStatus`/`lastError` with `null` fails it.
+> - “reports jobs, next run and status through `schedules_list`” gained the assertion the audit
+>   asked for: the fields a never-run job has nothing to report are **present and `null`**, so a
+>   reader can tell “no run yet” from “this surface does not report that”. Honest limit: that
+>   assertion does **not** catch the `?? null` mutation — a never-run job's status already *is*
+>   null — which is exactly why the field values are asserted on the new test instead.
+> - The “held elsewhere” half stays pinned by “reports a lease held elsewhere instead of arming
+>   a second scheduler” (`leaseForeign: true`).
 
 - [x] A job may name a `model` as `provider/model` (or `{ providerID, id }`); a malformed one
       refuses the job with a named reason rather than dispatching on the wrong model.
 
 > **Ticked** — audit `task-audit-spec-001-acceptance-boxes`, 2026-10-02: `test/index.test.ts` → “parses provider/model and the explicit object form” and “refuses the whole job when its model is malformed” (the good sibling job still loads; the refusal names the job and the expected form).
 
-- [ ] The job's model is applied **before** the prompt is admitted, and the resolved model is
+- [x] The job's model is applied **before** the prompt is admitted, and the resolved model is
       echoed in the `running` line, so a job that inherited an unintended (paid) model is
       visible in the log instead of silent.
 
-> **Not ticked** — audit `task-audit-spec-001-acceptance-boxes`, 2026-10-02: **one clause pinned, one not.** “Applied before the prompt is admitted” is pinned by “switches the session to the job’s model before dispatching the prompt”, which asserts the exact order `switchAgent → switchModel → prompt`. “The resolved model is echoed in the `running` line” is **not**: dropping `model ${model}` from `runJob`’s running line leaves 234/234 green (the loop post’s line *is* pinned, by “records a loop post in history, names the model it spent, and leaves the session alone”). **Overlap with spec 002** line 159, which asks for the resolved model *and* session mode in that line and is likewise unticked — the same unpinned claim in two specs, so a test should close both at once.
+> **Ticked** — `task-pin-twelve-untested-spec-001-behaviours`, 2026-10-03. Both halves, and the
+> audit was right that the second was the open one:
+>
+> - **Applied before the prompt is admitted** — stays pinned by “switches the session to the job’s
+>   model before dispatching the prompt”, whose strict `["switchAgent", "switchModel:…", "prompt"]`
+>   order cannot hold if the application moves after the dispatch. Mutation: removing the
+>   `switchModel` call fails it.
+> - **Echoed in the `running` line** — new `test/index.test.ts` → “echoes the resolved model in
+>   the run’s own line, so an inherited paid model is visible (box 162)”: a due job naming a
+>   model, asserting the line names it *and* that `scheduler.log` carries the same line, because
+>   stderr is not where anyone looks. Mutation: dropping `model ${model}` from `runJob`’s running
+>   line fails it — the same mutation box 165’s test below catches.
 
-- [ ] A job that names no model inherits the session default, and the log says
+- [x] A job that names no model inherits the session default, and the log says
       `model session default`.
 
-> **Not ticked** — audit `task-audit-spec-001-acceptance-boxes`, 2026-10-02: **one clause pinned, one not.** “Inherits the session default” is pinned for the surfaces that report it: “reports the resolved model in schedules_list” (`model: "session default"`) and “records a run’s outcome, model and session, and survives a storage round-trip” (`model: "session default"` in the record). “The log says `model session default`” is not pinned for a job run — same mutant as the box above. The loop post’s line is pinned.
+> **Ticked** — `task-pin-twelve-untested-spec-001-behaviours`, 2026-10-03. Both halves, and the
+> audit was right that only the log half was open:
+>
+> - **Inherits the session default** — stays pinned on the reporting surfaces by “reports the
+>   resolved model in `schedules_list`” (`model: "session default"`) and “records a run’s outcome,
+>   model and session, and survives a storage round-trip”.
+> - **The log says `model session default`** — one assertion added to “records the asks a run
+>   turned into denies, and states them in its own running line”, a test that was already reading
+>   the `running` line and asserting a clause of it: the line names `model session default`
+>   because an inherited default is usually a *paid* model. Mutation: dropping `model ${model}`
+>   from `runJob`’s running line fails it, and fails box 162’s new test at the same time — the
+>   two boxes are one mutant, which is why one test closes both.
+>
+> **Still open in spec 002** line 159, which asks for the resolved model *and* session mode in
+> that line. This tick resolves box 165 here and does not resolve that one: the session-mode half
+> has no test, and a tick that claimed otherwise would be the failure this audit exists to end.
 
 ### Security — security/threat model
 
@@ -434,19 +535,80 @@ job set.**
 
 ### Environment and lifecycle — environment/platform
 
-- [ ] The tick interval is `unref()`ed, so the scheduler never keeps the server process
+- [x] The tick interval is `unref()`ed, so the scheduler never keeps the server process
       alive.
 
-> **Not ticked** — audit `task-audit-spec-001-acceptance-boxes`, 2026-10-02: true, and **no test pins it**. The interval is `unref()`ed (src/index.ts:4312) and the process proves it — a probe that arms a 5 s tick and never calls cleanup exits in 0.095 s — but deleting the `unref` leaves 234/234 green.
+> **Ticked** — `task-pin-twelve-untested-spec-001-behaviours`, 2026-10-03:
+> `test/index.test.ts` → “never holds the server process open to poll a schedule: the tick interval
+> is unref'd (box 176)”. It arms a real timer behind a spy on `setInterval` and asserts the
+> **property** — `handle.hasRef()` is false — rather than that a particular call was made, because
+> `unref` is how the property is reached and `hasRef` is what it means. Real timers, deliberately:
+> the handle under test has to be the host's own, not a fake-timer stand-in. The interval really
+> does stop the process exiting being asserted by the fact that the suite finishes at all.
+>
+> Mutation: removing `timer.unref?.()` fails it.
 
-- [ ] Lockfile paths are built with `node:path` and behave on Windows.
+- [x] Lockfile paths are composed with `node:path` from a sanitized project id, so they are
+      platform-correct by construction and cannot be walked out of the lease directory; the
+      Windows half is asserted only where Windows runs.
 
-> **Not ticked** — audit `task-audit-spec-001-acceptance-boxes`, 2026-10-02: true, and **no test pins it**. `leaseBaseDir`, `leasePath` and `logPath` build every path with `node:path.join`, and the id is sanitized, so the paths are platform-correct by construction; no test would fail if that became string concatenation, so nothing keeps it true. (Observation, outside this box: `markdownFilePath` composes `${TASKS_DIR}/${name}`, which mixes separators on Windows — that string is only ever a refusal *message*, never a path anything is opened with.)
+> **Amended + ticked** — `task-pin-twelve-untested-spec-001-behaviours`, 2026-10-03. The audit
+> verdict below was right and its own conclusion was the amendment: *“no test would fail if that
+> became string concatenation, so nothing keeps it true.”* That is not a missing assertion, it is a
+> missing property to assert. The box is narrowed to what this repository can actually keep true,
+> and the Windows claim is stated as what it is — a property of `node:path` that a Linux runner
+> cannot distinguish from anything else.
+>
+> - **Sanitized, and confined** — `test/index.test.ts` → “keeps a hostile project id inside the
+>   lease directory, whichever separator it brings (box 178)”: ids carrying `/`, `\`, `:`, a
+>   leading slash, `..` traversal and spaces all produce a lockfile and a log file that stay under
+>   the lease base directory, in exactly one component, with the fixed leaf. Mutation: deleting the
+>   `.replace(/[^A-Za-z0-9._-]/g, "_")` in `leasePath` fails it, because `join` then follows the id
+>   out of the directory.
+> - **Composed with `node:path`** — pinned by the existing “every static import in the plugin is a
+>   node builtin” (ADR 0004): `node:path` is the only path module in the file, and after
+>   sanitization `join` is the only thing standing between an id and concatenation. After
+>   sanitization the two differ *only* in normalisation, so this is a code-level fact pinned by a
+>   code-level test, and it is named as such rather than dressed up as a behavioural one.
+> - **Windows** — platform-gated: “composes the lockfile path with the host’s own separator, not a
+>   hard-coded slash (box 178)”, `it.runIf(process.platform === "win32")`. It runs on Windows and is
+>   **skipped on this suite's Linux runner**, so it was not mutation-checked here. The honest
+>   consequence: the Windows claim is *encoded*, not *verified*, by this repository's CI.
+>
+> **Known limit, reported not fixed here:** the sanitizer keeps `.`, so a project id of exactly
+> `..` composes to a lockfile one level *above* the lease base directory. Fixing it is a `src`
+> change and outside this item's scope; it is raised to the coordinator rather than patched
+> silently, and the test above deliberately does not assert the escaping form as if it were
+> correct.
+>
+> The audit's own observation stands, outside this box: `markdownFilePath` composes
+> `${TASKS_DIR}/${name}`, which mixes separators on Windows — that string is only ever a refusal
+> *message*, never a path anything is opened with.
+>
+> The audit's prior verdict, discharged: audit `task-audit-spec-001-acceptance-boxes`, 2026-10-02: true, and **no test pins it**. `leaseBaseDir`, `leasePath` and `logPath` build every path with `node:path.join`, and the id is sanitized, so the paths are platform-correct by construction; no test would fail if that became string concatenation, so nothing keeps it true. (Observation, outside this box: `markdownFilePath` composes `${TASKS_DIR}/${name}`, which mixes separators on Windows — that string is only ever a refusal *message*, never a path anything is opened with.)
 
-- [ ] The `setup` cleanup function clears the interval, releases the lease, and disposes the
+- [x] The `setup` cleanup function clears the interval, releases the lease, and disposes the
       tool registration; it is safe to call more than once.
 
-> **Not ticked** — audit `task-audit-spec-001-acceptance-boxes`, 2026-10-02: **idempotency pinned, the three effects not.** “Safe to call more than once” is pinned by “registers every tool and returns an idempotent cleanup” (two calls, no throw). Clearing the interval is not: removing `clearInterval(timer)` from `disarm` leaves 234/234 green. Releasing the lease on cleanup is not asserted on the cleanup path either — “hands the lease back once the last ephemeral task is done” covers `disarm` from the tick, not from the returned disposer.
+> **Ticked** — `task-pin-twelve-untested-spec-001-behaviours`, 2026-10-03. The audit was right
+> that idempotency was pinned and the three effects were not, so this is a new test rather than an
+> addition: `test/index.test.ts` → “stops everything the cleanup promised: the interval, the lease
+> and the tool registration (box 179)”. Each of the three is checked against a distinct
+> observation, and each is checked *after* cleanup rather than during it:
+>
+> - **The interval is cleared** — the job in the test is owed nothing at the first tick, so it
+>   becomes due one minute later; cleanup runs, and fourteen boundaries are advanced across that
+>   minute. A surviving interval dispatches it; a cleared one does not.
+> - **The lease is released** — the lockfile is gone afterwards, so the project is writable by the
+>   next instance rather than held until its TTL expires.
+> - **The registration is disposed** — the harness's `ctx.tool.transform` returns a `dispose`
+>   counter, read through the disposer `setup` handed back.
+> - **Safe to call more than once** — stays pinned by “registers every tool and returns an
+>   idempotent cleanup”, and is re-asserted here on the same disposer.
+>
+> Mutations: removing `clearInterval(timer)` from `disarm` fails it; removing `lease.release()`
+> from `disarm` fails it; not pushing the registration's disposer fails it. Three effects, three
+> separate reds.
 
 ### Upgrade — upgrade/data-loss
 
@@ -458,7 +620,17 @@ job set.**
 
 > **Ticked** — audit `task-audit-spec-001-acceptance-boxes`, 2026-10-02: `test/index.test.ts` → “keeps ephemeral history in its own key space, so it cannot collide with a job’s”. Making the ephemeral keys flat again fails 17 tests, so the namespace is load-bearing rather than decorative.
 
-- [ ] Removing a job from the file leaves its inert state behind; it is never used again
+- [x] Removing a job from the file leaves its inert state behind; it is never used again
       unless the id returns.
 
-> **Not ticked** — audit `task-audit-spec-001-acceptance-boxes`, 2026-10-02: true, and **no test pins it**. `loadStates` reads only the ids in the loaded job set and nothing anywhere deletes a removed job’s key — but making `setup` delete the state of every job missing from the file leaves 234/234 green.
+> **Ticked** — `task-pin-twelve-untested-spec-001-behaviours`, 2026-10-03:
+> `test/index.test.ts` → “leaves a removed job's state behind and never uses it again, unless the
+> id returns (box 186)”. A stored record and run history for a `ghost` job, and a file that does
+> not mention it: both keys are still exactly as they were, three minutes of ticks never evaluate,
+> dispatch or write back an id that is not in the file, and a second `setup` over the same store —
+> with the id back in the file — reports the retained `lastRun` and `lastStatus` rather than a
+> fresh record. Both halves of "inert, and retained" in one test, because the second half is what
+> makes the first one a decision rather than an omission.
+>
+> Mutation: the audit's own proposed one — making `setup` delete the state of every job missing
+> from the file — fails it.

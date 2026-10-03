@@ -1,7 +1,7 @@
 import { describe, expect, it, beforeEach, afterEach, vi } from "vitest"
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync, existsSync } from "node:fs"
 import { tmpdir } from "node:os"
-import { dirname, join } from "node:path"
+import { basename, dirname, join, sep } from "node:path"
 import { spawnSync } from "node:child_process"
 
 import plugin, {
@@ -46,6 +46,7 @@ import plugin, {
   DEFAULT_LOOP_TTL_MS,
   DEFAULT_ONEOFF_CAP,
   hasWork,
+  leaseBaseDir,
   leasePath,
   normalizeLoops,
   MAX_LOOP_SCAN_KEYS,
@@ -2043,6 +2044,8 @@ describe("acquireLease (ADR 0003)", () => {
 describe("plugin setup — context wiring and failure isolation", () => {
   let dir: string
   let restoreEnv: string | undefined
+  let consoleLines: string[] = []
+  let realConsoleError: typeof console.error
 
   beforeEach(() => {
     dir = mkdtempSync(join(tmpdir(), "st-plugin-"))
@@ -2051,10 +2054,16 @@ describe("plugin setup — context wiring and failure isolation", () => {
     // leaks from one test into the next (which would make the results order-dependent).
     restoreEnv = process.env[DATA_DIR_ENV]
     process.env[DATA_DIR_ENV] = join(dir, "state")
+    // The plugin reports through `console.error`, so a log claim ("the parse failure is named
+    // once") has to be asserted against captured lines rather than against nothing.
+    realConsoleError = console.error
+    consoleLines = []
+    console.error = (...args: unknown[]): void => void consoleLines.push(args.map(String).join(" "))
   })
   afterEach(() => {
     if (restoreEnv === undefined) delete process.env[DATA_DIR_ENV]
     else process.env[DATA_DIR_ENV] = restoreEnv
+    console.error = realConsoleError
     rmSync(dir, { recursive: true, force: true })
   })
 
@@ -2160,6 +2169,18 @@ describe("plugin setup — context wiring and failure isolation", () => {
     expect(result.jobs).toHaveLength(1)
     expect(result.jobs[0]).toMatchObject({ id: "nightly", schedule: "0 3 * * *", timezone: "UTC", enabled: true })
     expect(typeof result.leaseHeld).toBe("boolean")
+    // **Box 135**, the one assertion this test was missing: the reported instant is an absolute
+    // ISO-8601 string, not an epoch number and not a local wall clock, so a reader in any zone
+    // reads the same moment. Replacing `new Date(record.nextRun).toISOString()` with the raw
+    // epoch fails here and nowhere else.
+    expect(result.jobs[0]!.nextRun).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/)
+    // **Box 158**, the same idea for the fields a job that has never run has nothing to report:
+    // they are present and `null` rather than missing, so a reader can tell "no run yet" from
+    // "this surface does not report that".
+    expect(result.jobs[0]).toMatchObject({ lastStatus: null, lastError: null })
+    // `lastRun` is the one the first tick has already armed, so it carries a value — of the same
+    // absolute shape, which is the second half of box 135's claim.
+    expect(result.jobs[0]!.lastRun).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/)
   })
 
   it("schedules_run admits the prompt and rejects an unknown id", async () => {
@@ -2203,6 +2224,11 @@ describe("plugin setup — context wiring and failure isolation", () => {
     // Malformed on a cold read: nothing to retain, but the error is reported, not hidden.
     expect(result.error).toBeTruthy()
     expect(calls).toHaveLength(1)
+    // **Box 89**, the one assertion this test was missing: the parse failure is *named* in the
+    // log, and named once. The filter is `schedules.json:` with the colon rather than the bare
+    // file name, because the idle notice also names both surfaces in its other wording — the
+    // colon is the plugin composing "which file, and what went wrong", which is the claim.
+    expect(consoleLines.filter((line) => line.includes("schedules.json:"))).toHaveLength(1)
   })
 
   it("degrades to in-memory state when ctx.storage is absent", async () => {
@@ -2855,6 +2881,9 @@ describe("per-job permissions (T4)", () => {
         jobs: [{ id: "j", schedule: "@daily", prompt: "p", permissions: { edit: "deny" } }],
       }),
     )
+    const consoleLines: string[] = []
+    const realConsoleError = console.error
+    console.error = (...args: unknown[]): void => void consoleLines.push(args.map(String).join(" "))
     let added: Array<Record<string, unknown>> = []
     const ctx = {
       location: { directory: dir, project: { id: "perm2" } },
@@ -2866,17 +2895,30 @@ describe("per-job permissions (T4)", () => {
         },
       },
     }
-    const cleanup = await plugin.setup(ctx as never)
+    let cleanup: unknown
     try {
+      cleanup = await plugin.setup(ctx as never)
       const run = added.find((tool) => tool.name === "run")!
-      const out = await (run.execute as (i: Record<string, unknown>) => Promise<{ output: Record<string, unknown> }>)({
-        id: "j",
-      })
+      const execute = run.execute as (i: Record<string, unknown>) => Promise<{ output: Record<string, unknown> }>
       // The run still happens, on session defaults: a missing host capability must not
       // silently stop the job.
+      const out = await execute({ id: "j" })
       expect(out.output.error).toBeUndefined()
+
+      // **Box 157**, the one assertion this test's *name* promised and never made: a repeated
+      // identical failure logs once. Triggered twice here rather than across two ticks, because
+      // `logOnce` has no tick awareness — the guard is the same one either way, and the
+      // per-tick form of the claim is pinned by "logs a repeated identical failure once across
+      // five ticks" below. Note the dependency this creates: `logOnce` is keyed on a module-level
+      // set, so this is the first `no-permission-rules` in the file to reach it.
+      await execute({ id: "j" })
+      expect(consoleLines.filter((line) => line.includes("ctx.permission.rules is unavailable"))).toHaveLength(1)
     } finally {
-      ;(cleanup as () => void)?.()
+      // Restored before the cleanup, so a line the disposer emits is not swallowed into a
+      // capture that has already served its assertion — and so a throw from `setup` itself
+      // cannot leave the capture installed for every test after this one.
+      console.error = realConsoleError
+      ;(cleanup as (() => void) | undefined)?.()
       rmSync(dir, { recursive: true, force: true })
     }
   })
@@ -6529,6 +6571,10 @@ describe("the tool boundary and the ask-as-deny report (bug-tool-boundary-throws
     const running = h.logged().filter((line) => line.includes("running asks"))
     expect(running).toHaveLength(1)
     expect(running[0]).toContain("asks as deny: edit")
+    // **Box 165**, the one assertion this line was missing: `asks` names no model, so it
+    // inherits the session default — and the line says so by name, because an inherited
+    // default is usually a *paid* model and silence there is the cost nobody sees coming.
+    expect(running[0]).toContain("model session default")
     expect(h.logFile()).toContain("asks as deny: edit")
 
     // A run with nothing downgraded carries no field at all, rather than an empty list: absence
@@ -8487,5 +8533,543 @@ describe("the log directory exists before the first lease (bug-log-lines-before-
     expect(ensureLogDir(target)).toBe(true)
     // A directory, and nothing else.
     expect(existsSync(join(dirname(target), "writer.lock"))).toBe(false)
+  })
+})
+
+// ===========================================================================
+// The spec 001 clauses nothing was enforcing
+// (task-pin-twelve-untested-spec-001-behaviours)
+//
+// `task-audit-spec-001-acceptance-boxes` resolved all 39 spec 001 boxes into 23 ticked,
+// 1 amended, 4 false and **12 true and untested** — behaviours that are implemented and
+// believed correct, where breaking them left the whole suite green. A tick on one of those
+// boxes would have been a claim about belief, which is the failure mode this tracker exists
+// to end, so each test below names the mutation that turns it red. Five of the twelve were
+// one missing assertion inside a test that already existed; those say so at the assertion.
+//
+// One harness for all of them, because every one is a statement about the same surface the
+// existing suites already drive: `setup`, the interval, the tick loop and the tools. What it
+// adds is the two things none of them can do:
+//
+//   - **park a storage write**, which is the only way to hold a tick open across an interval
+//     boundary, and therefore the only way to observe the re-entrancy guard at all; and
+//   - **count the lines the plugin logged**, which is the difference between "logs once" and
+//     "logs once, which nobody checked".
+//
+// Fake timers throughout, and the schedule is always a bounded one: no test here waits on a
+// wall clock and none of them walks the occurrence search without the bounds `resolveDue`
+// already applies.
+// ===========================================================================
+describe("the spec 001 clauses nothing was enforcing (task-pin-twelve-untested-spec-001-behaviours)", () => {
+  const PROJECT = "pinned"
+
+  let dir: string
+  let restoreEnv: string | undefined
+  let consoleLines: string[]
+  let realConsoleError: typeof console.error
+  const outstanding: Array<() => void> = []
+
+  beforeEach(() => {
+    vi.useFakeTimers()
+    dir = mkdtempSync(join(tmpdir(), "st-pinned-"))
+    mkdirSync(join(dir, ".opencode"), { recursive: true })
+    restoreEnv = process.env[DATA_DIR_ENV]
+    process.env[DATA_DIR_ENV] = join(dir, "state")
+    realConsoleError = console.error
+    consoleLines = []
+    console.error = (...args: unknown[]): void => void consoleLines.push(args.map(String).join(" "))
+  })
+
+  afterEach(() => {
+    for (const dispose of outstanding.splice(0).reverse()) {
+      try {
+        dispose()
+      } catch {
+        /* a failing teardown must not mask the assertion that ran before it */
+      }
+    }
+    console.error = realConsoleError
+    if (restoreEnv === undefined) delete process.env[DATA_DIR_ENV]
+    else process.env[DATA_DIR_ENV] = restoreEnv
+    rmSync(dir, { recursive: true, force: true })
+    vi.useRealTimers()
+  })
+
+  type Tool = {
+    execute: (
+      input: Record<string, unknown>,
+      context?: { sessionID?: unknown },
+    ) => Promise<{ output: Record<string, unknown> }>
+  }
+
+  type Pinned = {
+    tool: (name: string) => Tool
+    list: () => Promise<Record<string, unknown>>
+    prompts: Record<string, unknown>[]
+    store: Map<string, unknown>
+    /** Every line the plugin logged this test, as a user sees them on stderr. */
+    logged: () => string[]
+    /** The per-project `scheduler.log`, read the way a user reads it. */
+    logFile: () => string
+    /** The storage keys whose write is parked right now. */
+    parkedKeys: () => string[]
+    releaseParked: () => void
+    /** How many times the value `ctx.tool.transform` returned has been disposed. */
+    disposals: () => number
+    cleanup: () => void
+  }
+
+  async function pinned(
+    options: {
+      jobs?: unknown[]
+      seed?: Record<string, unknown>
+      /** Reuse an earlier harness's store, so a second `setup` reads what the first left. */
+      store?: Map<string, unknown>
+      pluginOptions?: Record<string, unknown>
+      /** Make every admitted prompt fail with this message. */
+      promptError?: string
+      /** Make `ctx.session.create` fail with this message. */
+      createError?: string
+      /** Park the write to these storage keys until `releaseParked()`. */
+      park?: string[]
+    } = {},
+  ): Promise<Pinned> {
+    const store = options.store ?? new Map<string, unknown>(Object.entries(options.seed ?? {}))
+    if (options.jobs !== undefined) {
+      writeFileSync(join(dir, ".opencode", "schedules.json"), JSON.stringify({ version: 1, jobs: options.jobs }))
+    }
+    const parked: string[] = []
+    const gates = new Map<string, Array<() => void>>()
+    const tools: Array<Record<string, unknown>> = []
+    const prompts: Record<string, unknown>[] = []
+    let disposals = 0
+    const ctx: Record<string, unknown> = {
+      ...(options.pluginOptions === undefined ? {} : { options: options.pluginOptions }),
+      location: { directory: dir, project: { id: PROJECT } },
+      storage: {
+        get: async (key: string) => store.get(key),
+        set: async (key: string, value: unknown) => {
+          if ((options.park ?? []).includes(key)) {
+            parked.push(key)
+            await new Promise<void>((resolve) => (gates.get(key) ?? gates.set(key, []).get(key)!).push(resolve))
+          }
+          store.set(key, value)
+        },
+        remove: async (key: string) => void store.delete(key),
+        // Mirrors the host surface verified on 2.0.22 (`{ entries, next? }`, keys already
+        // relative to the plugin's namespace). The plugin's loop restore is its only reader,
+        // and none of these clauses needs one — it is here so a host that offers `scan` is the
+        // ordinary case rather than a special one.
+        scan: async (input: { prefix?: string; after?: string; limit?: number }) => {
+          const keys = [...store.keys()].filter((key) => key.startsWith(input.prefix ?? "")).sort()
+          const start = input.after === undefined ? 0 : Math.max(0, keys.indexOf(input.after) + 1)
+          const page = keys.slice(start, start + (input.limit ?? 100))
+          return { entries: page.map((key) => ({ key, value: store.get(key) })) }
+        },
+      },
+      session: {
+        create: async () => {
+          if (options.createError !== undefined) throw new Error(options.createError)
+          return { id: "ses_pinned" }
+        },
+        prompt: async (input: Record<string, unknown>) => {
+          prompts.push(input)
+          if (options.promptError !== undefined) throw new Error(options.promptError)
+          return { id: `inbox_${prompts.length}` }
+        },
+      },
+      permission: { rules: async () => {} },
+      tool: {
+        transform: async (cb: (editor: { add?: (t: unknown) => void }) => void) => {
+          cb({ add: (t) => void tools.push(t as Record<string, unknown>) })
+          return { dispose: () => void (disposals += 1) }
+        },
+      },
+    }
+    const resolved = await plugin.setup(ctx as never)
+    const cleanup = (): void => void (resolved as () => void)?.()
+    outstanding.push(cleanup)
+    const tool = (name: string): Tool => {
+      const found = tools.find((entry) => entry.name === name)
+      if (found === undefined) throw new Error(`tool ${name} was not registered`)
+      return found as unknown as Tool
+    }
+    return {
+      prompts,
+      store,
+      tool,
+      list: async () => (await tool("list").execute({})).output,
+      logged: () => [...consoleLines],
+      logFile: () => {
+        const path = logPath(dir, PROJECT)
+        expect(existsSync(path)).toBe(true)
+        return readFileSync(path, "utf8")
+      },
+      parkedKeys: () => [...parked],
+      releaseParked: () => {
+        for (const opens of gates.values()) for (const open of opens) open()
+      },
+      disposals: () => disposals,
+      cleanup,
+    }
+  }
+
+  /** A job due every minute, already owed an occurrence, so the first tick decides it. */
+  const due = (id: string, over: Record<string, unknown> = {}): Record<string, unknown> => ({
+    id,
+    schedule: "* * * * *",
+    timezone: "UTC",
+    prompt: `the ${id} prompt`,
+    ...over,
+  })
+
+  /** A job no occurrence is owed yet: the first tick only arms its cursor. */
+  const later = (id: string): Record<string, unknown> => ({
+    id,
+    schedule: "* * * * *",
+    timezone: "UTC",
+    prompt: `the ${id} prompt`,
+  })
+
+  const owed = (start: number, over: Record<string, unknown> = {}): Record<string, unknown> => ({
+    version: STATE_VERSION,
+    lastRun: start - 5 * MINUTE_MS,
+    ...over,
+  })
+
+  /** An absolute, unambiguous instant: what `schedules_list` promises for `nextRun`/`lastRun`. */
+  const ISO_INSTANT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/
+
+  /** Let microtasks and 0/1ms timers run without advancing the injected clock. */
+  async function flush(turns = 16): Promise<void> {
+    for (let n = 0; n < turns; n += 1) await vi.advanceTimersByTimeAsync(0)
+  }
+
+  /** A fixed instant, so no assertion below depends on where in the minute it started. */
+  const START = Date.UTC(2026, 9, 3, 12, 0, 0)
+
+  // ---------------------------------------------------------------------
+  // Box 96 — the tick loop never re-enters.
+  // ---------------------------------------------------------------------
+
+  it("drops a tick that fires while the previous one is still running, instead of nesting it (box 96)", async () => {
+    vi.setSystemTime(START)
+    const h = await pinned({
+      // Order is the whole mechanism. `blocked` is decided first and its state write is parked,
+      // so the tick is still inside the job loop when the interval fires again and `live` has
+      // not been looked at yet. `resolveDue` is synchronous, so the window between the two is a
+      // few microtasks wide — which is exactly the window a real slow storage write opens.
+      jobs: [due("blocked"), due("live")],
+      seed: {
+        // A live run lease is what suppresses `blocked`, which is what routes it down the skip
+        // path and into the parked `saveState`.
+        "scheduled-tasks/blocked": owed(START, { leaseUntil: START + 60 * MINUTE_MS }),
+        "scheduled-tasks/live": owed(START),
+      },
+      park: ["scheduled-tasks/blocked"],
+      pluginOptions: { tickMs: MIN_TICK_MS, maxConcurrentRuns: 4 },
+    })
+    await flush()
+    expect(h.parkedKeys()).toEqual(["scheduled-tasks/blocked"])
+
+    // A whole interval passes with the first tick still in flight. A tick that re-entered here
+    // would evaluate `live` — nothing about it has been decided yet — and dispatch it.
+    await vi.advanceTimersByTimeAsync(MIN_TICK_MS + 1)
+    expect(h.prompts).toEqual([])
+    expect(h.logged().filter((line) => line.includes("running live"))).toEqual([])
+
+    // Release the write and the *first* tick finishes the job itself: one run, one occurrence.
+    h.releaseParked()
+    await flush()
+    expect(h.prompts).toHaveLength(1)
+    expect(h.prompts[0]).toMatchObject({ text: "the live prompt" })
+    const runs = (await h.tool("history").execute({ id: "live" })).output.runs as Array<Record<string, unknown>>
+    expect(runs).toHaveLength(1)
+  })
+
+  // ---------------------------------------------------------------------
+  // Box 107 — a failed run is recorded, and not retried inside its occurrence.
+  // ---------------------------------------------------------------------
+
+  it("records a failed scheduled run: status, the message it threw, and no retry inside the occurrence (box 107)", async () => {
+    vi.setSystemTime(START)
+    const h = await pinned({
+      jobs: [due("flaky")],
+      seed: { "scheduled-tasks/flaky": owed(START) },
+      promptError: "provider refused the request",
+      pluginOptions: { tickMs: MIN_TICK_MS },
+    })
+    await flush()
+
+    // The job's own record, as `schedules_list` reports it.
+    const reported = ((await h.list()).jobs as Array<Record<string, unknown>>)[0]!
+    expect(reported).toMatchObject({ id: "flaky", lastStatus: "failed", lastError: "provider refused the request" })
+    expect(reported.lastRun).toMatch(ISO_INSTANT)
+    // …and what it left in storage, which is the copy a restart reads.
+    expect(h.store.get("scheduled-tasks/flaky")).toMatchObject({ lastStatus: "failed" })
+
+    // The run history, which is where a reader goes looking for the message.
+    const runs = (await h.tool("history").execute({ id: "flaky" })).output.runs as Array<Record<string, unknown>>
+    expect(runs).toHaveLength(1)
+    expect(runs[0]).toMatchObject({ outcome: "failed", error: "provider refused the request" })
+
+    // Not retried within the occurrence: five more ticks, every one of them inside the same
+    // minute, so a retry here would be a second run of an occurrence already spent.
+    for (let n = 0; n < 5; n += 1) await vi.advanceTimersByTimeAsync(MIN_TICK_MS)
+    await flush()
+    expect(h.prompts).toHaveLength(1)
+    expect((await h.tool("history").execute({ id: "flaky" })).output.runs).toHaveLength(1)
+  })
+
+  // ---------------------------------------------------------------------
+  // Boxes 135 and 158 — the reported instants and the reported field set.
+  // ---------------------------------------------------------------------
+
+  it("reports every field the box names, and both instants as absolute ISO-8601 (boxes 135, 158)", async () => {
+    vi.setSystemTime(START)
+    const lastRun = START - 2 * MINUTE_MS
+    const h = await pinned({
+      // A daily job with nothing owed, so the tick leaves the seeded record alone and the
+      // fields below are the ones the *file and storage* say rather than ones this run wrote.
+      jobs: [{ id: "slow", schedule: "0 3 * * *", timezone: "UTC", prompt: "the slow prompt" }],
+      seed: {
+        "scheduled-tasks/slow": {
+          version: STATE_VERSION,
+          lastRun,
+          lastStatus: "timeout",
+          lastError: "run exceeded its bound of 15m",
+        },
+      },
+      pluginOptions: { tickMs: MIN_TICK_MS },
+    })
+
+    const listing = await h.list()
+    const reported = (listing.jobs as Array<Record<string, unknown>>)[0]!
+    expect(reported).toMatchObject({
+      id: "slow",
+      schedule: "0 3 * * *",
+      timezone: "UTC",
+      enabled: true,
+      lastRun: new Date(lastRun).toISOString(),
+      lastStatus: "timeout",
+      lastError: "run exceeded its bound of 15m",
+    })
+    // Absolute and unambiguous: a `Z`-suffixed instant, not an epoch number and not a local
+    // wall clock, so a reader in any zone reads the same moment (box 135).
+    expect(reported.lastRun).toMatch(ISO_INSTANT)
+    expect(reported.nextRun).toMatch(ISO_INSTANT)
+    expect(new Date(reported.lastRun as string).getTime()).toBe(lastRun)
+    // The remaining field the box names — whether the lease is held elsewhere — read live
+    // rather than captured when the tool was built, so it is this instance's answer (box 158).
+    expect(listing.leaseHeld).toBe(true)
+    expect(listing.leaseForeign).toBe(false)
+  })
+
+  // ---------------------------------------------------------------------
+  // Box 157 — a repeated identical failure logs once.
+  // ---------------------------------------------------------------------
+
+  it("logs a repeated identical failure once across five ticks, not once per tick (box 157)", async () => {
+    vi.setSystemTime(START)
+    // `session.create` failing reports under a **per-job** key (`session-create-<id>`), so
+    // this measurement cannot be spent by an earlier test in the file the way a host-wide
+    // notice can — and the same failure on every tick is the repetition the box is about.
+    const h = await pinned({
+      jobs: [due("stuck")],
+      seed: { "scheduled-tasks/stuck": owed(START) },
+      createError: "session store is unavailable",
+      pluginOptions: { tickMs: MIN_TICK_MS },
+    })
+    await flush()
+    // Minutes, not ticks: one occurrence per minute, so five minutes is five identical
+    // failures of the same dispatch rather than five views of one.
+    for (let n = 0; n < 5; n += 1) await vi.advanceTimersByTimeAsync(MINUTE_MS + 1)
+    await flush()
+
+    expect(h.logged().filter((line) => line.includes("session create failed"))).toHaveLength(1)
+    // …while the failures themselves kept happening, so "once" is a dedupe and not a silence.
+    expect(h.prompts).toEqual([])
+    expect(((await h.list()).jobs as Array<Record<string, unknown>>)[0]).toMatchObject({ lastStatus: "failed" })
+  })
+
+  // ---------------------------------------------------------------------
+  // Box 162 — the resolved model is echoed in the run's own line.
+  // ---------------------------------------------------------------------
+
+  it("echoes the resolved model in the run's own line, so an inherited paid model is visible (box 162)", async () => {
+    vi.setSystemTime(START)
+    const h = await pinned({
+      jobs: [due("priced", { model: "opencode/space-bunny-free" })],
+      seed: { "scheduled-tasks/priced": owed(START) },
+      pluginOptions: { tickMs: MIN_TICK_MS },
+    })
+    await flush()
+
+    const running = h.logged().filter((line) => line.includes("running priced"))
+    expect(running).toHaveLength(1)
+    // The model the run is billed on, named in the line that announces the run — not only in
+    // the record, which nobody reads until something has already cost money.
+    expect(running[0]).toContain("model opencode/space-bunny-free")
+    // …and in the file a user actually reads, not only on stderr.
+    expect(h.logFile()).toContain("running priced")
+    expect(h.logFile()).toContain("model opencode/space-bunny-free")
+  })
+
+  // ---------------------------------------------------------------------
+  // Box 176 — the interval is `unref()`ed.
+  // ---------------------------------------------------------------------
+
+  it("never holds the server process open to poll a schedule: the tick interval is unref'd (box 176)", async () => {
+    // Real timers, and deliberately: the property under test is a property of the handle the
+    // host gets, so the handle has to be the host's own rather than a fake-timer stand-in.
+    vi.useRealTimers()
+    const handles: Array<{ hasRef?: () => boolean }> = []
+    const real = globalThis.setInterval
+    const spy = vi.spyOn(globalThis, "setInterval").mockImplementation(((
+      ...args: Parameters<typeof real>
+    ): unknown => {
+      const handle = real(...args) as unknown as { hasRef?: () => boolean }
+      handles.push(handle)
+      return handle
+    }) as never)
+    try {
+      await pinned({ jobs: [later("polled")], pluginOptions: { tickMs: MIN_TICK_MS } })
+
+      // The interval that polls a schedule does not reference the event loop, so a server with
+      // nothing else to do exits instead of sitting on a timer. The *property* is asserted, not
+      // the call that produced it: `unref` is how it is reached, `hasRef` is what it means.
+      expect(handles.length).toBeGreaterThan(0)
+      for (const handle of handles) expect(handle.hasRef?.()).toBe(false)
+    } finally {
+      spy.mockRestore()
+    }
+  })
+
+  // ---------------------------------------------------------------------
+  // Box 178 — lockfile paths are composed, and cannot be walked out of.
+  // ---------------------------------------------------------------------
+
+  it("keeps a hostile project id inside the lease directory, whichever separator it brings (box 178)", () => {
+    const base = leaseBaseDir()
+    // Every separator a project id can arrive with — a host reports whatever its own id scheme
+    // uses — plus the traversal they exist to express. `node:path.join` composes them into one
+    // component; a path assembled by string concatenation would follow them out of the lease
+    // directory, which on a real host is the whole point of the id being sanitized.
+    for (const hostile of [
+      "../../etc/passwd",
+      "..\\..\\windows",
+      "a/b",
+      "/absolute",
+      "C:\\windows",
+      "sp ace",
+      "proj-1.2_3",
+    ]) {
+      const lock = leasePath(dir, hostile)
+      const file = logPath(dir, hostile)
+      expect(lock.startsWith(`${base}${sep}`)).toBe(true)
+      expect(file.startsWith(`${base}${sep}`)).toBe(true)
+      // The id contributes exactly one component, and the leaf is the fixed one.
+      expect(dirname(lock)).toBe(join(base, hostile.replace(/[^A-Za-z0-9._-]/g, "_")))
+      expect(dirname(file)).toBe(dirname(lock))
+      expect(basename(lock)).toBe("writer.lock")
+      expect(basename(file)).toBe("scheduler.log")
+    }
+  })
+
+  it.runIf(process.platform === "win32")(
+    "composes the lockfile path with the host's own separator, not a hard-coded slash (box 178)",
+    () => {
+      // Platform-gated on purpose: `node:path` *is* the platform-correct composer, and the only
+      // way to tell it apart from a hard-coded separator is to run where the two differ. This
+      // suite runs on Linux, so the assertion below is never executed there — which is exactly
+      // why the box was amended rather than ticked on the strength of this test.
+      const base = leaseBaseDir()
+      const lock = leasePath(dir, "proj-1")
+      expect(lock).toBe(join(base, "proj-1", "writer.lock"))
+      expect(lock).toContain("\\")
+      expect(lock).not.toContain("/")
+    },
+  )
+
+  // ---------------------------------------------------------------------
+  // Box 179 — the returned cleanup stops all three things.
+  // ---------------------------------------------------------------------
+
+  it("stops everything the cleanup promised: the interval, the lease and the tool registration (box 179)", async () => {
+    vi.setSystemTime(START)
+    const lock = leasePath(dir, PROJECT)
+    // No stored `lastRun`, so the first tick only arms this job's cursor and it becomes due one
+    // minute later. The window advanced below crosses that minute, so "nothing ran after
+    // cleanup" is a fact about the interval rather than about the schedule.
+    const h = await pinned({ jobs: [later("later")], pluginOptions: { tickMs: MIN_TICK_MS } })
+    await flush()
+    expect((await h.list()).leaseHeld).toBe(true)
+    expect(existsSync(lock)).toBe(true)
+
+    h.cleanup()
+
+    // The interval: fourteen boundaries, including the one the job becomes due on.
+    await vi.advanceTimersByTimeAsync(MINUTE_MS + 2 * MIN_TICK_MS)
+    await flush()
+    expect(h.prompts).toEqual([])
+    expect(h.logged().filter((line) => line.includes("running later"))).toEqual([])
+
+    // The lease: handed back, so the lockfile is gone and the project is writable by the next
+    // instance rather than held until its TTL expires.
+    expect(existsSync(lock)).toBe(false)
+
+    // The registration: the value `ctx.tool.transform` returned is disposed through the
+    // disposer `setup` handed back.
+    expect(h.disposals()).toBe(1)
+
+    // …and a second call is still safe, which is the box's own clause and is pinned elsewhere
+    // too; repeated here because it is the same disposer.
+    expect(() => h.cleanup()).not.toThrow()
+  })
+
+  // ---------------------------------------------------------------------
+  // Box 186 — a removed job's state is left behind, inert.
+  // ---------------------------------------------------------------------
+
+  it("leaves a removed job's state behind and never uses it again, unless the id returns (box 186)", async () => {
+    vi.setSystemTime(START)
+    const lastRun = START - 90 * MINUTE_MS
+    const store = new Map<string, unknown>([
+      [
+        "scheduled-tasks/ghost",
+        { version: STATE_VERSION, lastRun, lastStatus: "ok" },
+      ],
+      [
+        "scheduled-tasks/history/ghost",
+        [{ dueAt: lastRun, startedAt: lastRun, outcome: "ok", model: "session default" }],
+      ],
+    ])
+    const nightly = { id: "nightly", schedule: "0 3 * * *", timezone: "UTC", prompt: "the nightly prompt" }
+
+    // The file no longer mentions `ghost`, which is what "removed" means here.
+    const without = await pinned({ jobs: [nightly], store })
+    expect((await without.list()).jobs).toHaveLength(1)
+
+    // Nothing deleted it: both keys are exactly as they were, because nothing anywhere deletes
+    // a job's state — upgrading the plugin must not cost a job its continuity.
+    expect(store.get("scheduled-tasks/ghost")).toMatchObject({ lastStatus: "ok", lastRun })
+    expect(store.get("scheduled-tasks/history/ghost")).toHaveLength(1)
+
+    // …and nothing used it either: three minutes of ticks, and an id that is not in the file is
+    // never evaluated, never dispatched and never written back.
+    await vi.advanceTimersByTimeAsync(3 * MINUTE_MS)
+    await flush()
+    expect(without.prompts).toEqual([])
+    expect(store.get("scheduled-tasks/ghost")).toMatchObject({ lastRun, lastStatus: "ok" })
+
+    // Unless the id returns — then the job resumes from the record it left behind instead of
+    // starting over, which is the whole reason the record was left rather than dropped.
+    without.cleanup()
+    const back = await pinned({
+      jobs: [nightly, { id: "ghost", schedule: "0 3 * * *", timezone: "UTC", prompt: "the ghost prompt" }],
+      store,
+    })
+    const reported = ((await back.list()).jobs as Array<Record<string, unknown>>).find((job) => job.id === "ghost")!
+    expect(reported).toMatchObject({ lastStatus: "ok", lastRun: new Date(lastRun).toISOString() })
   })
 })
