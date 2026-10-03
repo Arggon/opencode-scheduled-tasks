@@ -711,27 +711,129 @@ function naiveToWall(naiveMs: number): WallParts {
  * inside the second pass still walks 01:00-01:59, every minute of which resolves to an instant already
  * in the past. The `instant > afterMs` guard is what rejects them, which is why an ambiguous minute
  * fires once at its first occurrence and is never replayed at its second.
+ *
+ * **Every move of the cursor is required to advance it**, and the loop below refuses any that does
+ * not — see `WalkStalled` for why that is a thrown error rather than a loop condition, and
+ * `WalkTooLong` for the bound behind it that holds even if the refusal is ever removed.
  */
 export function nextOccurrence(spec: CronSpec, afterMs: number, timeZone: string): number | undefined {
+  return walkFrom(spec, afterMs, timeZone)
+}
+
+/**
+ * Which of the walk's four moves took a given step. All four advance the cursor; they are named apart
+ * because they are written apart, and a defect in any one of them has the same shape.
+ */
+export type WalkBranch = "day" | "hour" | "minute" | "gap"
+
+/** One cursor-advancing move the walk made, as `from` -> `to` in the naive wall-clock frame. */
+export type WalkStep = { branch: WalkBranch; from: number; to: number }
+
+/**
+ * Thrown when a cursor-advancing branch computes a value that does not advance the cursor.
+ *
+ * **This is the hang, made loud.** `wall < horizon` is the loop's only exit besides a match, so a
+ * branch that lands the cursor where it already was — or behind it — re-reads the same parts, takes
+ * the same branch, and never returns. That is not hypothetical: a stray `+ zoneOffsetMs(afterMs,
+ * timeZone)` left in the day-jump branch made a New York walk loop for 700 seconds with no output at
+ * all, which CI could only end by being killed. A hang is the worst failure this file can have,
+ * because it is indistinguishable from slowness and carries no assertion and no diff.
+ *
+ * Refused here instead, the same defect is a red test in milliseconds naming the branch and both
+ * values — and it is refused in **production** too, where `runTick`'s own `.catch` logs it as a
+ * failed tick. That is the better trade by a wide margin: one logged tick that never runs its jobs,
+ * rather than an event loop that never comes back.
+ */
+export class WalkStalled extends Error {
+  readonly branch: WalkBranch
+  readonly from: number
+  readonly to: number
+  constructor(branch: WalkBranch, from: number, to: number) {
+    super(`the ${branch} branch moved the walk cursor to ${to} from ${from}: every move must advance`)
+    this.name = "WalkStalled"
+    this.branch = branch
+    this.from = from
+    this.to = to
+  }
+}
+
+/**
+ * Thrown when a walk exceeds the step budget it was given, so termination was **interrupted** rather
+ * than reached.
+ *
+ * **The budget a walk runs under defaults to the horizon's length in minutes**, which is exactly the
+ * number of moves a correct walk cannot exceed: `wall < horizon` admits an iteration only while the
+ * cursor is short of the horizon, and every move advances it by at least a minute, so 2 635 200
+ * minutes of horizon is 2 635 200 moves at most. The bound is therefore unreachable from any input
+ * and is not a limit on the schedule search — it is the bound *behind* `advanceCursor`.
+ *
+ * Which is the point of having both. The cursor check refuses a bad move the moment it is made; this
+ * is what still holds if that check is ever deleted, and it is the difference between a defect that
+ * costs 400 ms and one that never returns. Kept as a distinct error because the two catch different
+ * defects and say different things: a spent budget means the walk was still moving when it ran out of
+ * room.
+ */
+export class WalkTooLong extends Error {
+  readonly budget: number
+  constructor(budget: number) {
+    super(`the walk spent its budget of ${budget} steps without terminating`)
+    this.name = "WalkTooLong"
+    this.budget = budget
+  }
+}
+
+/**
+ * The walk's one termination argument, in one place.
+ *
+ * Every branch below reaches its next candidate through here, which is the point: "each move advances"
+ * becomes a single assertion that no branch can route around, rather than three that each have to be
+ * remembered. The three are also exactly where a bad edit hides, because a jump that is wrong only for
+ * some inputs still looks right on the schedule it was written against.
+ */
+function advanceCursor(from: number, branch: WalkBranch, to: number, trace: WalkStep[] | undefined): number {
+  if (to <= from) throw new WalkStalled(branch, from, to)
+  if (trace !== undefined) trace.push({ branch, from, to })
+  return to
+}
+
+/**
+ * `nextOccurrence`'s walk, with the two things the plugin itself never asks for made available: a
+ * ledger of the moves (`trace`, allocated by the caller so an ordinary walk allocates nothing) and a
+ * caller-chosen step budget (`maxSteps`).
+ *
+ * The default budget is the horizon measured in minutes — the most moves a correct walk can make, and
+ * so unreachable in normal operation. It is the floor under `advanceCursor` rather than a new limit;
+ * see `WalkTooLong`.
+ */
+function walkFrom(
+  spec: CronSpec,
+  afterMs: number,
+  timeZone: string,
+  maxSteps: number = SEARCH_HORIZON_MS / MINUTE_MS,
+  trace?: WalkStep[],
+): number | undefined {
   // Start at the next whole minute of the job's own clock, strictly after `afterMs`. Reading
   // `afterMs` in `timeZone` rather than through UTC getters is the whole fix: it is the one place
   // the zone has to be applied, because every later step is arithmetic on the reading it yields.
   let wall = wallToNaive(wallParts(afterMs, timeZone)) + MINUTE_MS
   const horizon = wall + SEARCH_HORIZON_MS
 
+  let steps = 0
   while (wall < horizon) {
+    if (steps >= maxSteps) throw new WalkTooLong(maxSteps)
+    steps += 1
     const parts = naiveToWall(wall)
     if (!dayMatches(parts, spec)) {
       // Jump to the next local midnight instead of walking 1440 dead minutes.
-      wall = wallToNaive({ ...parts, day: parts.day + 1, hour: 0, minute: 0 })
+      wall = advanceCursor(wall, "day", wallToNaive({ ...parts, day: parts.day + 1, hour: 0, minute: 0 }), trace)
       continue
     }
     if (!spec.hours.has(parts.hour)) {
-      wall = wallToNaive({ ...parts, hour: parts.hour + 1, minute: 0 })
+      wall = advanceCursor(wall, "hour", wallToNaive({ ...parts, hour: parts.hour + 1, minute: 0 }), trace)
       continue
     }
     if (!spec.minutes.has(parts.minute)) {
-      wall += MINUTE_MS
+      wall = advanceCursor(wall, "minute", wall + MINUTE_MS, trace)
       continue
     }
     // The only conversion to a real instant in the loop, and it is in the zone the whole walk was
@@ -739,9 +841,34 @@ export function nextOccurrence(spec: CronSpec, afterMs: number, timeZone: string
     const instant = wallToInstant(parts, timeZone)
     if (instant !== undefined && instant > afterMs) return instant
     // The wall minute matched but does not exist locally (spring-forward): step past it.
-    wall += MINUTE_MS
+    wall = advanceCursor(wall, "gap", wall + MINUTE_MS, trace)
   }
   return undefined
+}
+
+/**
+ * One `nextOccurrence` walk, observed: every cursor move it made, and what it returned.
+ *
+ * **Test surface, and deliberately not part of the plugin's shape.** The scheduler wants the answer;
+ * the path is interesting only to a test, and a ledger on every production walk would allocate once
+ * per step on the path spec 002 bounds. So this is the same walk with the ledger open and a budget
+ * attached, and `nextOccurrence` is this function with both switched off.
+ *
+ * **`maxSteps` counts steps rather than milliseconds on purpose.** A wall-clock timeout is slow when
+ * it works and ambiguous when it fires — and a stalled cursor is unbounded in wall-clock terms, so no
+ * clock can honestly bound it. A budget of `Infinity` is therefore not on offer: exceeding the
+ * budget **throws** rather than returning what it has, because a partial walk is not a shorter
+ * answer, it is no answer.
+ */
+export function traceOccurrenceWalk(
+  spec: CronSpec,
+  afterMs: number,
+  timeZone: string,
+  maxSteps: number,
+): { steps: WalkStep[]; result: number | undefined } {
+  const steps: WalkStep[] = []
+  const result = walkFrom(spec, afterMs, timeZone, maxSteps, steps)
+  return { steps, result }
 }
 
 // ---------------------------------------------------------------------------
