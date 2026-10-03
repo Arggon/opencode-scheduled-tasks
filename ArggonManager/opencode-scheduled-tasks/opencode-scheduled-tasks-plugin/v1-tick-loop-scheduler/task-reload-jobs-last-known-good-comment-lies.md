@@ -1,6 +1,6 @@
 ---
 type: task
-status: in_progress
+status: done
 id: task-reload-jobs-last-known-good-comment-lies
 title: "reloadJobs' last-known-good branch has no caller and its comment promises mid-edit resilience that cannot happen"
 assignee: arggon
@@ -10,7 +10,6 @@ labels: []
 priority: p2
 created: "2026-10-03"
 updated: "2026-10-03"
-claimed_at: "2026-10-03T10:45:42.526Z"
 depends_on: [bug-project-id-dotdot-escapes-lease-base]
 ---
 <!--
