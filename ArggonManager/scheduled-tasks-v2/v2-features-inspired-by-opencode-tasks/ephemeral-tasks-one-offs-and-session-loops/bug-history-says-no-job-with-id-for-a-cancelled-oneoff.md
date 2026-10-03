@@ -4,6 +4,7 @@ status: in_progress
 id: bug-history-says-no-job-with-id-for-a-cancelled-oneoff
 title: "schedules_history answers \"no job with id\" for a cancelled one-off, which had a valid id"
 assignee: arggon
+branch: fix/bug-history-says-no-job-with-id-for-a-cancelled-oneoff
 parent: ephemeral-tasks-one-offs-and-session-loops
 labels: []
 priority: p3
