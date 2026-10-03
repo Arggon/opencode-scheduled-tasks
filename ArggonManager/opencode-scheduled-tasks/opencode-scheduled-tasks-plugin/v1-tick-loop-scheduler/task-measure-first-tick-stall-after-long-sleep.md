@@ -4,6 +4,7 @@ status: in_progress
 id: task-measure-first-tick-stall-after-long-sleep
 title: "A long sleep may stall the first tick for seconds at 100 jobs — measure, then decide"
 assignee: arggon
+branch: chore/task-measure-first-tick-stall-after-long-sleep
 parent: v1-tick-loop-scheduler
 labels: []
 priority: p2
