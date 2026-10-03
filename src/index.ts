@@ -745,6 +745,17 @@ export type HistoryEntry = {
   /** Session the run used; omitted when none was available. */
   sessionID?: string
   /**
+   * Present only when this record was written by a host with **no usable storage**, so it exists
+   * in that process's memory alone and is gone when it ends.
+   *
+   * Presence-only, like `asksAsDeny` and `dropped`: its absence means "this record was stored"
+   * rather than "nothing was said about retention". It is stamped in the one place every run of
+   * every kind funnels through (`recordRun`), because that is the only place that knows whether
+   * what it is about to write can be read back — and a record that silently evaporates at restart
+   * is indistinguishable from a run that never happened.
+   */
+  inMemoryOnly?: boolean
+  /**
    * The `"ask"` rules this run silently turned into denies, as `action` or `action:resource`.
    *
    * Present only when the run had any, so its absence means "nothing was downgraded", which is a
@@ -2673,6 +2684,22 @@ function dispose(registration: unknown): void {
   }
 }
 
+/**
+ * The storage operations this host does **not** offer, in the order they are needed.
+ *
+ * `get`, `set` and `remove` are feature-detected one at a time, everywhere they are used, because
+ * the plugin storage surface grew across host versions and a scheduler cannot assume a present
+ * `storage` object carries any particular method. This names what is missing rather than answering
+ * yes/no, so the one setup line about a degraded host can say *which* half is gone: a host that
+ * only writes keeps nothing readable, and one that only reads keeps nothing at all.
+ */
+function missingStorageOps(ctx: PluginContext): string[] {
+  return [
+    ...(typeof ctx.storage?.get === "function" ? [] : ["get"]),
+    ...(typeof ctx.storage?.set === "function" ? [] : ["set"]),
+  ]
+}
+
 async function storageGet(ctx: PluginContext, key: string): Promise<unknown> {
   try {
     return typeof ctx.storage?.get === "function" ? await ctx.storage.get(key) : undefined
@@ -2768,7 +2795,26 @@ type SchedulerState = {
   inFlight: Set<string>
   fileError?: string
   invalid: InvalidJob[]
+  /**
+   * Whether this host can keep what it records across a restart — i.e. whether it offers **both**
+   * halves of the plugin storage surface that durability needs: `set` to write and `get` to read
+   * back.
+   *
+   * Detected as the pair rather than as "is there a `storage` object", because neither operation
+   * implies the other and a scheduler that assumes they arrive together invents continuity it
+   * does not have. `false` is not a shrug: it is stamped onto every run record
+   * (`HistoryEntry.inMemoryOnly`), said once at setup, and is why ephemeral history is kept and
+   * read in memory below.
+   */
   storageAvailable: boolean
+  /**
+   * This process's own record of the ephemeral history keys it has minted, oldest stamp first.
+   *
+   * The mirror of the persisted index, and the only one on a host with no storage — where the
+   * in-memory ring *is* the retained history, so a cap that counted storage keys alone would
+   * bound nothing and every one-off would leave a ring behind for the life of the session.
+   */
+  ephemeralKeys: Map<string, number>
 }
 
 /**
@@ -2848,6 +2894,7 @@ const HISTORY_OUTPUT = {
     session: { type: "string" },
     runs: { type: "array" },
     limit: { type: "number" },
+    historyUnavailable: { type: "string" },
   },
 }
 
@@ -3022,11 +3069,25 @@ const EPHEMERAL_INDEX_KEY = `${HISTORY_PREFIX}ephemeral`
  * (Checked in the filter rather than again at the deletion, because a second check there is
  * unreachable — a mutation that removed it caught nothing, and unreachable defence is worse than
  * none: it reads as protection that is not there.)
+ *
+ * This process's own list is unioned with the persisted one rather than replacing it, so a key
+ * minted by an earlier process still counts against the cap after a restart — and, on a host with
+ * no storage, the in-memory union is the whole index. That is why eviction drops the *ring* and
+ * not just the index entry: where nothing is persisted, the ring is the retained history, and
+ * forgetting to delete it would leave the cap counting nothing at all.
  */
-async function retainEphemeralHistoryKey(ctx: PluginContext, key: string): Promise<void> {
+async function retainEphemeralHistoryKey(ctx: PluginContext, state: SchedulerState, key: string): Promise<void> {
   if (!isEphemeralHistoryKey(key)) return
   const stored = await storageGet(ctx, EPHEMERAL_INDEX_KEY)
-  const known: EphemeralHistoryKey[] = Array.isArray(stored) ? stored.filter(isEphemeralHistoryKeyRecord) : []
+  const persisted: EphemeralHistoryKey[] = Array.isArray(stored) ? stored.filter(isEphemeralHistoryKeyRecord) : []
+  // This process's stamps first, and the persisted ones only for keys it does not have. A key in
+  // both halves is one key: read twice it would occupy two slots and evict a younger one early,
+  // which is what a storage write that silently failed mid-session would otherwise arrange.
+  const stamps = new Map(state.ephemeralKeys)
+  for (const entry of persisted) {
+    if (!stamps.has(entry.key)) stamps.set(entry.key, entry.at)
+  }
+  const known = [...stamps].map(([key, at]) => ({ key, at }))
   // Re-recorded rather than appended, so a loop that keeps posting stays at the young end and an
   // active loop is never evicted in favour of a one-off that ran once, months ago. Ordered by
   // the stamp rather than by position, so a hand-edited index is read by its timestamps and not
@@ -3040,7 +3101,9 @@ async function retainEphemeralHistoryKey(ctx: PluginContext, key: string): Promi
     // Safe to delete without re-checking the namespace: every entry above came out of
     // `isEphemeralHistoryKeyRecord`, which is what refuses anything outside it.
     await storageRemove(ctx, entry.key)
+    state.history.delete(entry.key)
   }
+  state.ephemeralKeys = new Map(kept.map((entry) => [entry.key, entry.at]))
   await storageSet(ctx, EPHEMERAL_INDEX_KEY, kept)
 }
 
@@ -3075,6 +3138,12 @@ async function loadHistory(ctx: PluginContext, key: string): Promise<HistoryEntr
       outcome: record.outcome,
       model: clip(record.model, HISTORY_LABEL_MAX),
       ...(sessionID !== undefined ? { sessionID: clip(sessionID, HISTORY_LABEL_MAX) } : {}),
+      // `inMemoryOnly` is deliberately *not* rebuilt here, unlike the truncation fields beside it:
+      // the stamp is only ever applied when the host had no storage to write to, so a record that
+      // arrived from storage was written by a host that *had* storage — and honouring a stored
+      // `inMemoryOnly` would report a persisted record as lost. Since every other field here is
+      // rebuilt rather than passed through, dropping it is also the answer to a hand-edited
+      // record claiming it.
       ...(asksAsDeny !== undefined ? { asksAsDeny } : {}),
       ...truncation,
       ...(error !== undefined ? { error: clip(error, HISTORY_ERROR_MAX) } : {}),
@@ -3090,9 +3159,10 @@ async function saveHistory(ctx: PluginContext, state: SchedulerState, key: strin
 /**
  * Record one run against the right history, and keep the ephemeral key space bounded.
  *
- * Every run of every kind goes through here, so "which key did this land in" and "is that key
- * still retained" are one decision rather than two that can disagree — which is exactly how the
- * one-off's history ended up written somewhere nothing could read it.
+ * Every run of every kind goes through here, so "which key did this land in", "is that key still
+ * retained" and "can this record be read back after a restart" are one decision rather than three
+ * that can disagree — which is exactly how the one-off's history ended up written somewhere
+ * nothing could read it.
  */
 async function recordRun(
   ctx: PluginContext,
@@ -3101,10 +3171,15 @@ async function recordRun(
   id: string,
   entry: HistoryEntry,
 ): Promise<void> {
+  // Stamped here, on the write side, because this is the last point where the host's storage
+  // surface is still a fact rather than an assumption. What follows — `saveHistory` — can only
+  // fail *silently* by feature-detecting its way past a missing `set`, and a record that outlives
+  // nothing must say so on itself rather than leaving the reader to infer it from a log line.
+  const recorded: HistoryEntry = state.storageAvailable ? entry : { ...entry, inMemoryOnly: true }
   const key = historyKey(kind, id)
-  state.history.set(key, pushHistory(state.history.get(key) ?? [], entry))
+  state.history.set(key, pushHistory(state.history.get(key) ?? [], recorded))
   await saveHistory(ctx, state, key)
-  if (kind !== "job") await retainEphemeralHistoryKey(ctx, key)
+  if (kind !== "job") await retainEphemeralHistoryKey(ctx, state, key)
 }
 
 /** What an id turned out to be, and the runs recorded against it. */
@@ -3115,9 +3190,16 @@ type HistoryOwner = { kind: HistoryKind; session?: string; runs: HistoryEntry[] 
  *
  * The lookup is deliberately wider than `state.jobs`. A one-off is consumed the moment it runs
  * and a loop is scoped to a session, so neither is in any live list by the time anyone asks what
- * it did — which is why history was written and never read. So the answer comes from storage,
- * namespaced per kind, and a flat pre-fix key is migrated on the way through so a host that
- * already leaked one gets it reclaimed instead of inheriting the leak.
+ * it did — which is why history was written and never read. So the answer comes from this
+ * process's own rings first and from storage second, namespaced per kind, and a flat pre-fix key
+ * is migrated on the way through so a host that already leaked one gets it reclaimed instead of
+ * inheriting the leak.
+ *
+ * **Memory first, storage second, and both are needed.** Storage is what survives a restart and
+ * the only copy once this process is gone; the rings are what a run that happened *just now* left
+ * behind, and on a host with no storage they are the only copy there will ever be. Storage alone
+ * — the shape this function had after the namespacing fix — turned a one-off that demonstrably ran
+ * into `no job with id`, which is the symptom the previous item existed to eliminate.
  */
 async function resolveHistoryOwner(ctx: PluginContext, state: SchedulerState, id: string): Promise<HistoryOwner | undefined> {
   const job = state.jobs.find((entry) => entry.id === id)
@@ -3140,11 +3222,13 @@ async function resolveHistoryOwner(ctx: PluginContext, state: SchedulerState, id
     return { kind: "loop", session: sessionID, runs: state.history.get(historyKey("loop", id)) ?? [] }
   }
 
-  // Gone from every live list, which is the normal state of a finished one-off: ask storage.
+  // Gone from every live list, which is the normal state of a finished one-off.
   for (const kind of ["oneoff", "loop"] as const) {
     const key = historyKey(kind, id)
-    const runs = await loadHistory(ctx, key)
+    const runs = state.history.get(key) ?? []
     if (runs.length > 0) return { kind, runs }
+    const stored = await loadHistory(ctx, key)
+    if (stored.length > 0) return { kind, runs: stored }
   }
   if (!isEphemeralId(id)) return undefined
   // A pre-fix build wrote ephemeral history flat, under the id itself, and never removed it.
@@ -3155,7 +3239,7 @@ async function resolveHistoryOwner(ctx: PluginContext, state: SchedulerState, id
   if (runs.length === 0) return undefined
   await storageSet(ctx, historyKey("oneoff", id), runs)
   await storageRemove(ctx, legacy)
-  await retainEphemeralHistoryKey(ctx, historyKey("oneoff", id))
+  await retainEphemeralHistoryKey(ctx, state, historyKey("oneoff", id))
   return { kind: "oneoff", runs }
 }
 
@@ -4166,7 +4250,8 @@ function buildTools(
     {
       name: "history",
       description:
-        "Return recent runs for a job, a one-off or a session loop, newest first: due and start instants, outcome, resolved model, and any error.",
+        "Return recent runs for a job, a one-off or a session loop, newest first: due and start instants, outcome, resolved model, " +
+        "and any error. A run carries inMemoryOnly on a host with no storage: it is readable for this session and not after it.",
       input: {
         type: "object",
         properties: {
@@ -4203,6 +4288,18 @@ function buildTools(
                 ...state.jobs.map((entry) => entry.id),
                 ...state.oneOffs.map((task) => task.id),
               ],
+              // A completed one-off or loop is named by neither list, so on a host that cannot
+              // read storage the two remaining explanations — "never ran" and "ran, and the
+              // record died with the session" — cannot be told apart. Say which one is being
+              // reported, because answering "no job with id" for a run that demonstrably
+              // happened is exactly the lie this repo already paid for once.
+              ...(isEphemeralId(id) && typeof ctx.storage?.get !== "function"
+                ? {
+                    historyUnavailable:
+                      "this host offers no ctx.storage.get, so a finished one-off or loop is found from this " +
+                      "session's memory only, and never after it",
+                  }
+                : {}),
             },
           }
         }
@@ -4215,6 +4312,10 @@ function buildTools(
             outcome: entry.outcome,
             model: entry.model,
             ...(entry.sessionID !== undefined ? { sessionID: entry.sessionID } : {}),
+            // Carried through to the reader rather than left to be inferred from the setup line:
+            // "this run happened and is gone when the session ends" is a different fact from
+            // "this run happened", and only the record can tell the two apart after the fact.
+            ...(entry.inMemoryOnly === true ? { inMemoryOnly: true } : {}),
             ...(entry.asksAsDeny !== undefined ? { asksAsDeny: entry.asksAsDeny } : {}),
             // What the backlog owed and this run did not cover, so "how much did I miss?" is
             // answered here rather than by reading the log (ADR 0002).
@@ -4437,6 +4538,7 @@ const definition: PluginDefinition = {
     const disposers: Array<() => void> = []
     const directory = asString(ctx.location?.directory)
 
+    const storageMissing = missingStorageOps(ctx)
     const state: SchedulerState = {
       jobs: [],
       specs: new Map(),
@@ -4448,7 +4550,8 @@ const definition: PluginDefinition = {
       dispatching: new Set(),
       inFlight: new Set(),
       invalid: [],
-      storageAvailable: typeof ctx.storage?.get === "function",
+      storageAvailable: storageMissing.length === 0,
+      ephemeralKeys: new Map(),
     }
 
     // Options are read once, from the `plugins: [{ package, options }]` object form. The job
@@ -4469,6 +4572,27 @@ const definition: PluginDefinition = {
 
     const projectID = asString(ctx.location?.project?.id) ?? directory
     activeLogPath = logPath(directory, projectID)
+
+    // Said once per project, here, before any work is decided: jobs still run without storage, but
+    // run state, pending one-offs and every run record live in this process's memory alone.
+    // Nothing else the plugin emits would name the difference — a run logs its outcome either way,
+    // and the record that says "in memory only" is read by whoever asks `schedules_history`, not
+    // by the log. Keyed by project like the lease lines, because one server loads this plugin for
+    // every project it opens and a host-wide fact reported once would leave the second project's
+    // log silent about its own degradation.
+    if (!state.storageAvailable) {
+      // Both halves gone is the whole surface as far as durability goes — `remove` on its own
+      // retains nothing — so the line names the surface rather than a "/" of two methods. A host
+      // missing exactly one is named for that one, because "storage is unavailable" would be the
+      // less useful half of the truth.
+      const surface = storageMissing.length === 2 ? "ctx.storage" : `ctx.storage.${storageMissing.join("/")}`
+      logOnce(
+        `no-storage:${projectID}`,
+        `${surface} unavailable; jobs still run and their history is readable ` +
+          `through schedules_history, but run state, pending one-offs and run records are kept in memory ` +
+          `only and are lost when this session ends`,
+      )
+    }
 
     // Read the jobs *before* arbitrating. A globally-installed plugin loads in every
     // project, and claiming the writer lease (or littering a lockfile) in a project that
