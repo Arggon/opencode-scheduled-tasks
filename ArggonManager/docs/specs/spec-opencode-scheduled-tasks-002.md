@@ -5,12 +5,28 @@ status: proposed
 created: 2026-10-02
 ---
 
-<!-- status: NOT implemented. Flipping this to `implemented` was attempted and
-     reverted: the markdown-union acceptance block is unimplemented until
-     task-t2-markdown-task-files lands, and task-t7 still owes the v2 gate. Only
-     `proposed`, `implemented` and `superseded` are legal (DOC_STATUSES), and there
-     is no in-progress state - so `proposed` is the honest value while any
-     acceptance box is open. Flip it in the PR that closes the last box. -->
+<!-- status: NOT implemented, and this comment was rewritten by
+     task-t7-attribution-docs-and-v2-gate (2026-10-03). The earlier text said the
+     markdown-union block was "unimplemented until task-t2-markdown-task-files lands" —
+     stale: T2 landed, the union is in `src/index.ts` (`loadMarkdownJobs`,
+     `mergeJobSources`), and every box in that block is implemented in code.
+
+     What still blocks `implemented` is narrower, and none of it is code:
+
+     1. **The acceptance section has never been audited.** There is no
+        `task-audit-spec-002-acceptance-boxes`; spec 001 was audited
+        (`task-audit-spec-001-acceptance-boxes`) and that audit is what found four
+        boxes that were simply false. Until spec 002 gets the same pass, no box in
+        it can honestly carry a tick, and `implemented` would assert that a section
+        nobody checked had been checked.
+     2. **Two boxes in § Observability and upgrade — the ones this item owns — are
+        false as written or only half-asserted.** They are annotated in place below.
+     3. **DOC_STATUSES** allows only `proposed` / `implemented` / `superseded` and has
+        no in-progress state, so `proposed` is the only honest value while any box is
+        open — the same rule that keeps spec 001 at `proposed`.
+     4. Flipping must move `plan-opencode-scheduled-tasks-002` with it or
+        `arggon spec analyze` reports SPEC-STATUS-DRIFT. Both, in the PR that closes
+        the last open box. -->
 
 
 # Spec: v2 — markdown task files, run control, ephemeral tasks (opencode-scheduled-tasks-002)
@@ -156,12 +172,51 @@ tools.schedules.*   list · run · schedule · cancel · start_loop · stop_loop
 
 - [ ] Every fire, skip, error, expiry and cancellation appends one bounded line to
       `scheduler.log`, including the job id.
+
+> **Not ticked — the box overclaims.** The fire/skip/error/expiry/cancellation half is
+> true (`runJob`, `postLoop`, `runOneOff`, the one-off/loop drains and the `schedules_run`
+> trigger all route through `emit`), but "including the job id" is **false for host-level
+> notices**, which have no job to name: no work to do, a foreign writer lease, a missing
+> `ctx.session.prompt`, a host without `ctx.storage.scan`, a degraded log directory, and
+> `ctx.location.directory is unavailable` — the last of which is emitted before a log path
+> exists, so it reaches `stderr` only. The honest form is: *every line reaches `stderr` and
+> `scheduler.log` except the one emitted before the project is known, and job-scoped lines
+> carry the id while host-level lines carry the project path.* Amending the box and ticking
+> it is the audit's call, not this item's.
+
 - [ ] The `running` line names the resolved model **and** session mode.
+
+> **Not ticked — true, unpinned.** `runJob`'s log line carries `model`, `session` and
+> `runTimeout`; `test/index.test.ts` asserts on the *recorded* model but no test asserts the
+> shape of the line itself. Left for `task-audit-spec-002-acceptance-boxes`.
 - [ ] `schedules_format` returns the job-file reference so an agent can author jobs correctly.
 - [ ] State written by a v1-shaped record (no new fields) loads unchanged; every new field is
       optional with a documented default.
+
+> **Not ticked — true, and partially pinned.** `STATE_VERSION` is still `1` and
+> `normalizeState` rebuilds each field by type and drops unknown keys, so a v1 record is
+> read unchanged; the one new field, `catchUp`, is absent-means-nothing-owed.
+> `test/index.test.ts` → "keeps a well-formed record and drops unknown fields" pins the
+> rebuild on exactly the v1 field set, and "keeps a stored catch-up plan, oldest first, and
+> bounds it" pins the new field. Not ticked here because no test writes a **literal v1
+> record** — the fixture is written from today's constants, so it would keep passing if a
+> future field were made required. That gap is the audit's to name and close.
+
 - [ ] A v1 job file with no markdown directory produces identical behaviour to v1 — the upgrade
       is additive.
+
+> **Not ticked — the additive half is pinned, "identical behaviour" is not.**
+> `test/index.test.ts` → describe "invariant 4 — the plugin imports nothing but node builtins
+> (ADR 0004)": "loads and runs a JSON-only project without resolving any package" runs the
+> real `plugin.setup` over a JSON-only project whose `.opencode/tasks/` does not exist, under
+> an ESM loader hook that reports every non-builtin resolution, and asserts zero `EXTERNAL:`
+> lines, that the job loads, and exit 0; "every static import in the plugin is a node builtin"
+> pins the import list to `["node:fs","node:os","node:path"]`; "a missing directory is the v1
+> state, not an error" pins `loadMarkdownJobs` on an absent directory to
+> `{ jobs: [], invalid: [] }`. What is **missing** is a behavioural equivalence assertion:
+> nothing runs the same project under a v1 build and a v2 build and compares run records,
+> admission decisions or state bytes. That is a real gap, and it is why this box is open
+> rather than ticked on the strength of a dependency-count test.
 - [ ] Upgrading preserves recurring-job state and run history; nothing is deleted.
 
 ### Non-goals
