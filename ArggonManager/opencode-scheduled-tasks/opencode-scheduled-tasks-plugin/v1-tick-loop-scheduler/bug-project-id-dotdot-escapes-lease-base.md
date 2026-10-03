@@ -81,3 +81,7 @@ widening a src-excluded diff — which is the right call and is why this exists 
 
 Box 178 (Windows path behaviour) was platform-gated in the same area and left unverified on Linux; see
 that box's note. Do not regress the hostile-id confinement test that already exists.
+
+### handoff 2026-10-03 @ses_eff74efdaffezTu0PXysBLCQHu (session: ses_eff74efdaffezTu0PXysBLCQHu) — next: Code-review branch fix/bug-project-id-dotdot-escapes-lease-base (2 commits, src+test only), then apply the README threat-model sentence quoted in my comment and merge.
+- branch: fix/bug-project-id-dotdot-escapes-lease-base
+- open questions: README threat-model wording is in the comment for you to apply; keep the allowlist over a denylist.
