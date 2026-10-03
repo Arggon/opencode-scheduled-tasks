@@ -6,7 +6,7 @@ title: "Attribution, README docs, and the v2 gate"
 parent: config-surface-markdown-task-files-durations
 labels: []
 created: "2026-10-02"
-updated: "2026-10-02"
+updated: "2026-10-03"
 depends_on: [task-pin-twelve-untested-spec-001-behaviours]
 ---
 <!--
