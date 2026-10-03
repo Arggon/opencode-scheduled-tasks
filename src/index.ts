@@ -589,6 +589,21 @@ function rendersAs(instantMs: number, parts: WallParts, timeZone: string): boole
  *
  * When the wall time occurs twice (DST fall-back) the **earlier** instant is returned, so a
  * schedule that lands on an ambiguous minute fires once, at the first occurrence.
+ *
+ * **Both edges are the ones the standard names, and one of them is a deliberate divergence.**
+ * RFC 9557 (and the `Temporal` API built on it) classifies a wall-clock reading by how many
+ * instants can carry it — zero in a spring-forward *gap*, one ordinarily, two in a fall-back
+ * *overlap* — and resolves it with a `disambiguation` strategy. `compatible`, the default, is
+ * "overlap → the earlier instant; gap → shift forward by the length of the gap", so
+ * `30 2 * * *` on a spring-forward day becomes 03:30.
+ *
+ * - **Overlap → earlier**: identical to `compatible`, and to what `cron` and `cron-parser` do. Not
+ *   a local choice.
+ * - **Gap → skip**: `undefined`, so the walk moves on. This is *not* `compatible` and it is not what
+ *   `cron`/`cron-parser` do either — they compensate and run the job at the landing hour. It is
+ *   spec 001's committed behaviour (a job that did not run, rather than one that silently ran an
+ *   hour late), and it is the reason this returns `undefined` rather than throwing as `reject` would:
+ *   inside a search, "this minute does not exist" is an ordinary outcome, not an error.
  */
 export function wallToInstant(parts: WallParts, timeZone: string): number | undefined {
   const target = Date.UTC(parts.year, parts.month - 1, parts.day, parts.hour, parts.minute, 0, 0)
@@ -604,27 +619,12 @@ export function wallToInstant(parts: WallParts, timeZone: string): number | unde
   return Math.min(...candidates)
 }
 
-/** Wall parts treated as a UTC instant, so day/month arithmetic never needs a timezone. */
-function wallAsUtc(parts: WallParts): number {
-  return Date.UTC(parts.year, parts.month - 1, parts.day, parts.hour, parts.minute, 0, 0)
-}
-
-function wallFromUtc(ms: number): WallParts {
-  const date = new Date(ms)
-  return {
-    year: date.getUTCFullYear(),
-    month: date.getUTCMonth() + 1,
-    day: date.getUTCDate(),
-    hour: date.getUTCHours(),
-    minute: date.getUTCMinutes(),
-    // getUTCDay: 0 = Sunday, already the convention `daysOfWeek` uses.
-    weekday: date.getUTCDay(),
-  }
-}
-
 /**
  * Vixie day rule: when **both** day-of-month and day-of-week are restricted the day matches
  * if **either** does; when only one is restricted, that one must match.
+ *
+ * `parts` is a reading in whichever frame the caller walked; the rule is about the numbers, not the
+ * frame, so it needs no zone.
  */
 export function dayMatches(parts: WallParts, spec: CronSpec): boolean {
   if (!spec.months.has(parts.month)) return false
@@ -637,34 +637,105 @@ export function dayMatches(parts: WallParts, spec: CronSpec): boolean {
 }
 
 /**
+ * These wall parts as a value in the **naive wall-clock frame** — a `Date.UTC`-shaped integer that
+ * stands for a wall-clock reading with no zone attached to it.
+ *
+ * Cron is a wall-clock language — `30 2 * * *` means 02:30 on the clock on the wall, not 02:30 UTC —
+ * so every step of a schedule search is wall arithmetic and the zone only enters once, when a matched
+ * reading is turned into an instant. Arithmetic in this frame is what makes that true: the naive
+ * value for "local midnight on 9 March" is the same integer whatever the zone, and its ordering is
+ * the wall clock's own ordering, which is what a walk over a schedule wants to step through.
+ *
+ * **This frame has a name in the standard, and `Temporal` implements it.** RFC 9557 / `Temporal`
+ * call it a *plain* date-time: "a date and time without a specific time zone or UTC offset", meant
+ * for exactly this — an appointment or a scheduled event, independent of any location. Walking a
+ * schedule in `Temporal.PlainDateTime` arithmetic and resolving each match with `toZonedDateTime`
+ * reproduces this file's behaviour exactly, including the shape of the walk across both transitions
+ * and the index at which the fall-back's 61-minute step appears. `PlainDateTime` is the vocabulary
+ * this file uses instead.
+ *
+ * **It is nonetheless hand-rolled here, because it has to be.** This plugin is vendored as one
+ * dependency-free file and CI pins **Node 22** (`.github/workflows/arggon.yml`), where `Temporal` is
+ * absent: on Node 22.23.3 / V8 12.4, `typeof Temporal === "undefined"`, and it is reachable only
+ * behind `--harmony-temporal`, a V8 flag a plugin cannot set on the host process that loads it. (It
+ * is present unflagged on Node 26 / V8 14.6 — but even there `PlainDateTime` shipped without
+ * `getPossibleInstantsFor`, the method that most directly expresses "how many instants is this wall
+ * time", so the API is not settled enough to be a floor either.) See ADR 0004: a dependency is only
+ * acceptable where it does not compromise the dependency-free core, and this is the core.
+ *
+ * **Why the frame has to be named at every call site.**
+ * `bug-next-occurrence-walks-utc-wall-parts-in-any-zone-west-of-utc` shipped a walk whose cursor was
+ * a *real instant* read through `Date`'s UTC getters and handed to `wallToInstant`, which reads its
+ * argument as `timeZone` wall parts. Those are the same value only at offset 0: inverting
+ * `local = UTC + offset` by adding `offset` back round-trips when `offset >= 0` and *adds* the
+ * magnitude when it is negative, so every step in New York landed `|offset| + 1` minutes late and a
+ * `* * * * *` job fired once every 241 minutes. Nothing about it looked wrong where it was written,
+ * which is why the helpers say which frame they speak rather than saying `UTC`.
+ */
+function wallToNaive(parts: WallParts): number {
+  return Date.UTC(parts.year, parts.month - 1, parts.day, parts.hour, parts.minute, 0, 0)
+}
+
+/** The parts a value in the naive wall-clock frame encodes. The inverse of `wallToNaive`. */
+function naiveToWall(naiveMs: number): WallParts {
+  const date = new Date(naiveMs)
+  return {
+    year: date.getUTCFullYear(),
+    month: date.getUTCMonth() + 1,
+    day: date.getUTCDate(),
+    hour: date.getUTCHours(),
+    minute: date.getUTCMinutes(),
+    // getUTCDay: 0 = Sunday, already the convention `daysOfWeek` uses.
+    weekday: date.getUTCDay(),
+  }
+}
+
+/**
  * First occurrence of `spec` strictly after `afterMs`, evaluated in `timeZone`, or
  * `undefined` when nothing matches within the search horizon.
  *
- * The search walks **wall-clock** minutes and only converts the match to an instant, which
- * is what makes DST correct for free: a wall time that does not exist resolves to
- * `undefined` and the walk continues, and an ambiguous wall time resolves to its first
- * instant.
+ * **The cursor walks wall minutes in `timeZone`'s own frame.** `wall` is a value in the naive
+ * wall-clock frame (see `wallToNaive`), not an instant: it starts from the zone's own reading of
+ * `afterMs`, `naiveToWall` decodes it, both jump branches rebuild it from the same naive parts, and
+ * only the matched reading becomes a real instant. Every step is a step of the job's clock, so one
+ * frame governs the whole loop — the two jumps would be in the wrong frame if they were not, and
+ * fixing only the final conversion would leave them mis-walking.
+ *
+ * That is also what makes DST fall out for free: a wall time that does not exist resolves to
+ * `undefined` and the walk continues, and an ambiguous one resolves to its first instant. Both
+ * edges are spelled out at `wallToInstant`, including the one where this file parts company with
+ * the standard's `compatible` disambiguation.
+ *
+ * **"Strictly after" is enforced on the instant, not on the frame.** The naive frame is not a total
+ * order on instants — during a fall-back the wall clock repeats an hour — so a cursor asked from
+ * inside the second pass still walks 01:00-01:59, every minute of which resolves to an instant already
+ * in the past. The `instant > afterMs` guard is what rejects them, which is why an ambiguous minute
+ * fires once at its first occurrence and is never replayed at its second.
  */
 export function nextOccurrence(spec: CronSpec, afterMs: number, timeZone: string): number | undefined {
-  // Start at the next whole minute strictly after `afterMs`.
-  let wall = Math.floor(afterMs / MINUTE_MS) * MINUTE_MS + MINUTE_MS
+  // Start at the next whole minute of the job's own clock, strictly after `afterMs`. Reading
+  // `afterMs` in `timeZone` rather than through UTC getters is the whole fix: it is the one place
+  // the zone has to be applied, because every later step is arithmetic on the reading it yields.
+  let wall = wallToNaive(wallParts(afterMs, timeZone)) + MINUTE_MS
   const horizon = wall + SEARCH_HORIZON_MS
 
   while (wall < horizon) {
-    const parts = wallFromUtc(wall)
+    const parts = naiveToWall(wall)
     if (!dayMatches(parts, spec)) {
       // Jump to the next local midnight instead of walking 1440 dead minutes.
-      wall = Date.UTC(parts.year, parts.month - 1, parts.day + 1, 0, 0, 0, 0)
+      wall = wallToNaive({ ...parts, day: parts.day + 1, hour: 0, minute: 0 })
       continue
     }
     if (!spec.hours.has(parts.hour)) {
-      wall = Date.UTC(parts.year, parts.month - 1, parts.day, parts.hour + 1, 0, 0, 0)
+      wall = wallToNaive({ ...parts, hour: parts.hour + 1, minute: 0 })
       continue
     }
     if (!spec.minutes.has(parts.minute)) {
       wall += MINUTE_MS
       continue
     }
+    // The only conversion to a real instant in the loop, and it is in the zone the whole walk was
+    // reading in — so the round trip is `zone -> naive -> zone`, not `zone -> UTC -> zone`.
     const instant = wallToInstant(parts, timeZone)
     if (instant !== undefined && instant > afterMs) return instant
     // The wall minute matched but does not exist locally (spring-forward): step past it.
@@ -1587,11 +1658,18 @@ export type MissedOccurrences = {
  * function of a timezone, a calendar and DST, so an exact count *is* a search. What is bounded is
  * how far the search goes — past this many occurrences it stops and reports a lower bound
  * (`droppedCapped`). That is what makes a tick cost a function of the number of **jobs** rather
- * than of how long the server was asleep. Measured on this file (2026-10-02): a `* * * * *` job
- * costs the same 6012 timezone lookups (~23 ms) for a backlog of 24 hours and for one of 100
- * years, and pays that once — the tick that finds the backlog consumes the window and a `backfill`
- * remainder moves into the durable plan, so the next tick costs one occurrence search (~0.07 ms).
- * A later tick over 100 such jobs costs ~6 ms.
+ * than of how long the server was asleep. Measured on this file (2026-10-03, re-measured after
+ * `bug-next-occurrence-walks-utc-wall-parts-in-any-zone-west-of-utc`): a `* * * * *` job costs the
+ * same 7014 timezone lookups (~31 ms) for a backlog of 24 hours and for one of 100 years, and pays
+ * that once — the tick that finds the backlog consumes the window and a `backfill` remainder moves
+ * into the durable plan, so the next tick costs one occurrence search (~0.03 ms). A later tick over
+ * 100 such jobs costs ~8 ms.
+ *
+ * The walk is **7014** rather than the 6012 it used to be because a matching search now costs seven
+ * timezone lookups rather than six: the walk reads `afterMs` in the job's own zone to learn what its
+ * clock says before it walks that clock (`nextOccurrence`). The bound itself is unchanged, so the
+ * longest block a walk can produce is still one job's — see `yieldToEventLoop` for the measurement
+ * that the fix does not regress.
  *
  * **Not exported on purpose.** The bound is asserted as a literal in `test/index.test.ts`, so
  * raising it breaks a cost assertion in the open rather than being followed silently by a test
@@ -3776,12 +3854,20 @@ async function runJob(
  * Hand the event loop back for exactly one turn.
  *
  * The job loop below is the only place in this file that can spend seconds of straight-line CPU.
- * One job's `MAX_BACKLOG_SCAN` walk is ~24 ms on its own (6012 timezone lookups), and at
+ * One job's `MAX_BACKLOG_SCAN` walk is ~31 ms on its own (7014 timezone lookups), and at
  * `DEFAULT_MAX_JOBS` (100 jobs, each owing a capped backlog — which needs ≥17 h asleep) a hundred
  * of them run back to back. Measured on this file (2026-10-03, 24 h backlog, `* * * * *`, UTC, the
  * real `tick` driven through `setup`): **601 800 lookups, and a 2.45 s stretch in which no timer
  * and no I/O callback ran at all** — `setImmediate` and `setTimeout(0)` markers queued during the
  * walk both fired only after the last job had been evaluated.
+ *
+ * Re-measured after `bug-next-occurrence-walks-utc-wall-parts-in-any-zone-west-of-utc`, same
+ * scenario: **702 100 lookups over ~2.97 s**, because a matching search now costs seven lookups
+ * rather than six — the walk reads `afterMs` in the job's own zone before walking that zone's
+ * clock. The bound the turn buys is unchanged and is the thing to check: the **longest stretch with
+ * no callback at all is ~48 ms**, one job's walk plus the loop's own per-job overhead, and the next
+ * four are 40/38/36/34 ms. Still no run anywhere near the 2.45 s, and still no run that grows with
+ * the number of jobs behind it.
  *
  * That gap is the whole difference between *busy* and *blocked*. The loop already interleaves
  * microtasks — the skip path awaits a storage write — and microtasks do not end a turn, so nothing
@@ -3830,7 +3916,13 @@ async function tick(ctx: PluginContext, state: SchedulerState, lease: Lease, max
     // top, rather than after the decision below: the turn then separates walks, so a job that finds
     // a backlog always begins a fresh blocking run and the run it begins is exactly one walk. The
     // cost is a turn only on the ticks that would otherwise have blocked — measured at ~1.5 µs,
-    // against a tick that spends ~24 ms per capped backlog — so an ordinary tick pays nothing.
+    // against a tick that spends ~31 ms per capped backlog — so an ordinary tick pays nothing.
+    //
+    // **What the meter counts is occurrences, not lookups**, and the two stopped being the same
+    // price when the walk's frame was fixed: a search now costs seven timezone lookups where it
+    // cost six, so one capped walk is ~17 % dearer than it was. `MAX_BACKLOG_SCAN` was left at 1000
+    // rather than scaled down — the bound buys *one job's walk* as a block, which is unchanged in
+    // kind, and re-measured at ~48 ms as the longest stretch without a callback.
     //
     // Nothing the turn protects is affected by it: `resolveDue` decides **and** mutates the record
     // before the meter is charged, `decisions` keeps the order the loop found, and the shared

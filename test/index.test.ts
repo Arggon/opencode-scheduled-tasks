@@ -63,11 +63,83 @@ const MADRID = "Europe/Madrid"
 const DST_SPRING_FORWARD_2026 = "2026-03-29" // 02:00 -> 03:00; 02:30 does not exist
 const DST_FALL_BACK_2026 = "2026-10-25" // 03:00 -> 02:00; 02:30 happens twice
 
+/**
+ * A zone **west** of UTC, added by `bug-next-occurrence-walks-utc-wall-parts-in-any-zone-west-of-utc`.
+ *
+ * Madrid and UTC are the only two zones the suite used to evaluate schedules in, and both sit at or
+ * east of Greenwich, which is the whole range in which the old UTC-frame walk cancelled out. New York
+ * is the zone the bug was reported from, and it is also an ordinary zone: most of the people running
+ * a scheduler are west of Greenwich. Its DST transitions are in March and November.
+ */
+const NEW_YORK = "America/New_York"
+const NY_SPRING_FORWARD_2026 = "2026-03-08" // 02:00 -> 03:00; 02:30 does not exist
+const NY_FALL_BACK_2026 = "2026-11-01" // 02:00 -> 01:00; 01:30 happens twice
+
+/**
+ * A zone west of UTC with a **half-hour** magnitude: UTC-3:30 in standard time, UTC-2:30 in
+ * daylight time.
+ *
+ * A whole-hour negative offset cannot see a `:30` bug — `|offset| + 1` is 241 either way if the
+ * minutes are dropped, and 151 vs 211 here is the difference between the two.
+ */
+const ST_JOHNS = "America/St_Johns"
+
 /** ISO-8601 local reading of an instant, for assertions that do not care about internals. */
 function local(instantMs: number, timeZone: string): string {
   const parts = wallParts(instantMs, timeZone)
   const pad = (n: number): string => String(n).padStart(2, "0")
   return `${parts.year}-${pad(parts.month)}-${pad(parts.day)}T${pad(parts.hour)}:${pad(parts.minute)}`
+}
+
+/**
+ * `zone`'s offset from UTC in whole minutes at `instantMs`, positive **east** of Greenwich.
+ *
+ * Derived from `wallParts` rather than tabulated, so a test can assert the *range* the matrix covers
+ * instead of trusting that nobody deleted the half of it that found the bug. Only exact on whole
+ * minutes — `wallParts` has no second field, and every caller here pins one.
+ */
+function offsetMinutes(instantMs: number, zone: string): number {
+  const parts = wallParts(instantMs, zone)
+  return (Date.UTC(parts.year, parts.month - 1, parts.day, parts.hour, parts.minute) - instantMs) / MINUTE_MS
+}
+
+/** Minutes from `fromMs` to the next occurrence of `spec` in `zone`; the reported cadence. */
+function stepMinutes(spec: ReturnType<typeof parseCron>, fromMs: number, zone: string): number {
+  return (nextOccurrence(spec, fromMs, zone)! - fromMs) / MINUTE_MS
+}
+
+/**
+ * How many instants render as the given local wall-clock reading in `zone`.
+ *
+ * RFC 9557 / `Temporal` classify a wall-clock reading by exactly this count: **zero** in a
+ * spring-forward *gap*, **one** ordinarily, **two** in a fall-back *overlap*, and the `disambiguation`
+ * option is the policy for turning that count into an instant. This is the classification the suite's
+ * DST fixtures are supposed to be about, so it is *derived* here rather than asserted in prose — by
+ * scanning a day either side of the reading with raw `Intl`, touching no plugin code beyond the
+ * exported `wallParts`.
+ *
+ * The reason to bother: a tzdata update that moves a transition would leave every DST test in this
+ * file still passing while quietly testing the wrong fixture. This makes it fail instead.
+ */
+function possibleInstants(reading: string, zone: string): number {
+  const [date, time] = reading.split("T")
+  const [y, mo, d] = date!.split("-").map(Number)
+  const [h, mi] = time!.split(":").map(Number)
+  const noonish = Date.UTC(y!, mo! - 1, d!, h!, mi!, 0, 0) // the reading read as if it were UTC
+  let count = 0
+  for (let t = noonish - 24 * 60 * MINUTE_MS; t <= noonish + 24 * 60 * MINUTE_MS; t += MINUTE_MS) {
+    const parts = wallParts(t, zone)
+    if (
+      parts.year === y &&
+      parts.month === mo &&
+      parts.day === d &&
+      parts.hour === h &&
+      parts.minute === mi
+    ) {
+      count += 1
+    }
+  }
+  return count
 }
 
 /**
@@ -179,6 +251,49 @@ describe("nextOccurrence", () => {
     expect(nextOccurrence(spec, at, "UTC")).toBe(at + 60 * MINUTE_MS)
   })
 
+  it("never returns an instant at or before the cursor, even inside a repeated hour", () => {
+    // The one place "strictly after" is not free. A cursor in the naive frame is ordered by the
+    // **wall clock**, and during a fall-back the wall clock runs backwards over an hour: at
+    // 2026-11-01T06:00Z New York reads 01:00 for the *second* time, so every wall minute after it
+    // — 01:01, 01:02, up to 01:59 — resolves to an instant an hour in the past. Seeding the walk
+    // from `afterMs` is not enough to exclude them, and neither is "the cursor advanced", because
+    // in that frame it did.
+    //
+    // So the frame cannot carry the ordering and the walk rests the claim on the instant: `instant > afterMs`.
+    // Drop that comparison and this answers with 2026-11-01T05:01Z for a cursor at 06:00Z — an hour
+    // *in the past*, and on a `* * * * *` job a scheduler would fire it immediately, in a loop.
+    const spec = parseCron("* * * * *")
+    // Each zone's own fall-back instant, because the repeated local hour lands at a different time
+    // in UTC in each: New York at 06:00Z (EDT -4 -> EST -5), St_Johns at 04:30Z (NDT -2:30 ->
+    // NST -3:30). Both land inside the same 2026-11-01, which is why one date serves both.
+    for (const [zone, fallsBackAt] of [
+      [NEW_YORK, Date.parse(`${NY_FALL_BACK_2026}T06:00:00Z`)],
+      [ST_JOHNS, Date.parse(`${NY_FALL_BACK_2026}T04:30:00Z`)],
+    ] as const) {
+      // Every wall minute of the second pass is rejected, not just the one the cursor sits on,
+      // because *all* of local 01:01-01:59 resolves to the first pass, an hour earlier. So the
+      // answer is the same from anywhere inside it: one hour past the transition, which is 02:00
+      // local — the first wall minute whose instant is still ahead.
+      const expected = new Date(fallsBackAt + 60 * MINUTE_MS).toISOString()
+      for (const offset of [0, 1, 15, 29] as const) {
+        const after = fallsBackAt + offset * MINUTE_MS
+        expect({ zone, offset, instant: new Date(nextOccurrence(spec, after, zone)!).toISOString() }).toEqual({
+          zone,
+          offset,
+          instant: expected,
+        })
+      }
+      // And the invariant itself, over every second of the half-hour of the repeated hour rather
+      // than four points in it: the answer is never at or behind the cursor.
+      for (let minute = 0; minute < 30; minute += 1) {
+        for (const second of [0, 30, 59]) {
+          const cursor = fallsBackAt + minute * MINUTE_MS + second * 1000
+          expect(nextOccurrence(spec, cursor, zone)!).toBeGreaterThan(cursor)
+        }
+      }
+    }
+  })
+
   it("rolls over the hour, the day, the month and the year", () => {
     expect(local(nextOccurrence(parseCron("0 0 * * *"), Date.UTC(2026, 0, 31, 23, 30), "UTC")!, "UTC")).toBe(
       "2026-02-01T00:00",
@@ -206,6 +321,172 @@ describe("nextOccurrence", () => {
     expect(new Date(instant).toISOString()).toBe("2026-05-10T01:00:00.000Z")
   })
 
+  // -------------------------------------------------------------------------
+  // The offset-sign axis (bug-next-occurrence-walks-utc-wall-parts-in-any-zone-west-of-utc)
+  //
+  // The schedule walk used to advance the cursor in **UTC** wall parts and hand those parts to
+  // `wallToInstant`, which reads them as **`timeZone`** wall parts. The two frames are the same only
+  // at offset 0: inverting `local = UTC + offset` by adding `offset` back round-trips for
+  // `offset >= 0`, and *adds* the magnitude for a negative one, so every step landed `|offset| + 1`
+  // minutes late. 271 tests missed it because every zone they evaluated was at or east of Greenwich.
+  //
+  // So the axis to vary is the **sign of the offset**, and a table is the shape that keeps it
+  // varied: deleting a zone narrows the range, and the guard below is what makes that deletion fail
+  // rather than pass quietly.
+  // -------------------------------------------------------------------------
+
+  /** Both signs, both magnitudes, both extremes — the range the walk has to be right over. */
+  const OFFSET_MATRIX = [
+    "UTC",
+    MADRID,
+    "Asia/Kolkata", // +5:30 — half hour, east
+    "Pacific/Kiritimati", // +14 — the eastern extreme
+    ST_JOHNS, // -2:30 in May, -3:30 in January — half hour, west
+    "America/Buenos_Aires", // -3
+    NEW_YORK, // -4 in May — the zone the bug was reported from
+    "America/Chicago", // -5
+    "Pacific/Honolulu", // -10 — the western extreme
+  ] as const
+
+  it("varies the sign of the UTC offset, not one side of it", () => {
+    // The matrix is not a list of zones people like; it is one zone per **class** the walk has to be
+    // right over, and the classes are derived here rather than trusted. A zone's class is fixed by two
+    // facts `Intl` will answer for any instant: the **sign** of its offset from Greenwich (east /
+    // west / Greenwich itself) and whether it **observes DST** (its offset differs between the two
+    // seasons). Magnitude and sub-hour parts follow from the offset's value. Asserted over both
+    // seasons, because the sign is not a property of a zone — it is a property of an instant, and
+    // `America/New_York` is `-5` in January and `-4` in May.
+    const SEASONS = [
+      { name: "January (standard time)", at: Date.UTC(2026, 0, 10, 12, 0) },
+      { name: "May (daylight time)", at: Date.UTC(2026, 4, 10, 12, 0) },
+    ]
+
+    for (const season of SEASONS) {
+      const offsets = OFFSET_MATRIX.map((zone) => offsetMinutes(season.at!, zone))
+
+      // **The axis whose absence let the bug through.** Asserted as a range rather than as a list, so
+      // a future edit that drops the negative half fails here instead of quietly narrowing the tests
+      // back to the range where the frame error cancels.
+      expect(Math.min(...offsets)).toBeLessThanOrEqual(-240)
+      expect(Math.max(...offsets)).toBeGreaterThanOrEqual(840)
+
+      // A whole-hour case cannot see a `:30` offset, so half-hour magnitudes belong on **both** sides
+      // of Greenwich; the west one is `America/St_Johns`, which is what the bug report asked for.
+      expect(offsets).toContain(330)
+      expect(offsets.filter((n) => n % 60 !== 0 && n < 0).length).toBeGreaterThanOrEqual(1)
+
+      // And the sign is not standing in for the magnitude: a fix that special-cased the zones rather
+      // than the frame would still pass the range check, so pin that three distinct signs are in play.
+      expect(new Set(offsets.map((n) => Math.sign(n))).size).toBe(3)
+    }
+
+    // DST-observing vs fixed, derived: a zone that shifts between the seasons has to be in the matrix
+    // (its offset is a function of the instant, which is the whole reason the bug was seasonal) and so
+    // does a zone that does not (a fixed offset is the case where the frame error hides most easily).
+    const january = OFFSET_MATRIX.map((zone) => offsetMinutes(SEASONS[0]!.at, zone))
+    const may = OFFSET_MATRIX.map((zone) => offsetMinutes(SEASONS[1]!.at, zone))
+    const shifting = OFFSET_MATRIX.map((zone, i) => ({ zone, jan: january[i]!, may: may[i]! })).filter(
+      (row) => row.jan !== row.may,
+    )
+    const fixed = OFFSET_MATRIX.length - shifting.length
+    // `UTC`, `Asia/Kolkata`, `Pacific/Kiritimati`, `America/Buenos_Aires`, `Pacific/Honolulu`.
+    expect(fixed).toBeGreaterThanOrEqual(4)
+    // `Europe/Madrid`, `America/St_Johns`, `America/New_York`, `America/Chicago`.
+    expect(shifting.length).toBeGreaterThanOrEqual(3)
+    // And the direction of every shift, derived rather than assumed. Every DST zone in the matrix is
+    // northern-hemisphere, so summer is further **east**: `America/New_York` goes from `-5` to `-4`,
+    // `Europe/Madrid` from `+1` to `+2`. The bug-relevant consequence is that for a zone west of
+    // Greenwich the *magnitude shrinks* into summer — and the symptom was `|offset| + 1`, so the same
+    // New York job was 301 minutes slow in January and 241 in May. Measuring one season would have
+    // understated the defect by an hour; both seasons are therefore part of the axis.
+    for (const row of shifting) expect(row.may).toBeGreaterThan(row.jan)
+    for (const row of shifting.filter((r) => r.jan < 0)) expect(Math.abs(row.may)).toBeLessThan(Math.abs(row.jan))
+  })
+
+  it("keeps a minutely job minutely in every zone, east or west of UTC", () => {
+    // The reported symptom, as a table: a `* * * * *` job stepping 241 minutes at a time in New
+    // York means the most common schedule in the most common timezone fires roughly every 4 hours.
+    // The step is the *cadence*, so it is asserted directly rather than inferred from a due time.
+    const spec = parseCron("* * * * *")
+    const start = Date.UTC(2026, 4, 10, 12, 0)
+
+    const steps: Record<string, number[]> = {}
+    for (const zone of OFFSET_MATRIX) {
+      const seen: number[] = []
+      let cursor = start
+      for (let i = 0; i < 4; i += 1) {
+        seen.push(stepMinutes(spec, cursor, zone))
+        cursor = nextOccurrence(spec, cursor, zone)!
+      }
+      steps[zone] = seen
+    }
+    // One expectation covering the whole table: the diff names the zone that is wrong and shows the
+    // exact step it took instead, which is the `241 !== 1` symptom rather than a bare false.
+    expect(steps).toEqual(Object.fromEntries(OFFSET_MATRIX.map((zone) => [zone, [1, 1, 1, 1]])))
+  })
+
+  it("steps one minute at a half-hour magnitude, in daylight time and in standard time", () => {
+    // `America/St_Johns` is UTC-2:30 in May and UTC-3:30 in January. The old walk added the
+    // magnitude instead of subtracting it, so the two seasons reported 151 and 211 minutes — a
+    // half-hour offset bug a whole-hour case (241) cannot distinguish from an hours-only one.
+    const spec = parseCron("* * * * *")
+    const daylight = Date.UTC(2026, 4, 10, 12, 0) // NDT, UTC-2:30
+    const standard = Date.UTC(2026, 0, 10, 12, 0) // NST, UTC-3:30
+
+    expect(offsetMinutes(daylight, ST_JOHNS)).toBe(-150)
+    expect(offsetMinutes(standard, ST_JOHNS)).toBe(-210)
+    expect([stepMinutes(spec, daylight, ST_JOHNS), stepMinutes(spec, standard, ST_JOHNS)]).toEqual([1, 1])
+  })
+
+  it("jumps the day and the hour in the zone's own frame, not a UTC one", () => {
+    // The two jump branches are where the frame is hardest to get right and easiest to leave wrong:
+    // a cursor mis-framed by `|offset|` **hours** still produces the right answer for a minutely
+    // schedule, because every day and every hour matches and the branch is never taken. So the
+    // branches need schedules that *restrict* the day and the hour, evaluated in a negative-offset
+    // zone, or nothing pins them.
+    //
+    // Both branches run on every one of these: a restricted day rejects most of the walk and jumps
+    // to the next local midnight; a restricted hour rejects the rest of it and jumps to the top of
+    // the next matching hour. The old walk took those jumps from UTC-derived parts, so a
+    // monthly-at-midnight job in New York landed on the wrong night — and a day-of-week job was
+    // matched against the **UTC** weekday, which is the previous day for every evening in the
+    // Americas.
+    const cases: Array<{ schedule: string; zone: string; after: string; want: string }> = [
+      // Day-of-month: the next 1st, at local midnight. New York is UTC-4, St_Johns UTC-2:30.
+      { schedule: "0 0 1 * *", zone: NEW_YORK, after: "2026-05-10T12:00:00Z", want: "2026-06-01T00:00" },
+      { schedule: "0 0 1 * *", zone: ST_JOHNS, after: "2026-05-10T12:00:00Z", want: "2026-06-01T00:00" },
+      // The same jump crossing a **year** boundary, where a mis-framed target is a whole year out.
+      { schedule: "0 0 1 1 *", zone: NEW_YORK, after: "2026-05-10T12:00:00Z", want: "2027-01-01T00:00" },
+      { schedule: "0 0 1 1 *", zone: ST_JOHNS, after: "2026-05-10T12:00:00Z", want: "2027-01-01T00:00" },
+      // Day-of-week: 2026-05-10 is a Sunday, so the next Monday is the 11th. Reading the weekday
+      // off UTC instead of the zone would give the 18th.
+      { schedule: "30 9 * * 1", zone: NEW_YORK, after: "2026-05-10T12:00:00Z", want: "2026-05-11T09:30" },
+      { schedule: "30 9 * * 1", zone: ST_JOHNS, after: "2026-05-10T12:00:00Z", want: "2026-05-11T09:30" },
+      // Saturday evening local in New York is already Sunday in UTC — the case where the two
+      // weekday frames disagree, and the one that only fails if the parts are UTC's.
+      { schedule: "0 20 * * 6", zone: NEW_YORK, after: "2026-05-16T02:00:00Z", want: "2026-05-16T20:00" },
+      // Hour branch only: 08:00 local has to jump forward to 09:00 **the same day** — the jump is
+      // forward to the next matching hour, not to the next occurrence of the schedule.
+      { schedule: "0 9 * * *", zone: NEW_YORK, after: "2026-05-10T12:00:00Z", want: "2026-05-10T09:00" },
+      // The same jump from 09:30 local, where 09:00 is already behind and tomorrow is the answer.
+      { schedule: "0 9 * * *", zone: ST_JOHNS, after: "2026-05-10T12:00:00Z", want: "2026-05-11T09:00" },
+      // Two matching hours with a non-matching one between them: from 10:00 local the jump has to
+      // *skip* 11:00-16:00 and land on 17:00 in the same day.
+      { schedule: "0 9,17 * * *", zone: NEW_YORK, after: "2026-05-10T14:00:00Z", want: "2026-05-10T17:00" },
+    ]
+
+    const readings: Record<string, string> = {}
+    for (const { schedule, zone, after, want } of cases) {
+      const instant = nextOccurrence(parseCron(schedule), Date.parse(after), zone)!
+      const reading = local(instant, zone)
+      readings[`${schedule} @ ${zone}`] = reading
+      expect({ schedule, zone, reading }).toEqual({ schedule, zone, reading: want })
+    }
+    // And every one of those readings is a whole local minute the schedule actually names — the
+    // jump has to land *on* the schedule, not merely somewhere after it.
+    expect(Object.values(readings).every((reading) => /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(reading))).toBe(true)
+  })
+
   it("skips a local time that does not exist on spring-forward", () => {
     const spec = parseCron("30 2 * * *") // 02:30 — absent on 2026-03-29 in Madrid
     const after = Date.parse(`${DST_SPRING_FORWARD_2026}T00:00:00Z`)
@@ -221,6 +502,224 @@ describe("nextOccurrence", () => {
     expect(local(instant, MADRID)).toBe("2026-10-25T02:30")
     // The first occurrence is still CEST (UTC+2), i.e. 00:30 UTC — not the CET repeat.
     expect(new Date(instant).toISOString()).toBe("2026-10-25T00:30:00.000Z")
+  })
+
+  // -------------------------------------------------------------------------
+  // The same two transitions, west of UTC. Madrid is the only zone the suite used to re-verify DST
+  // in, and a DST frame error is at its most obvious exactly here — but the transitions that matter
+  // to users happen in the Americas, so Madrid is not the representative case, it is the lucky one.
+  // -------------------------------------------------------------------------
+
+  it("skips a local time that does not exist on spring-forward west of UTC", () => {
+    // 02:30 on 2026-03-08 does not exist in New York (EST -5 -> EDT -4 at 07:00Z). The next 02:30
+    // is the next day, and by then the offset is -4, so 02:30 EDT is 06:30Z — *not* 07:30Z, which
+    // is what a walk that mis-read the frame would report.
+    //
+    // The fixture is verified to be a **gap** (zero possible instants, in the standard's terms) before
+    // the behaviour is asserted, so a tzdata release that moved this transition fails here rather than
+    // leaving a test that no longer describes what it says.
+    expect(possibleInstants(`${NY_SPRING_FORWARD_2026}T02:30`, NEW_YORK)).toBe(0)
+    expect(possibleInstants("2026-03-09T02:30", NEW_YORK)).toBe(1)
+    const spec = parseCron("30 2 * * *")
+    const after = Date.parse(`${NY_SPRING_FORWARD_2026}T00:00:00Z`)
+    const instant = nextOccurrence(spec, after, NEW_YORK)!
+    expect(local(instant, NEW_YORK)).toBe("2026-03-09T02:30")
+    expect(local(instant, NEW_YORK).startsWith(NY_SPRING_FORWARD_2026)).toBe(false)
+    expect(new Date(instant).toISOString()).toBe("2026-03-09T06:30:00.000Z")
+  })
+
+  it("fires once, at the first occurrence, for an ambiguous fall-back time west of UTC", () => {
+    // 01:30 on 2026-11-01 happens twice in New York: 01:30 EDT (-4) then 01:30 EST (-5). The
+    // policy is unchanged from Madrid's — fire once, at the earlier instant — and it is *this*
+    // zone where the two candidates are 60 minutes apart rather than Madrid's hour, so a frame
+    // error cannot hide behind a small disagreement.
+    // The fixture is verified to be an **overlap** (two possible instants) and the day after it
+    // ordinary (one), so the "fires once, at the earlier" claim is measured rather than assumed.
+    expect(possibleInstants(`${NY_FALL_BACK_2026}T01:30`, NEW_YORK)).toBe(2)
+    expect(possibleInstants("2026-11-02T01:30", NEW_YORK)).toBe(1)
+    const spec = parseCron("30 1 * * *")
+    const after = Date.parse(`${NY_FALL_BACK_2026}T00:00:00Z`)
+    const instant = nextOccurrence(spec, after, NEW_YORK)!
+    expect(local(instant, NEW_YORK)).toBe("2026-11-01T01:30")
+    expect(new Date(instant).toISOString()).toBe("2026-11-01T05:30:00.000Z")
+    // And the repeat is genuinely not a second occurrence: asked from inside the *second* pass, the
+    // next 01:30 is tomorrow's, because the earlier one is already in the past.
+    const insideSecondPass = nextOccurrence(spec, Date.parse(`${NY_FALL_BACK_2026}T06:30:00Z`), NEW_YORK)!
+    expect(local(insideSecondPass, NEW_YORK)).toBe("2026-11-02T01:30")
+  })
+
+  it("loses no whole day at a transition west of UTC, which the UTC-frame walk did", () => {
+    // The two tests above pin the *policy* at each transition — a nonexistent local time is skipped,
+    // an ambiguous one fires at its first instant — and both pass on the old walk as well, because
+    // `wallToInstant` re-renders whatever wall parts it is handed in the job's own zone: the old
+    // walk matched UTC 02:30 and got back an instant that *reads* as 02:30 local. Policy was never
+    // what it broke.
+    //
+    // What it broke at a transition is worse than a slow cadence, and this is the case that shows it.
+    // A walk in UTC wall parts asks "when is the next 03:30 **UTC**", which is a different question
+    // from "when is the next 03:30 **here**", and near a transition the two land on different
+    // *dates*. Ask a New York 03:30 job at 23:00 the night before the spring-forward and the old walk
+    // answered with **2026-03-09** — it skipped 2026-03-08 entirely, so a daily job silently did not
+    // run on the day the clocks changed. On the fall-back night it was a day every time: both passes
+    // of the repeated hour were stepped over, not just the second.
+    //
+    // Every `want` below was cross-checked against a brute-force scan of every whole minute in the
+    // window, reading the local parts with raw `Intl` and applying the cron fields directly — an
+    // oracle that shares no code with `nextOccurrence`. `America/St_Johns` is on the axis too: its
+    // transitions are an hour earlier in the day and its offsets are half hours, so a `:30` bug
+    // cannot hide behind the whole-hour cases.
+    const cases: Array<{ schedule: string; zone: string; after: string; instant: string; reading: string }> = [
+      // Spring forward. NY moves at 07:00Z (-5 -> -4); St_Johns at 05:30Z (-2:30 -> -1:30).
+      {
+        schedule: "30 3 * * *",
+        zone: NEW_YORK,
+        after: `${NY_SPRING_FORWARD_2026}T04:00:00Z`, // 23:00 EST the night before
+        instant: "2026-03-08T07:30:00.000Z",
+        reading: "2026-03-08T03:30",
+      },
+      {
+        schedule: "30 3 * * *",
+        zone: ST_JOHNS,
+        after: `${NY_SPRING_FORWARD_2026}T03:30:00Z`,
+        instant: "2026-03-08T06:00:00.000Z",
+        reading: "2026-03-08T03:30",
+      },
+      // Fall back. The 01:30 answers are the **first** pass of the ambiguous minute, so the policy
+      // above and the no-lost-day claim are the same assertion seen from two sides: the run happens,
+      // once, on the day it belongs to. NY moves at 06:00Z (-4 -> -5); St_Johns at 04:30Z.
+      {
+        schedule: "30 1 * * *",
+        zone: NEW_YORK,
+        after: `${NY_FALL_BACK_2026}T01:30:00Z`,
+        instant: "2026-11-01T05:30:00.000Z",
+        reading: "2026-11-01T01:30",
+      },
+      {
+        schedule: "30 1 * * *",
+        zone: ST_JOHNS,
+        after: `${NY_FALL_BACK_2026}T01:30:00Z`,
+        instant: "2026-11-01T04:00:00.000Z",
+        reading: "2026-11-01T01:30",
+      },
+      // And a local time that exists exactly once on the fall-back night, to show the day survives
+      // independently of the ambiguity: 02:30 EST is the one occurrence the transition does not touch.
+      {
+        schedule: "30 2 * * *",
+        zone: ST_JOHNS,
+        after: `${NY_FALL_BACK_2026}T02:30:00Z`,
+        instant: "2026-11-01T06:00:00.000Z",
+        reading: "2026-11-01T02:30",
+      },
+    ]
+
+    const readings: Record<string, string> = {}
+    for (const { schedule, zone, after, instant: wantInstant, reading: want } of cases) {
+      // Each `want` is an **ordinary** reading — exactly one instant renders it — except the two 01:30
+      // ones, which are overlaps. Asserted from the standard's own classification so a tzdata change
+      // cannot turn this into a test of a transition that no longer happens.
+      const possibles = possibleInstants(want, zone)
+      expect({ zone, want, possibles }).toEqual({
+        zone,
+        want,
+        possibles: want.endsWith("T01:30") ? 2 : 1,
+      })
+      const found = nextOccurrence(parseCron(schedule), Date.parse(after), zone)!
+      const reading = local(found, zone)
+      readings[`${schedule} @ ${zone}`] = `${new Date(found).toISOString()} = ${reading}`
+      // Both halves in one assertion: the exact instant *and* the local clock it renders as, so a
+      // walk that got the right local reading on the wrong day cannot pass.
+      expect({ key: `${schedule} @ ${zone}`, got: new Date(found).toISOString(), reading }).toEqual({
+        key: `${schedule} @ ${zone}`,
+        got: wantInstant,
+        reading: want,
+      })
+    }
+    // Nothing above landed on the day after its transition, which is what "lost a day" meant.
+    expect(Object.keys(readings)).toHaveLength(cases.length)
+  })
+
+  it("keeps a minutely job one minute apart straight through a spring-forward west of UTC", () => {
+    // 200 consecutive minutely occurrences spanning the New York transition, each exactly one minute
+    // after the last, with the nonexistent hour skipped rather than fired. A walk in the wrong frame
+    // cannot produce that, and neither can a walk that treats 02:00-02:59 as real wall minutes.
+    //
+    // The step stays one minute across the gap because the missing hour has no *instants* in it: the
+    // clock reads 01:59 EST and then 03:00 EDT, one minute apart in time, having skipped an hour of
+    // clock. That is what "the wall walk is continuous" looks like from the instants.
+    const spec = parseCron("* * * * *")
+    let cursor = Date.parse(`${NY_SPRING_FORWARD_2026}T05:00:00Z`) // 00:00 EST
+    const readings: string[] = []
+    for (let i = 0; i < 200; i += 1) {
+      const next = nextOccurrence(spec, cursor, NEW_YORK)!
+      expect(next - cursor).toBe(MINUTE_MS)
+      readings.push(local(next, NEW_YORK))
+      cursor = next
+    }
+    expect(readings[0]).toBe("2026-03-08T00:01")
+    // Nothing in the nonexistent hour, and the walk resumes at 03:00 the instant 01:59 was due.
+    expect(readings.filter((r) => r.startsWith(`${NY_SPRING_FORWARD_2026}T02:`))).toEqual([])
+    expect(readings.indexOf(`${NY_SPRING_FORWARD_2026}T03:00`)).toBe(119)
+    expect(readings[119 - 1]).toBe(`${NY_SPRING_FORWARD_2026}T01:59`)
+    // 200 occurrences over a wall clock that lost an hour: 199 steps, one of them an hour of clock.
+    expect(readings.at(-1)).toBe("2026-03-08T04:20")
+  })
+
+  it("keeps a minutely job one minute apart straight through a fall-back west of UTC", () => {
+    // The mirror image, and the half with a real gap in it. The instants are the contract: one
+    // minute apart across the whole walk **except at the transition itself**, where the gap is 61
+    // minutes rather than one.
+    //
+    // That gap is not new behaviour and not a side effect of the frame fix — it is the policy this
+    // plugin already documented and Madrid already had: an ambiguous wall minute fires at its first
+    // instant, never at its second. So the repeated 01:00-01:59 is walked once, and the instants
+    // that would have rendered it the second time are the 60 minutes in between. A wall-clock
+    // schedule that fired the repeated hour twice would run 60 extra times a night.
+    const spec = parseCron("* * * * *")
+
+    /** Walk `span` minutely occurrences from `from`, reporting each step and each local reading. */
+    const walk = (zone: string, from: string, span: number): { gaps: number[]; readings: string[] } => {
+      let cursor = Date.parse(from)
+      const gaps: number[] = []
+      const readings: string[] = []
+      for (let i = 0; i < span; i += 1) {
+        const next = nextOccurrence(spec, cursor, zone)!
+        gaps.push((next - cursor) / MINUTE_MS)
+        readings.push(local(next, zone))
+        cursor = next
+      }
+      return { gaps, readings }
+    }
+
+    const newYork = walk(NEW_YORK, `${NY_FALL_BACK_2026}T04:30:00Z`, 200) // 00:30 EDT
+    expect(newYork.gaps).toHaveLength(200)
+    expect(newYork.gaps.filter((gap) => gap !== 1)).toEqual([61])
+    expect(newYork.readings[0]).toBe(`${NY_FALL_BACK_2026}T00:31`)
+    // The repeated hour is walked at its first pass, so no local reading appears twice.
+    expect(new Set(newYork.readings).size).toBe(200)
+    expect(newYork.readings.filter((r) => r === `${NY_FALL_BACK_2026}T01:30`)).toHaveLength(1)
+    expect(newYork.readings.indexOf(`${NY_FALL_BACK_2026}T02:00`)).toBe(89)
+    // 200 occurrences, 199 steps, and one of those steps was 61 minutes: the last reading lands
+    // 00:31 + 259 minutes of clock, which is 03:50 rather than 02:50.
+    expect(newYork.readings.at(-1)).toBe(`${NY_FALL_BACK_2026}T03:50`)
+
+    // **The zone does not change the shape.** Madrid's fall-back is the case the suite already
+    // pinned, so it runs the same walk: one 61-minute step, everything else one minute, and no
+    // repeated local reading. New York diverging from Madrid here would mean the frame fix is not
+    // complete, whatever the numbers above say on their own.
+    //
+    // Both walks start *before* the transition instant, so both actually span it: Madrid falls back
+    // at 2026-10-25T01:00Z and New York at 2026-11-01T06:00Z, and a walk begun after either one
+    // would report the same numbers while proving nothing.
+    const madrid = walk(MADRID, "2026-10-24T23:00:00Z", 200) // 01:00 CEST, spans 01:00Z
+    expect(madrid.gaps.filter((gap) => gap !== 1)).toEqual(newYork.gaps.filter((gap) => gap !== 1))
+    expect(new Set(madrid.readings).size).toBe(200)
+    expect(madrid.readings.filter((r) => r === `${DST_FALL_BACK_2026}T02:30`)).toHaveLength(1)
+
+    // And the same claim on the other transition, where the gap is in the *clock* rather than in the
+    // instants: spring-forward reads continuously because the missing hour holds no instants at all.
+    // Madrid springs forward at 2026-03-29T01:00Z.
+    expect(walk(NEW_YORK, `${NY_SPRING_FORWARD_2026}T05:00:00Z`, 200).gaps.filter((g) => g !== 1)).toEqual([])
+    expect(walk(MADRID, "2026-03-28T23:00:00Z", 200).gaps.filter((g) => g !== 1)).toEqual([])
   })
 
   it("returns undefined rather than looping forever on an unsatisfiable search", () => {
@@ -321,6 +820,86 @@ describe("missedOccurrences", () => {
     const spec = parseCron("0 0 1 1 *") // 1 January
     const result = missedOccurrences(spec, Date.UTC(2026, 4, 1), Date.UTC(2026, 4, 2), "UTC", 10)
     expect(result.instants).toEqual([])
+  })
+
+  /**
+   * `MAX_BACKLOG_SCAN`, restated as a literal.
+   *
+   * Not exported on purpose (`src/index.ts` keeps it module-private): a test reading the constant
+   * follows any new value silently, so raising the bound would pass green. Written out here, a change
+   * to it breaks a cost assertion in the open instead.
+   */
+  const SCAN_BOUND = 1000
+
+  it("counts a minutely backlog the same west of UTC as at it (ADR 0002)", () => {
+    // ADR 0002 is *the count agrees with the instants it is reported beside*. The old walk stepped
+    // `|offset| + 1` minutes at a time, so a 24 h window in New York was exhausted after six
+    // searches and reported **4 dropped with no cap** — claiming a day of backlog held five
+    // occurrences. That is the agreement broken, on top of the cadence being wrong.
+    const spec = parseCron("* * * * *")
+    const from = Date.UTC(2026, 4, 10, 0, 0)
+    const to = from + 24 * 60 * MINUTE_MS // 1439 occurrences; the bound admits 1000 of them
+
+    const counted: Record<string, unknown> = {}
+    for (const zone of ["UTC", NEW_YORK, ST_JOHNS, "America/Buenos_Aires"]) {
+      const result = missedOccurrences(spec, from, to, zone, 1)
+      counted[zone] = { instants: result.instants, dropped: result.dropped, droppedCapped: result.droppedCapped }
+    }
+    // The zone must not change the answer. Exactly one occurrence is admitted as an instant, 1000 are
+    // counted, and the flag is set because the walk really was cut short.
+    expect(counted).toEqual({
+      UTC: { instants: [from + MINUTE_MS], dropped: SCAN_BOUND, droppedCapped: true },
+      [NEW_YORK]: { instants: [from + MINUTE_MS], dropped: SCAN_BOUND, droppedCapped: true },
+      [ST_JOHNS]: { instants: [from + MINUTE_MS], dropped: SCAN_BOUND, droppedCapped: true },
+      "America/Buenos_Aires": { instants: [from + MINUTE_MS], dropped: SCAN_BOUND, droppedCapped: true },
+    })
+  })
+
+  it("stays exact below the bound in a negative-offset zone, so `droppedCapped` stays honest", () => {
+    // The flag has to mean "the walk stopped here", not "the number looks round". Below the bound
+    // the count is a count, and reporting it as capped would claim a truncation that did not happen
+    // — the inverted version of the ADR 0002 failure the bug above was. In New York this is the
+    // case that read as `4 dropped, uncapped`: a walk that ended early reports the end as an
+    // answer, and only the instants beside it show it is wrong.
+    const spec = parseCron("* * * * *")
+    const from = Date.UTC(2026, 4, 10, 0, 0)
+
+    const exact = missedOccurrences(spec, from, from + (SCAN_BOUND + 1) * MINUTE_MS, NEW_YORK, 1)
+    expect(exact.instants).toEqual([from + MINUTE_MS])
+    expect(exact.dropped).toBe(SCAN_BOUND)
+    expect(exact.droppedCapped).toBe(false)
+
+    // One more minute of window is one more occurrence past the bound, so now it is cut short.
+    const beyond = missedOccurrences(spec, from, from + (SCAN_BOUND + 2) * MINUTE_MS, NEW_YORK, 1)
+    expect(beyond.dropped).toBe(SCAN_BOUND)
+    expect(beyond.droppedCapped).toBe(true)
+  })
+
+  it("enumerates a backlog west of UTC as consecutive minutes, not as a sparse series", () => {
+    // The instants themselves, not just the count: a caller that *replays* a backlog (`backfill`)
+    // gets this list, so a 241-minute gap here would fire a job hours apart while reporting a
+    // one-minute schedule. Pinned on the half-hour zone because that is where a `±:30` magnitude
+    // shows up as its own step size.
+    const spec = parseCron("* * * * *")
+    const from = Date.UTC(2026, 4, 10, 0, 0)
+    const { instants } = missedOccurrences(spec, from, from + 10 * MINUTE_MS, ST_JOHNS, 10)
+
+    expect(instants).toHaveLength(10)
+    for (const [i, instant] of instants.entries()) expect(instant).toBe(from + (i + 1) * MINUTE_MS)
+    // And each one really is that local minute, read back in the job's own zone. `America/St_Johns`
+    // is UTC-2:30 in May, so 00:00Z is 21:30 the previous evening there.
+    expect(instants.map((instant) => local(instant, ST_JOHNS))).toEqual([
+      "2026-05-09T21:31",
+      "2026-05-09T21:32",
+      "2026-05-09T21:33",
+      "2026-05-09T21:34",
+      "2026-05-09T21:35",
+      "2026-05-09T21:36",
+      "2026-05-09T21:37",
+      "2026-05-09T21:38",
+      "2026-05-09T21:39",
+      "2026-05-09T21:40",
+    ])
   })
 })
 
@@ -482,6 +1061,31 @@ describe("resolveDue — misfire and cost bounds (ADR 0002)", () => {
     resolveDue(job(), hourly, state, Date.UTC(2026, 4, 10, 8, 30), false, 0, 1)
     expect(state.nextRun).toBe(Date.UTC(2026, 4, 10, 9, 0))
   })
+
+  it("arms a minutely job's nextRun one minute out, in a negative-offset zone", () => {
+    // `nextRun` is what `hasWork` reads to decide whether to arm the tick, so it is the user-visible
+    // face of the bug: a `* * * * *` job in New York used to report its next run **241 minutes** out,
+    // which on an idle host means the schedule does not fire for four hours. Asserted on the
+    // scheduler path rather than on `nextOccurrence`, because that is the path the fix has to hold.
+    const spec = parseCron("* * * * *")
+    const now = Date.UTC(2026, 4, 10, 12, 0)
+    const state: JobState = { version: STATE_VERSION, lastRun: now }
+    const definition = job({ schedule: "* * * * *", timezone: NEW_YORK })
+
+    expect(resolveDue(definition, spec, state, now, false, 0, 1)).toBeUndefined()
+    expect(state.nextRun).toBe(now + MINUTE_MS)
+
+    // And once it is due, the occurrence it fires is the *oldest* the window owes — `skip` collapses a
+    // backlog to one run, oldest first — so a five-minute window fires its first minute and counts
+    // the other four. The cadence claim is that the five instants are consecutive, which the drop
+    // count and the one-minute `nextRun` both rest on.
+    const due = Date.UTC(2026, 4, 10, 12, 5)
+    const ran = resolveDue(definition, spec, state, due, false, 0, 1)
+    expect(ran).toMatchObject({ kind: "run", occurrence: { dueAt: now + MINUTE_MS } })
+    expect(ran?.occurrence.dropped).toBe(4)
+    expect(ran?.occurrence.droppedCapped).toBeUndefined()
+    expect(state.nextRun).toBe(due + MINUTE_MS)
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -504,10 +1108,24 @@ describe("the dropped-backlog count costs a bounded walk, not a walk per occurre
    * Lookups one occurrence search may cost, with headroom.
    *
    * `wallToInstant` probes three candidate instants and reads each one twice (`zoneOffsetMs` and
-   * `rendersAs`), so a search that matches costs six. The ceiling is deliberately loose: these
-   * tests assert that the walk is **bounded**, not that a search is implemented a particular way.
+   * `rendersAs`), so a search that matches costs six of those.
+   *
+   * **Plus one**, which is where the frame fix spends its lookup
+   * (`bug-next-occurrence-walks-utc-wall-parts-in-any-zone-west-of-utc`): the walk now reads
+   * `afterMs` in the job's own zone to learn what its clock says before it walks that clock, so a
+   * matching search costs seven where it used to cost six. Written as a per-search figure because
+   * the assertions below are per-search ones — two searches is what an ordinary no-backlog tick
+   * costs (one to enumerate, one to arm `nextRun`).
+   *
+   * The ceiling is deliberately loose in *form* — these tests assert that the walk is **bounded**,
+   * not that a search is implemented a particular way — but fourteen is **exact** here, and that is
+   * why the old twelve had to move rather than being left as slack: an ordinary no-backlog `resolveDue`
+   * measures exactly 14 lookups, and asserting `≤ 12` against it is a real failure. The relationship
+   * is unchanged from the old constant (2× the per-search cost), so the *claim* is the same claim
+   * restated against a search that costs one more lookup — and a search that grew past seven (an
+   * unbounded re-probe, say) still fails here instead of being absorbed.
    */
-  const LOOKUPS_PER_SEARCH = 12
+  const LOOKUPS_PER_SEARCH = 14
 
   /**
    * Timezone lookups `run` performs.
