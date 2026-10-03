@@ -1,6 +1,7 @@
 import { describe, expect, it, beforeEach, afterEach, vi } from "vitest"
 import {
   mkdtempSync,
+  chmodSync,
   rmSync,
   mkdirSync,
   writeFileSync,
@@ -4154,6 +4155,43 @@ it.runIf(realYaml !== undefined)(
       cleanup()
     }
   })
+
+  // A permission bit is the only portable way to make a directory unreadable, so the test is
+  // declared with `it.runIf` rather than passing vacuously: on Windows `chmod` does not withhold
+  // access, and under **root** the kernel does not withhold it either, so in both cases there is
+  // no EACCES to assert and the test would assert nothing.
+  it.runIf(process.platform !== "win32" && process.getuid?.() !== 0)(
+    "names both surfaces when neither one loads, rather than one reason standing in for the other",
+    async () => {
+      // The one observable effect of the retention branch removed by
+      // `task-reload-jobs-last-known-good-comment-lies` — it was the only thing standing in for a
+      // reload: with neither surface yielding a job it returned `state.fileError = failure`, the
+      // JSON read's reason *alone*, so a directory that could not be read was reported as a missing
+      // `schedules.json` and the surface that actually failed was never named. `mergeJobSources`
+      // promises to report both, and this is that promise surviving the path that decides what a
+      // project is told, rather than stopping at the merge.
+      chmodSync(tasks, 0o000)
+      try {
+        const { cleanup, list } = await run()
+        try {
+          const listing = await list()
+          expect(listing.jobs).toEqual([])
+          // The directory, named as the thing that could not be read…
+          expect(listing.error).toMatch(/\.opencode\/tasks/)
+          // …and the absent JSON file beside it, because it is absent too and not a second finding
+          // about the same one.
+          expect(listing.error).toMatch(/no \.opencode\/schedules\.json/)
+        } finally {
+          cleanup()
+        }
+      } finally {
+        // Restored even if `setup` itself threw, and always before teardown: `rmSync(recursive)`
+        // in `afterEach` cannot traverse a mode-000 directory, and a leaked temp tree plus a
+        // confusing teardown error would bury the real failure.
+        chmodSync(tasks, 0o755)
+      }
+    },
+  )
 })
 // ---------------------------------------------------------------------------
 // What arms the tick (bug-ephemeral-work-never-arms-tick)

@@ -3280,6 +3280,14 @@ const HISTORY_OUTPUT = {
  * — the one guarded, optional dependency in the file (ADR 0004). The JSON surface stays
  * synchronous underneath: an `await` here changes when the merge completes, never what it
  * accepts.
+ *
+ * **Read once per session, from `setup`, and never again** — no watcher, no second call site
+ * (ADR 0001: "changing a job means editing the file and reloading"). So the job set this writes
+ * is the only set the session has, and there is no last-known-good one to fall back on: a
+ * malformed or missing `schedules.json` leaves the project with **no jobs and a named reason**,
+ * which is the whole of the guarantee. What that costs the project is *not* its silence — the
+ * reason reaches `schedules_list` and the one idle-project log line — and it is never a torn-down
+ * running job, because a running job exists only if this same read already admitted it.
  */
 async function reloadJobs(ctx: PluginContext, directory: string, state: SchedulerState): Promise<void> {
   let payload: unknown
@@ -3298,14 +3306,11 @@ async function reloadJobs(ctx: PluginContext, directory: string, state: Schedule
   // JSON jobs, and a missing YAML reader must not cost it its schedules.json either.
   const markdown = await loadMarkdownJobs(join(directory, TASKS_DIR))
 
-  if (payload === undefined && markdown.jobs.length === 0 && markdown.invalid.length === 0) {
-    // Nothing loaded at all: retain the last-known-good set and report only the reason.
-    // Tearing down running jobs because a file was deleted mid-edit would be worse than the
-    // bug it reports.
-    state.fileError = failure
-    return
-  }
-
+  // Nothing short-circuits here. An earlier revision returned early when neither surface yielded
+  // anything, on the promise of "retaining the last-known-good set" — a set that cannot exist here
+  // (see the note above), and whose only real effect was to *drop* a second surface's reason: an
+  // unreadable `.opencode/tasks` was reported as a missing `schedules.json` and nothing else. The
+  // merge below reports both, which is what `mergeJobSources` already promised.
   const loaded = mergeJobSources(payload === undefined ? { jobs: [], invalid: [] } : loadJobs(payload), markdown)
   const specs = new Map<string, CronSpec>()
   for (const job of loaded.jobs) {
@@ -5074,6 +5079,9 @@ const definition: PluginDefinition = {
     // Read the jobs *before* arbitrating. A globally-installed plugin loads in every
     // project, and claiming the writer lease (or littering a lockfile) in a project that
     // has no schedules would be wrong in every such project.
+    //
+    // The only read of either surface in this session, which is why an edit to a job file
+    // lands on the next `opencode reload` and not on the next tick — see `reloadJobs`.
     await reloadJobs(ctx, directory, state)
     await loadStates(ctx, state)
     await loadAllHistory(ctx, state)
