@@ -129,3 +129,7 @@ The 6th and 7th initially left the suite green; I added "counts a key minted by 
 spec 001 box 145 **ticked**, with the verdict recording what each clause is pinned by and the one unpinned sub-clause (the stamp cannot survive a storage round-trip, by construction). No box left unticked by me. Boxes 309/318/322/284 remain unticked and untouched — they belong to `task-audit-spec-001-acceptance-boxes`.
 
 Item file edited and committed on the branch (not via arggon write commands, which would have landed on the primary's main).
+
+### handoff 2026-10-03 @arggon-worker (session: ses_f00f24d89ffel6R8moRzSN3oT0) — next: Code-review commit f4a0569 in the worktree, then merge. Focus: resolveHistoryOwner memory-first order and the state.ephemeralKeys cap.
+- branch: fix/bug-storageless-degradation-unrecorded
+- open questions: inMemoryOnly on the loadHistory read side is untestable by design (disclosed); accept, or file a follow-up? README not touched (T7).
