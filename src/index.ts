@@ -78,6 +78,17 @@ export const MIN_TICK_MS = 5_000
 /** Default per-run bound, which also bounds an unanswerable permission prompt. */
 export const DEFAULT_RUN_TIMEOUT_MS = 15 * 60_000
 
+/**
+ * Floor and ceiling for a per-run bound: one minute to 24 hours.
+ *
+ * Named, and used by every clamp below, so `JOB_FORMAT_REFERENCE` can print this window from
+ * the same constants the parser clamps to instead of restating them as text. Restating is how
+ * the reference came to advertise a `30s` example that resolved to 60s: the two copies drifted
+ * because nothing connected them, and nothing compared them.
+ */
+export const MIN_RUN_TIMEOUT_MS = MINUTE_MS
+export const MAX_RUN_TIMEOUT_MS = 24 * 60 * MINUTE_MS
+
 /** Default ceiling on runs in flight at once, across all jobs. */
 export const DEFAULT_MAX_CONCURRENT_RUNS = 1
 
@@ -105,6 +116,12 @@ export const STATE_VERSION = 1
  * Bounded on purpose: this text is model context, and the Code Mode catalog is charged per
  * request. It states both config surfaces, the precedence rule, and the fields that carry a
  * cost or a permission consequence — the three things an agent gets wrong otherwise.
+ *
+ * **Every number in it comes from the constant the parser uses.** The `runTimeout` window is
+ * interpolated from `MIN_RUN_TIMEOUT_MS`/`MAX_RUN_TIMEOUT_MS`/`DEFAULT_RUN_TIMEOUT_MS`, so a
+ * change to the clamp moves the reference with it. Hand-typed bounds are how the reference came
+ * to offer `30s` — a value the parser clamps to `1m`, so an agent copying the example got a run
+ * twice as long as the one it asked for.
  */
 export const JOB_FORMAT_REFERENCE = `## Scheduled jobs (.opencode/schedules.json or .opencode/tasks/<id>.md)
 
@@ -123,9 +140,11 @@ Both validate the same way: one bad job is refused by name; the rest still load.
 | \`agent\` | no | Agent switched to before dispatch. |
 | \`enabled\` | no | \`false\` parks a job without deleting it. |
 | \`misfire\` | no | \`skip\` (default, one run per backlog) or \`backfill\`. |
-| \`maxCatchUp\` | no | Replay ceiling for \`backfill\`, one run per tick. Default 5, max 50. |
-| \`runTimeout\` | no | Duration: \`30s\`, \`5m\`, \`1h30m\`, \`1d\`. A bare number means seconds. |
-| \`runTimeoutMs\` | no | The millisecond form; kept for compatibility. |
+| \`maxCatchUp\` | no | Replay ceiling for \`backfill\`, one run per tick. Default ${DEFAULT_MAX_CATCH_UP}, max 50. |
+| \`runTimeout\` | no | Duration; a bare number means seconds. Clamped to \`${MIN_RUN_TIMEOUT_MS / MINUTE_MS}m\`–\`${MAX_RUN_TIMEOUT_MS / (60 * MINUTE_MS)}h\`, default \`${DEFAULT_RUN_TIMEOUT_MS / MINUTE_MS}m\`. Every value here is inside that window, so it is used exactly as written: \`${MIN_RUN_TIMEOUT_MS / MINUTE_MS}m\`, \`5m\`, \`1h30m\`, \`1d\`. Shorter or longer is clamped to the window, never refused. |
+| \`runTimeoutMs\` | no | The millisecond form; kept for compatibility. \`runTimeout\` wins when both are set. |
+| \`session\` | no | \`reuse\` (the default) keeps one session per job, so runs build on prior context; \`fresh\` starts a new session per run, for stateless work. Any other value is refused by name. |
+| \`permissions\` | no | Per-job rules in OpenCode's own schema: an action mapped to \`allow\`/\`ask\`/\`deny\`, or to a map of glob \`resource\` → effect. Absent ⇒ the session default is inherited unchanged. |
 
 ### Always name a model
 
@@ -151,9 +170,9 @@ names the count, and \`schedules_history\` carries it as \`dropped\` on every re
 
 ### Unattended permission rules (v2)
 
-Scheduled runs have nobody to answer an \`"ask"\`: treat it as a deny. Declare \`permissions\`
-in the host's own schema if a job needs to be constrained, and remember that **the last
-matching rule wins** — catch-all first, specifics after.
+Scheduled runs have nobody to answer an \`"ask"\`: treat it as a deny. A job's \`permissions\` field
+is where you declare what its runs may do — in the job file, in the host's own schema, on either
+surface. Remember that **the last matching rule wins** — catch-all first, specifics after.
 
 ### Recurring jobs are file-only
 
@@ -1206,8 +1225,8 @@ export function validateJob(raw: unknown, index: number): { job: JobDefinition }
   const runTimeoutMs =
     duration !== undefined && "ms" in duration
       ? duration.ms
-      : boundedInt(record.runTimeoutMs, DEFAULT_RUN_TIMEOUT_MS, MINUTE_MS, 24 * 60 * MINUTE_MS)
-  const clampedRunTimeoutMs = boundedInt(runTimeoutMs, DEFAULT_RUN_TIMEOUT_MS, MINUTE_MS, 24 * 60 * MINUTE_MS)
+      : boundedInt(record.runTimeoutMs, DEFAULT_RUN_TIMEOUT_MS, MIN_RUN_TIMEOUT_MS, MAX_RUN_TIMEOUT_MS)
+  const clampedRunTimeoutMs = boundedInt(runTimeoutMs, DEFAULT_RUN_TIMEOUT_MS, MIN_RUN_TIMEOUT_MS, MAX_RUN_TIMEOUT_MS)
 
   const model = parseModelRef(record.model)
   if (model !== undefined && "reason" in model) return { reason: `job "${id}": ${model.reason}` }
@@ -2207,7 +2226,7 @@ export function isLeaseLive(state: JobState, nowMs: number): boolean {
  * expiry-under-a-live-run this exists to prevent, and nothing else in the file would notice.
  */
 export function leaseRenewalMs(runTimeoutMs: number): number {
-  const bounded = boundedInt(runTimeoutMs, DEFAULT_RUN_TIMEOUT_MS, MINUTE_MS, 24 * 60 * MINUTE_MS)
+  const bounded = boundedInt(runTimeoutMs, DEFAULT_RUN_TIMEOUT_MS, MIN_RUN_TIMEOUT_MS, MAX_RUN_TIMEOUT_MS)
   return Math.max(1_000, Math.floor(bounded / 2))
 }
 
@@ -2492,7 +2511,7 @@ function finish(
       ...(model !== undefined && "model" in model ? { model: model.model } : {}),
       runTimeoutMs:
         timeout !== undefined && "ms" in timeout
-          ? boundedInt(timeout.ms, DEFAULT_RUN_TIMEOUT_MS, MINUTE_MS, 24 * 60 * MINUTE_MS)
+          ? boundedInt(timeout.ms, DEFAULT_RUN_TIMEOUT_MS, MIN_RUN_TIMEOUT_MS, MAX_RUN_TIMEOUT_MS)
           : DEFAULT_RUN_TIMEOUT_MS,
       ...(permissions !== undefined ? { permissions } : {}),
     },
@@ -2532,7 +2551,7 @@ async function loadOneOffs(ctx: PluginContext): Promise<OneOffTask[]> {
       dueAt: record.dueAt,
       prompt,
       createdAt: record.createdAt,
-      runTimeoutMs: boundedInt(record.runTimeoutMs, DEFAULT_RUN_TIMEOUT_MS, MINUTE_MS, 24 * 60 * MINUTE_MS),
+      runTimeoutMs: boundedInt(record.runTimeoutMs, DEFAULT_RUN_TIMEOUT_MS, MIN_RUN_TIMEOUT_MS, MAX_RUN_TIMEOUT_MS),
       ...(asString(record.agent) !== undefined ? { agent: asString(record.agent) as string } : {}),
       ...(model !== undefined && "model" in model ? { model: model.model } : {}),
       ...(record.permissions !== undefined ? { permissions: record.permissions as PermissionSet } : {}),
