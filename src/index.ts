@@ -171,6 +171,10 @@ const LOG_PREFIX = "scheduled-tasks:"
  * too), so console output alone makes the scheduler unobservable and a silent failure
  * indistinguishable from an idle job. Every line is therefore also appended to a per-project
  * file the user can read directly.
+ *
+ * `undefined` is the honest "there is no file sink for this process" state, and it means two
+ * things that are not otherwise visible from a line: the project is not known yet (setup has
+ * not reached `ctx.location`), or `ensureLogDir` could not create the directory.
  */
 let activeLogPath: string | undefined
 
@@ -181,6 +185,51 @@ const LOG_LINE_MAX = 1000
 export function logPath(directory: string, id: string): string {
   const safe = id.replace(/[^A-Za-z0-9._-]/g, "_")
   return join(leaseBaseDir(), safe, "scheduler.log")
+}
+
+/**
+ * Create the per-project log directory, once, independently of the writer lease.
+ *
+ * `acquireLease` used to be the only thing that made this directory, and it only runs when
+ * there is work to arm — so every line emitted before the first lease reached `stderr` and
+ * never reached the file. Those are precisely the startup and degradation diagnostics, the
+ * ones you need when nothing is working and there is nothing in the file to read, and a
+ * project that never arms a timer left no evidence it had been loaded at all.
+ *
+ * **A directory is not lock state.** Creating it claims nothing and writes no lockfile: the
+ * lease keeps its own `mkdirSync` and remains the only thing that arbitrates, so a project
+ * with no jobs still leaves no `writer.lock` behind.
+ *
+ * Exactly one `mkdirSync` per `setup`, not one per line: the alternative is a syscall on
+ * every log write, and a per-line retry would turn a missing directory into a hot loop.
+ * Returns false having said so once per directory on `stderr`, in which case the caller
+ * leaves `activeLogPath` unset and the process keeps logging to `stderr` alone — which is
+ * what an unwritable data directory degrades to, and is reported rather than hidden.
+ */
+export function ensureLogDir(path: string): boolean {
+  try {
+    mkdirSync(dirname(path), { recursive: true })
+    return true
+  } catch {
+    // Reported once, straight to `stderr`, and deliberately *not* through `emit`: `emit` would
+    // try to append into the directory that just failed to appear and report a second, less
+    // useful failure behind this one — for whichever project this module was last loaded for,
+    // which is not this one. The caller leaves `activeLogPath` unset, so every later line takes
+    // the same `stderr`-only path without asking again. Nothing here calls back into the log,
+    // so it cannot recurse.
+    //
+    // The once-guard is keyed by the **path**, not globally: one host loads this plugin for
+    // every project it opens, and the line names a directory, so a second unwritable project
+    // has to be able to report its own instead of being silenced by the first one's key.
+    const key = `log-dir:${path}`
+    if (!logged.has(key)) {
+      logged.add(key)
+      console.error(
+        `${LOG_PREFIX} could not create the log directory ${dirname(path)}; scheduler.log is unavailable and every line stays on stderr`,
+      )
+    }
+    return false
+  }
 }
 
 /** Job file, relative to the plugin's location directory. */
@@ -4571,7 +4620,17 @@ const definition: PluginDefinition = {
     }
 
     const projectID = asString(ctx.location?.project?.id) ?? directory
-    activeLogPath = logPath(directory, projectID)
+    // The log directory is created *here*, before anything is decided and before the lease
+    // exists, so the startup and degradation lines below have a file to land in. Creating
+    // the directory is not taking the lease: `acquireLease` keeps its own `mkdirSync` and
+    // still does the arbitrating, so a project with no jobs leaves no `writer.lock` behind.
+    //
+    // Assigned unconditionally, and cleared first, because one host loads this plugin for
+    // every project it opens: a project whose directory cannot be made must not inherit the
+    // previous project's path and append its lines into someone else's file.
+    activeLogPath = undefined
+    const candidateLogPath = logPath(directory, projectID)
+    if (ensureLogDir(candidateLogPath)) activeLogPath = candidateLogPath
 
     // Said once per project, here, before any work is decided: jobs still run without storage, but
     // run state, pending one-offs and every run record live in this process's memory alone.

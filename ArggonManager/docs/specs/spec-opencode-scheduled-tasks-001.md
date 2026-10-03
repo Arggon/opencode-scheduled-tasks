@@ -314,14 +314,53 @@ job set.**
 
 ### Observability — observability/debuggability
 
-- [ ] Every fire, skip, and error emits exactly one bounded line, prefixed `scheduled-tasks:`
-      and including the job id, to `stderr` **and** to
-      `~/.local/share/opencode/scheduled-tasks/<project>/scheduler.log`.
+- [x] Every fire, skip, and error emits exactly one bounded line, prefixed `scheduled-tasks:`
+      to `stderr` **and** to
+      `~/.local/share/opencode/scheduled-tasks/<project>/scheduler.log` — every line, from
+      the first one, because the log directory is created at setup rather than by the lease
+      that only exists once there is work to arm. **Job-scoped lines carry the job, loop or
+      task id; host-level notices do not**, because they are not about one job: a missing
+      `ctx.storage` surface, a missing `ctx.storage.scan`, a missing YAML reader, an
+      unavailable writer lease, the loop-scan cap, and the inert-project notice. Exactly one
+      line is `stderr`-only and no project could name it: the line reporting that
+      `ctx.location.directory` is unavailable, since there is no `<project>` to log under.
       (Plugin `console.error` is **not** captured into OpenCode's own
       `~/.local/share/opencode/log/opencode.log` — verified against ArggonManager's `[arggon]`
       lines, which are equally absent — so stderr alone would make the scheduler unobservable.)
 
-> **False** — audit `task-audit-spec-001-acceptance-boxes`, 2026-10-02: The dual sink works for every line emitted *after* the first lease — pinned by “turns a rejecting permission.rules into an error result, a logged line and no prompt” and “records the asks a run turned into denies, and states them in its own running line”, which read `scheduler.log` back. But the log directory is created by `acquireLease`, which runs only when there is work to arm, so **every line emitted before it never reaches the file**. Repro, fresh process, one enabled job, `ctx.storage.scan` absent: stderr gets `ctx.storage.scan is unavailable, …` then `could not append to …/scheduler.log`; `scheduler.log` does not exist. Same for an idle project: the line that says *why* the plugin is inert (`no enabled jobs in .opencode/schedules.json or .opencode/tasks …; no timer armed`) is stderr-only. Secondary: the box says every line includes the job id, and the degradation notices (missing `scan`, no YAML reader, lease unavailable, the loop-scan cap) name no job — correctly, since they are not about one.
+> **Ticked** — fix `bug-log-lines-before-first-lease-never-reach-the-file`, 2026-10-03. The audit's
+> verdict below was right and is now discharged.
+>
+> - **The directory is created at setup, not by the lease.** `ensureLogDir(logPath(directory, projectID))`
+>   runs where `activeLogPath` is assigned — after `ctx.location.directory` is read, so the project id
+>   the path needs is already known, and before `reloadJobs`, `loadStates` and the storage notice, so
+>   every one of those lines has a file to land in. Pinned by "writes the idle-project line into the
+>   file, from a directory that never held a lease": with no jobs at all `acquireLease` never runs,
+>   and the notice explaining *why* the plugin is inert is in the file.
+> - **Both degradation notices are in the file too** — "writes the `ctx.storage.scan` degradation into
+>   the file, not just on stderr" imports a fresh module instance (so `logOnce`'s module-level
+>   `logged` set cannot answer for the line) and reads `ctx.storage.scan is unavailable` and
+>   `ctx.storage unavailable` back out of `scheduler.log`.
+> - **A log directory is not a lease.** "creates the log directory without taking the writer lease" pins
+>   that an idle project gets a `scheduler.log` and **no** `writer.lock`, and that `acquireLease` is
+>   still exclusive afterwards — so nothing here becomes a second writer (ADR 0003).
+> - **The mkdir failure is reported once and cannot recurse.** `ensureLogDir` reports on a bare
+>   `console.error`, not through `emit`, and the caller leaves `activeLogPath` unset — so no later line
+>   attempts an append and then reports that append's own failure. Pinned by "says once, on stderr,
+>   when the log directory cannot be created, and never retries per line" (no `could not append to …`
+>   ever) and "reports each unwritable project once, rather than silencing all but the first" (the
+>   once-guard is keyed by path, because one host loads this plugin per project).
+> - **One `mkdirSync` per `setup`, not per line** — `emit` never consults the directory, so a missing
+>   directory cannot become a hot loop, and the cost is one syscall per project load.
+>
+> **Two things decided while fixing it, both narrowed in the box text above rather than glossed:**
+> the job-id clause never applied to host-level notices and never was meant to, and one line
+> (`ctx.location.directory is unavailable`) has no project to be logged under. The
+> `activeLogPath` path is also cleared before each setup, so a project whose directory cannot be
+> made does not append its lines into the previously-loaded project's file — pinned by "does not
+> write a project with no usable log directory into the previous project's file".
+>
+> **Prior verdict, discharged:** audit `task-audit-spec-001-acceptance-boxes`, 2026-10-02: The dual sink worked for every line emitted *after* the first lease — pinned by "turns a rejecting permission.rules into an error result, a logged line and no prompt" and "records the asks a run turned into denies, and states them in its own running line", which read `scheduler.log` back. But the log directory was created by `acquireLease`, which runs only when there is work to arm, so every line emitted before it never reached the file. Repro, fresh process, one enabled job, `ctx.storage.scan` absent: stderr got `ctx.storage.scan is unavailable, …` then `could not append to …/scheduler.log`, and `scheduler.log` did not exist; the same for an idle project.
 
 - [ ] A repeated identical failure logs **once**, not once per tick.
 
