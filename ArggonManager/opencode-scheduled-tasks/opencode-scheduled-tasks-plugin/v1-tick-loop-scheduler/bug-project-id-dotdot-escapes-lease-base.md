@@ -1,13 +1,15 @@
 ---
 type: bug
-status: todo
+status: in_progress
 id: bug-project-id-dotdot-escapes-lease-base
 title: "A project id of \"..\" composes outside the lease directory — the sanitizer keeps dots"
+assignee: arggon
 parent: v1-tick-loop-scheduler
 labels: []
 priority: p2
 created: "2026-10-03"
 updated: "2026-10-03"
+claimed_at: "2026-10-03T06:53:31.863Z"
 depends_on: [task-assert-v1-identical-with-no-markdown-dir]
 ---
 <!--
