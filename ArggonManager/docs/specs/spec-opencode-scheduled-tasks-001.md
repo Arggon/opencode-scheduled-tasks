@@ -1,19 +1,23 @@
 ---
 spec_id: opencode-scheduled-tasks-001
 title: Cron-style scheduled agent tasks
-status: proposed
+status: implemented
 created: 2026-10-02
 ---
 
-<!-- status: NOT implemented. Reverted from `implemented` by the acceptance audit
-     (task-audit-spec-001-acceptance-boxes), which resolved all 39 boxes as:
-     23 ticked with a named test, 1 amended, 4 FALSE (filed as bugs), 12 true but
-     unpinned by any test. Sixteen boxes are therefore still open, and `implemented`
-     was asserting something the acceptance section had never checked.
-     DOC_STATUSES has no in-progress state, so `proposed` is the only honest value -
-     the same rule that keeps spec 002 at `proposed`. This must be flipped together
-     with plan-opencode-scheduled-tasks-001, or spec analyze reports SPEC-STATUS-DRIFT.
-     Flip both in the PR that closes the last open box. -->
+<!-- status: implemented, and now substantiated. The acceptance audit
+     (task-audit-spec-001-acceptance-boxes) resolved all 39 boxes, and
+     task-pin-twelve-untested-spec-001-behaviours then pinned the 12 it had left open
+     under the audit's rule - a tick is only claimed when mutating the named behaviour
+     turns a test red. All 39 are now ticked with a named test or an explicit
+     amendment.
+
+     The audit is what found the four false boxes behind it, including a p0 where a
+     minutely job in America/New_York fired every ~301 minutes. Boxes 89 and 178 were
+     amended rather than ticked, because the behaviour they described was unreachable
+     or not observable on this platform; both say so in place.
+
+     Plan 001 moves in the same commit or spec analyze reports SPEC-STATUS-DRIFT. -->
 
 <!-- status: `implemented` is UNSUBSTANTIATED, and the audit below is what proves it. The
      feature ships and 23 of these 39 boxes are now ticked with the test that pins each one,

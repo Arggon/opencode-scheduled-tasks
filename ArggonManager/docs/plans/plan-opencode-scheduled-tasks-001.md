@@ -2,7 +2,7 @@
 plan_id: opencode-scheduled-tasks-001
 title: Plan for Cron-style scheduled agent tasks
 spec: ArggonManager/docs/specs/spec-opencode-scheduled-tasks-001.md
-status: proposed
+status: implemented
 created: 2026-10-02
 ---
 
