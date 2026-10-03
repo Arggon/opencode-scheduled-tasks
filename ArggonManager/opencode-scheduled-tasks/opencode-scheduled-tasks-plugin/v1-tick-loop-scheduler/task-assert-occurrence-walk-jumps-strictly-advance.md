@@ -1,6 +1,6 @@
 ---
 type: task
-status: in_progress
+status: done
 id: task-assert-occurrence-walk-jumps-strictly-advance
 title: Nothing asserts the occurrence walk advances — a bad jump hangs the suite instead of failing it
 assignee: arggon
@@ -10,7 +10,6 @@ labels: []
 priority: p1
 created: "2026-10-03"
 updated: "2026-10-03"
-claimed_at: "2026-10-03T04:39:07.899Z"
 depends_on: [bug-next-occurrence-walks-utc-wall-parts-in-any-zone-west-of-utc]
 ---
 <!--
