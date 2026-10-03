@@ -230,10 +230,47 @@ job set.**
 
 > **Ticked** — audit `task-audit-spec-001-acceptance-boxes`, 2026-10-02: `test/index.test.ts` → “skips when the global concurrency cap is reached” (`{ kind: "skip", suppression: { reason: "concurrency" } }`), and globally: “spends the same per-tick budget as a recurring job”, “spends one budget across all three drains, so reordering neither of them buys a slot”.
 
-- [ ] One tick costs O(jobs): `nextRun` is advanced arithmetically, and the dropped-backlog count a
-      due job owes is bounded by `MAX_BACKLOG_SCAN` (1000) occurrences — so the cost does not grow
-      with how long the server was asleep past that ceiling, and it is paid **once per backlog**,
-      not once per tick.
+- [x] One tick costs O(jobs) and **cannot block the event loop**: `nextRun` is advanced by a single
+      forward occurrence search — O(1) in backlog length — and the dropped-backlog count a due job
+      owes is bounded by `MAX_BACKLOG_SCAN` (1000) occurrences, so the cost does not grow with how
+      long the server was asleep past that ceiling and it is paid **once per backlog**, not once per
+      tick. Between jobs the tick hands the event loop back whenever a whole `MAX_BACKLOG_SCAN` of
+      occurrences has been walked, so **no blocking run is longer than one job's bounded walk**,
+      whatever the job count.
+
+> **Blocked vs. busy — measured, then bounded** — `task-measure-first-tick-stall-after-long-sleep`,
+> 2026-10-03. The predecessor item bounded the *work* and left the event loop unexamined; its own
+> report said so, and this item existed to close that gap rather than assume it either way.
+>
+> **It was blocked, not busy.** Driving the real `tick` through `setup` at 100 jobs with a 24 h
+> `* * * * *` backlog (UTC) — 601 800 `Intl.DateTimeFormat#formatToParts` lookups — a `setImmediate`
+> and a `setTimeout(0)` marker queued *during* the walk both fired only after the last job, and a
+> self-rescheduling `setImmediate` canary recorded a single **2.45 s gap**: the whole walk was one
+> synchronous run. Promise *microtasks* did interleave (the skip path's `await saveState`), and that
+> is the distinction that mattered — a microtask does not end a turn, so nothing else in the host
+> process ran for the length of the walk. In an editor-hosted plugin that is invariant 3 failing
+> outright, not a slow schedule.
+>
+> **Now bounded by work rather than by a clock.** The tick meters occurrences walked and takes one
+> macrotask turn (`setImmediate`) before any walk that would extend the current run past a whole
+> `MAX_BACKLOG_SCAN`. Re-measured with the same harness: the 100-job walk is cut into **99 blocks**
+> — deterministic, one turn between every pair of walks — the longest ~32–40 ms on a quiet machine,
+> and **0 turns** on an ordinary tick, on a `backfill` replay, and on a backlog smaller than the
+> bound. Named tests, all counting **turns observed against a lookup count** and never a duration:
+> “hands the loop back between jobs, so no one walk can hold it”, “pays no turn at all on a tick
+> that has no backlog to walk”, “pays no turn while the walking it has done is still inside one
+> bound”, “pays no turn for a `backfill` replay, because the plan carries the count”.
+> Mutation-checked: deleting the yield fails the first; yielding per job fails the other three
+> **and** three pre-existing fake-timer tests; swapping `setImmediate` for `queueMicrotask` fails
+> the first — so the suite distinguishes busy from unblocked rather than inferring it.
+>
+> The two bounds are separate and both were needed: the *work* is bounded so a tick is affordable,
+> and the *block* is bounded so the work is interruptible. A bound on the first says nothing about
+> the second — which is precisely what the predecessor's ~2.34 s aggregate could not tell us.
+>
+> The audit's premise below — “produce a number no caller reads” — no longer applies: the count is
+> load-bearing since `bug-backfill-collapses-to-one-run-and-never-reports-truncation` (log **and**
+> every run record), which is why the walk was kept rather than deleted.
 
 > **Bound established** — `bug-tick-cost-grows-with-sleep-not-with-jobs`, 2026-10-02: the box as
 > previously worded was false in its first clause and left its second untested; it is reworded above

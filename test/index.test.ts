@@ -729,6 +729,218 @@ describe("the dropped-backlog count costs a bounded walk, not a walk per occurre
   })
 })
 
+describe("the first tick after a long sleep cannot hold the event loop (task-measure-first-tick-stall-after-long-sleep)", () => {
+  /**
+   * `MAX_BACKLOG_SCAN`, restated as a literal for the reason given in the block above: an
+   * imported-constant test would follow a new value silently, so raising the bound would pass green.
+   */
+  const SCAN_BOUND = 1000
+
+  /** Enough jobs that the walk is long enough to be cut in two, and short enough to stay quick. */
+  const JOBS = 3
+
+  /** One whole backlog each: enough that every job's walk reaches the bound. */
+  const ASLEPT_FOR_MS = 24 * 60 * MINUTE_MS
+
+  /**
+   * A long run that cannot finish on its own — so the tick's *dispatch* phase cannot be what the
+   * test is measuring. It costs nothing: the prompt never resolves and the test never waits for it.
+   */
+  let dir: string
+  let restoreEnv: string | undefined
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "st-stall-"))
+    restoreEnv = process.env[DATA_DIR_ENV]
+    process.env[DATA_DIR_ENV] = join(dir, "state")
+  })
+
+  afterEach(() => {
+    if (restoreEnv === undefined) delete process.env[DATA_DIR_ENV]
+    else process.env[DATA_DIR_ENV] = restoreEnv
+    rmSync(dir, { recursive: true, force: true })
+  })
+
+  /**
+   * Run one real tick — the plugin's own, through `setup` — over `JOBS` jobs whose cursors are
+   * `asleepMs` in the past, and report how the event loop behaved while it ran.
+   *
+   * **Turns, counted as work, never as durations.** A `setImmediate` chain records the lookup count
+   * it can see on each turn, so "a turn happened in the middle of the walk" is a statement about an
+   * integer — how far the walk had got — rather than about elapsed time on a machine that may be
+   * busy. That is the whole question: an assertion in milliseconds would be a flake by construction
+   * and would not distinguish *busy* from *blocked* on a slow run either.
+   *
+   * Counted by `Intl.DateTimeFormat#formatToParts`, the primitive every occurrence search bottoms
+   * out in and the only thing in the plugin that calls it, so a lookup count *is* a count of how far
+   * the walk has got.
+   */
+  async function firstTick(
+    asleepMs: number,
+    jobOverrides: Record<string, Record<string, unknown>> = {},
+    seedOverrides: Record<string, Record<string, unknown>> = {},
+  ): Promise<{ lookups: number; turnsInsideWalk: number }> {
+    mkdirSync(join(dir, ".opencode"), { recursive: true })
+    const lastRun = Date.now() - asleepMs
+    writeFileSync(
+      join(dir, ".opencode", "schedules.json"),
+      JSON.stringify({
+        version: 1,
+        jobs: Array.from({ length: JOBS }, (_, i) => ({
+          id: `j${i}`,
+          // UTC explicitly: the bound is a statement about the walk, and the walk's cost is a
+          // function of how many occurrences it counts — which is what the schedule decides.
+          schedule: "* * * * *",
+          timezone: "UTC",
+          prompt: "p",
+          enabled: true,
+          ...jobOverrides[`j${i}`],
+        })),
+      }),
+    )
+    const store = new Map<string, unknown>(
+      Array.from({ length: JOBS }, (_, i) => [
+        `scheduled-tasks/j${i}`,
+        { version: STATE_VERSION, lastRun, ...seedOverrides[`j${i}`] },
+      ]),
+    )
+
+    const real = Intl.DateTimeFormat.prototype.formatToParts
+    let lookups = 0
+    Intl.DateTimeFormat.prototype.formatToParts = function (
+      this: Intl.DateTimeFormat,
+      date?: Date | number,
+    ): Intl.DateTimeFormatPart[] {
+      lookups += 1
+      return (real as (d?: Date | number) => Intl.DateTimeFormatPart[]).call(this, date)
+    }
+    try {
+      /** Lookup count seen on each event-loop turn. */
+      const observed: number[] = []
+      let pumping = true
+      const pump = (): void => {
+        if (!pumping) return
+        observed.push(lookups)
+        setImmediate(pump)
+      }
+      setImmediate(pump)
+
+      const cleanup = await plugin.setup({
+        // Long enough that only the tick `arm()` dispatches from cold happens here.
+        options: { tickMs: 60 * MINUTE_MS, maxConcurrentRuns: JOBS },
+        location: { directory: dir, project: { id: "stall" } },
+        storage: {
+          get: async (key: string) => store.get(key),
+          set: async (key: string, value: unknown) => void store.set(key, value),
+          remove: async (key: string) => void store.delete(key),
+        },
+        session: {
+          create: async () => ({ id: "ses_1" }),
+          // Never resolves: the runs stay in flight, which is also what keeps the tick from
+          // dispatching a second time and muddying what was measured.
+          prompt: () => new Promise<never>(() => {}),
+        },
+        tool: { transform: async () => ({ dispose() {} }) },
+      } as never)
+
+      // The tick is over when nothing has been looked up for a stretch of turns. A turn count, not
+      // a duration, so a slow machine cannot cut the walk short and make this pass.
+      for (let settled = 0; settled < 500; settled += 1) {
+        const before = lookups
+        for (let turn = 0; turn < 500; turn += 1) await new Promise<void>((resolve) => setImmediate(resolve))
+        if (lookups === before) break
+      }
+      pumping = false
+      ;(cleanup as () => void)?.()
+
+      const total = lookups
+      return {
+        lookups: total,
+        // Strictly between: a turn that saw the walk still going. With the whole walk in one
+        // synchronous run there is none, whatever the job count.
+        turnsInsideWalk: observed.filter((seen) => seen > 0 && seen < total).length,
+      }
+    } finally {
+      Intl.DateTimeFormat.prototype.formatToParts = real
+    }
+  }
+
+  it("hands the loop back between jobs, so no one walk can hold it", async () => {
+    // The measurement this pins, on a real tick: 100 jobs each owing a capped backlog spent
+    // 601 800 lookups in a **single 2.45 s stretch during which no timer and no I/O callback ran**.
+    // The bound the box needs is not "the tick is fast" — the work is the work — but "no blocking
+    // run is longer than one job's walk", whatever the number of jobs behind it.
+    //
+    // `maxConcurrentRuns: JOBS` matters: every job is admitted, so no decision takes the skip
+    // branch's `await saveState`. Microtask boundaries were never the thing that mattered — they do
+    // not end a turn — so without a yield of its own the three walks are one uninterrupted run.
+    const { lookups, turnsInsideWalk } = await firstTick(ASLEPT_FOR_MS)
+
+    // The walk really did reach the bound on every job, so this is not a cheap walk that happened
+    // to be cut up. A day of minutely occurrences is ~1440 of them, which is past `SCAN_BOUND`.
+    expect(lookups).toBeGreaterThanOrEqual(JOBS * SCAN_BOUND)
+
+    // One turn between each pair of walks. Asserted as *at least*: the pump can get extra turns, and
+    // the claim is that the loop was given back, not that it was given back exactly once.
+    expect(turnsInsideWalk).toBeGreaterThanOrEqual(JOBS - 1)
+  })
+
+  it("pays no turn at all on a tick that has no backlog to walk", async () => {
+    // The other half of the same decision, and the reason the meter is metered rather than
+    // unconditional: a tick whose jobs owe nothing beyond their one occurrence searches once each.
+    // Nothing can be blocked, so nothing should be interrupted — an unconditional yield here would
+    // add an event-loop turn per job to every ordinary tick, forever, to protect against a cost
+    // that is not being paid.
+    const { turnsInsideWalk, lookups } = await firstTick(MINUTE_MS)
+    expect(lookups).toBeGreaterThan(0)
+    expect(lookups).toBeLessThan(JOBS * SCAN_BOUND)
+    expect(turnsInsideWalk).toBe(0)
+  })
+
+  it("pays no turn while the walking it has done is still inside one bound", async () => {
+    // The threshold is not a tuning knob, it is the definition of when the loop is at risk. A
+    // backlog *smaller* than `MAX_BACKLOG_SCAN` cannot hold the loop, so a tick full of them must
+    // not pay for protection it does not need — that is what keeps the turn off the common path,
+    // and it is a separate property from "no backlog at all", which the test above covers.
+    //
+    // Half an hour owes 29 occurrences, so each job walks 30 of them: three jobs are 90, nowhere
+    // near a bound's worth. Yielding per job here would be protection bought against a cost the
+    // tick is not paying.
+    const { turnsInsideWalk, lookups } = await firstTick(30 * MINUTE_MS)
+    // The walks were real — ~180 lookups' worth — so this is a tick that did work and declined to
+    // interrupt, not a tick that did nothing.
+    expect(lookups).toBeGreaterThan(JOBS)
+    expect(lookups).toBeLessThan(JOBS * SCAN_BOUND)
+    expect(turnsInsideWalk).toBe(0)
+  })
+
+  it("pays no turn for a `backfill` replay, because the plan carries the count", async () => {
+    // The durability that makes the walk happen once also makes it happen **only** once, and the two
+    // are the same decision. Charging a replay would buy nothing and cost a turn per job on every
+    // tick of a draining backlog — which is precisely the amortization the durable plan exists to
+    // provide, being paid back.
+    //
+    // `j0` arrives with a plan already in storage, so this tick *replays* it: one search, the
+    // remainder read off the plan. `j1` finds a capped backlog, so a turn would be legitimate
+    // somewhere in this tick if the replay were charging for work it did not do.
+    // `j0` arrives with a plan already in storage, so this tick *replays* it: one search, the
+    // remainder read off the plan — and a `dropped` of 1000 riding along that does not describe
+    // work this tick did. `j1` owes a single occurrence, so it walks once and is charged nothing.
+    // `j2` is the real one: a capped backlog, a full walk. If the replay were charging for work it
+    // did not do, the turn would be taken before `j1` and this tick would block for a walk twice
+    // over.
+    const plan = { pending: [Date.now() - 30_000], dropped: SCAN_BOUND, droppedCapped: true }
+    const { turnsInsideWalk, lookups } = await firstTick(
+      ASLEPT_FOR_MS,
+      { j0: { misfire: "backfill" } },
+      { j0: { catchUp: plan }, j1: { lastRun: Date.now() - MINUTE_MS } },
+    )
+    // And the walk it does pay for is real, so this is not a tick that simply did nothing.
+    expect(lookups).toBeGreaterThanOrEqual(SCAN_BOUND)
+    expect(turnsInsideWalk).toBe(0)
+  })
+})
+
 describe("normalizeState", () => {
   it("re-initializes an unknown version instead of misreading it", () => {
     expect(normalizeState({ version: 99, lastRun: 5 })).toEqual({ version: STATE_VERSION })
