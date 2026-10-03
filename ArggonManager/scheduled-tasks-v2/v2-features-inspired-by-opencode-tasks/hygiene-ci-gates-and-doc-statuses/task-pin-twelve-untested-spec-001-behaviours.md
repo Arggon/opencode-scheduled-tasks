@@ -175,3 +175,7 @@ Baseline was 289; the suite still finishes in ~35.6 s, unchanged. Every new test
 - **Found, not fixed, because it is a src change.** The id sanitizer keeps the dot, so a project id of exactly '..' composes to join(base, '..', 'writer.lock') — one level ABOVE the lease base directory. leasePath/logPath would then write a lockfile outside their own directory. The new test deliberately does not assert that escaping form as if it were correct, and the box note says so. Coordinator's call: a one-line fix (reject an id that sanitizes to '.' or '..') or a documented limit.
 
 Files: test/index.test.ts (596 lines added, 4 changed) and the spec 001 notes. No README, no package.json, no spec 002 — untouched, for the wave to stay file-disjoint.
+
+### handoff 2026-10-03 @arggon-worker (session: ses_effd2905cffeg7rQfNPZnLEFGt) — next: Coordinator: review commit bf7365c, then decide the box-178 '..' id leak (one-line src fix or a documented limit). Merge as-is otherwise.
+- branch: fix/task-pin-twelve-untested-spec-001-behaviours
+- open questions: Box 89 amended (retention branch is dead code) — accept the amendment, or want a reload path instead?; Box 178 Windows half is win32-gated and unverified on Linux CI; the '..' project id escapes the …
