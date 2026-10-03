@@ -635,6 +635,12 @@ recurring jobs · multi-machine locking.
 regardless, drive `opencode run` from OS scheduling (see
 [above](#jobs-that-must-run-while-the-server-is-down)).
 
+**Job files are read once, at startup.** Editing `.opencode/schedules.json` or
+`.opencode/tasks/*.md` takes effect after `opencode reload` — nothing re-reads them mid-session, so
+a fix to a broken file needs that reload too. There is no watcher and no hot reload, by design
+(ADR 0001): one read per session is what lets the writer lease and the tick timer be decided once
+from a job set that cannot change underneath them.
+
 ADRs and specs live under `ArggonManager/docs/`.
 
 ## Design
