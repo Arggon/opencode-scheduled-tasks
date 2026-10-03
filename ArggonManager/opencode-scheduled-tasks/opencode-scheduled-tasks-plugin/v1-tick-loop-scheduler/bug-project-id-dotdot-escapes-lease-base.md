@@ -85,3 +85,97 @@ that box's note. Do not regress the hostile-id confinement test that already exi
 ### handoff 2026-10-03 @ses_eff74efdaffezTu0PXysBLCQHu (session: ses_eff74efdaffezTu0PXysBLCQHu) — next: Code-review branch fix/bug-project-id-dotdot-escapes-lease-base (2 commits, src+test only), then apply the README threat-model sentence quoted in my comment and merge.
 - branch: fix/bug-project-id-dotdot-escapes-lease-base
 - open questions: README threat-model wording is in the comment for you to apply; keep the allowlist over a denylist.
+
+### 2026-10-03 @ses_eff74efdaffezTu0PXysBLCQHu
+## Fix report (worker)
+
+Branch `fix/bug-project-id-dotdot-escapes-lease-base`, 2 commits, `src/index.ts` + `test/index.test.ts`
++ the item file only. README untouched (out of lane).
+
+### Allowlist, and why not a denylist
+
+`safeProjectId` maps everything outside `[A-Za-z0-9_-]` to `_`. `..` and `.` are then not
+*rejected* — they are **unrepresentable**, because no character left in the alphabet means anything to
+`join`. A denylist would have to enumerate `.`, `..` and whatever a later reader worried about, and
+the denylist route also needs an error path through two call sites that both run in `setup`; a third
+caller would forget it.
+
+The id does not need `.`: a real host mints an opaque 32-char hex token
+(`ctx.location.project.id`; the dirs under `~/.local/share/opencode/scheduled-tasks/` on this host are
+exactly that), so the allowlist is the **identity** on every id a normal host produces — no lease
+directory moves, no lockfile is stranded. Sanitisation is lossy and already was (`a/b` and `a?` have
+always shared a directory); a collision is fail-safe — the loser meets a live foreign lease, logs why
+and stays inert (ADR 0003).
+
+The defect's real shape was **duplication**: two copies of the sanitizer, both wrong the same way. Both
+callers now go through one composer, `underLeaseBase`.
+
+### Before → after (resolved; identical for `leasePath` and `logPath`, leaf aside)
+
+| id | before | after |
+| --- | --- | --- |
+| `..` | `<parent-of-base>/writer.lock` — **outside the base** | `<base>/__/writer.lock` |
+| `.` | `<base>/writer.lock` — the base root, no project dir | `<base>/_/writer.lock` |
+| `.hidden` | `<base>/.hidden/writer.lock` | `<base>/_hidden/writer.lock` |
+| `proj-1.2_3` | `<base>/proj-1.2_3/writer.lock` | `<base>/proj-1_2_3/writer.lock` |
+| `abc123`, `a/b`, `../../etc`, real hex ids | already correct | unchanged |
+
+### How the containment assertion works
+
+`underLeaseBase` checks its **own composed result on the resolved absolute path**, with two conditions:
+`isInsideBase(root, composed)` **and** `dirname(dirname(composed)) === root`. Asserting the joined
+string could not work: `join` collapses `..` *before* a caller can inspect it, so the joined form of a
+traversing path already reads as a finished, normalised path — `join(base, "..", "writer.lock")` **is**
+`<parent>/writer.lock`. Comparing one `join` against another (what box 178's old line did) compares the
+defect against itself. Containment is a question about the base, so it needs a resolved comparison.
+
+The second condition is not redundancy: `.` does **not** escape — `isInsideBase` accepts it, because it
+lands *on* the base root. Only "exactly one component below the base" rejects it. A composition failing
+either check is recomposed from an escaped id (`..` → `_2e_2e_`) rather than thrown, because both
+callers run in `setup` before any work is decided and a `throw` there breaks the session (spec 002). The
+fallback is unreachable while the allowlist holds; it is there so widening the allowlist cannot quietly
+reopen this. Lexical, not `realpath`: the base need not exist yet.
+
+### The existing hostile-id test
+
+Not weakened, not made false — **one line did need changing**. `expect(dirname(lock)).toBe(join(base,
+hostile.replace(/[^A-Za-z0-9._-]/g, "_")))` re-derived the sanitizer inside the test, so it asserted
+agreement with a second copy of the bug. It is now `dirname(dirname(lock)) === resolve(base)` — the same
+claim (exactly one component, directly under the base) stated so it cannot pass by agreeing with itself.
+Every other expectation is untouched and still green.
+
+### `ensureLogDir`'s path-keyed once-guard
+
+Checked, not assumed: the path is still a pure function of the id (no clock, no counter), so repeated
+calls key identically and the guard still says "once" per project; distinct ids still key distinctly, so
+one unwritable project cannot silence another's report. What *did* change is the key for a traversing id —
+it now points inside the base rather than beside it, which is the fix. The on-disk consequence is
+asserted too: with the base never created, `ensureLogDir(logPath(dir, ".."))` creates the base and its
+child and **nothing beside the base** (before: it created the parent and stopped there).
+
+### Mutation results
+
+| mutation | red |
+| --- | --- |
+| restore the class to `[^A-Za-z0-9._-]` (keep composer+check) | 1 test — the allowlist assertion. The composer's check absorbs the escape, which is the second layer working |
+| restore the literal pre-fix code (both denylist copies, no composer, no check) | **all 4** new tests; the box-178 test stays green, which is why the defect survived — its id list has no dot id |
+
+### Gates
+
+`npx tsc --noEmit` exit 0 · `npx vitest run` **323 tests, 322 pass, 1 win32-gated skip, finishes in ~36s** ·
+`npx tsx harness/smoke.ts` PASS · `arggon validate` ok (0 warnings, v5) · `arggon spec analyze` clean.
+Baseline was 319 (318 + 1 skip): +4 tests.
+
+### README wording to apply (trust-boundary box — left unticked, reason on the item)
+
+Add to the threat-model section:
+
+> The plugin treats the host-provided project id as **host-provided, not attacker-controlled**: OpenCode
+> derives it from the project itself, so a third party cannot choose it. It still sanitises it to a
+> single path component under its data directory, because a corrupt or hostile host value should not be
+> able to place a lockfile or a log outside the directory meant to hold them — the same reason a
+> half-written id is never trusted to be well-formed.
+
+If you would rather not concede the trust, the equivalent honest sentence is: "the project id is
+**untrusted input**; `leasePath` and `logPath` reduce it to one dotless component and verify the composed
+path resolves inside the data directory." The code supports both readings; it is defensive either way.
