@@ -6626,3 +6626,420 @@ describe("backfill replays a backlog and reports what it dropped (bug-backfill-c
     expect("droppedCapped" in runs[0]!).toBe(false)
   })
 })
+
+// =====================================================================
+// (bug-storageless-degradation-unrecorded)
+//
+// spec 001 box 145 claimed that a host without `ctx.storage` "degrades to in-memory state:
+// jobs still run, and the loss of cross-restart continuity is recorded in the run record".
+// The first clause was true. The second did not exist — `state.storageAvailable` was assigned
+// at setup and read nowhere, and no run record had a field to carry it.
+//
+// And the namespacing fix for `bug-oneoff-history-unreadable-and-storage-unbounded` made
+// `resolveHistoryOwner` resolve a *finished* one-off through storage alone. On a storageless
+// host that reads nothing, so a one-off whose record was written moments earlier in the same
+// tick came back as `no job with id` — the exact symptom the previous item was filed to
+// eliminate, left standing for the uncommon host.
+//
+// So the decision this block pins: ephemeral history stays reachable **in memory** here, every
+// run record says whether it outlives the session, and an id this process cannot resolve names
+// the retention boundary instead of claiming no such job exists.
+// =====================================================================
+/**
+ * Project ids for the hosts below, unique for the whole file.
+ *
+ * `logOnce` dedups on a module-level set that outlives a single test, so two hosts sharing a
+ * project id would share one degradation line and the second would assert against nothing. The
+ * ids are the plugin's own key, so making them unique is what makes each line attributable here.
+ */
+let storagelessProjects = 0
+
+const nextProjectID = (): string => `storageless-${(storagelessProjects += 1)}`
+
+describe("a storageless host is told so, and keeps its history readable (bug-storageless-degradation-unrecorded)", () => {
+  let dir: string
+  let restoreEnv: string | undefined
+  let consoleLines: string[]
+  let realConsoleError: typeof console.error
+  const outstanding: Array<() => void> = []
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "st-storageless-"))
+    mkdirSync(join(dir, ".opencode"), { recursive: true })
+    restoreEnv = process.env[DATA_DIR_ENV]
+    process.env[DATA_DIR_ENV] = join(dir, "state")
+    realConsoleError = console.error
+    consoleLines = []
+    console.error = (...args: unknown[]): void => void consoleLines.push(args.map(String).join(" "))
+  })
+
+  afterEach(() => {
+    for (const dispose of outstanding.splice(0).reverse()) {
+      try {
+        dispose()
+      } catch {
+        /* a failing teardown must not mask the assertion before it */
+      }
+    }
+    console.error = realConsoleError
+    if (restoreEnv === undefined) delete process.env[DATA_DIR_ENV]
+    else process.env[DATA_DIR_ENV] = restoreEnv
+    rmSync(dir, { recursive: true, force: true })
+    vi.useRealTimers()
+  })
+
+  type Tool = {
+    execute: (input: Record<string, unknown>, context?: { sessionID?: unknown }) => Promise<{ output: Record<string, unknown> }>
+  }
+  type Runs = Array<Record<string, unknown>>
+
+  type Storageless = {
+    tool: (name: string) => Tool
+    prompts: Record<string, unknown>[]
+    /** Every `ctx.storage` operation this host actually offers, in the order it is used. */
+    offered: string[]
+    /** Lines this instance emitted, whatever else the file captured. */
+    log: () => string[]
+  }
+
+  /**
+   * A plugin whose `ctx.storage` is **genuinely absent**, or present in halves.
+   *
+   * The absence is the point, so there is no double to assert against: no store, no writes, and
+   * `offered` stays empty — a mock that silently succeeds would let every assertion below pass
+   * on a host that actually persists everything, which is the trap this suite has already paid
+   * for once. `setOnly`/`getOnly` are the two half-surfaces, because neither operation implies
+   * the other and a scheduler that assumes they arrive together invents continuity.
+   */
+  async function storageless(
+    options: {
+      jobs?: unknown[]
+      /** Offer `ctx.storage.set` alone: this host writes what it can never read back. */
+      setOnly?: boolean
+      /** Offer `ctx.storage.get` alone: this host reads what it can never have written. */
+      getOnly?: boolean
+      pluginOptions?: Record<string, unknown>
+    } = {},
+  ): Promise<Storageless> {
+    if (options.jobs !== undefined) {
+      writeFileSync(join(dir, ".opencode", "schedules.json"), JSON.stringify({ version: 1, jobs: options.jobs }))
+    }
+    const offered: string[] = []
+    const store = new Map<string, unknown>()
+    const prompts: Record<string, unknown>[] = []
+    const tools: Array<Record<string, unknown>> = []
+    const storage =
+      options.setOnly === true
+        ? {
+            set: async (key: string, value: unknown) => {
+              offered.push("set")
+              store.set(key, value)
+            },
+          }
+        : options.getOnly === true
+          ? {
+              get: async (key: string) => {
+                offered.push("get")
+                return store.get(key)
+              },
+            }
+          : undefined
+    const projectID = nextProjectID()
+    const ctx: Record<string, unknown> = {
+      ...(options.pluginOptions === undefined ? {} : { options: options.pluginOptions }),
+      location: { directory: dir, project: { id: projectID } },
+      // Absent, not an empty object: `{}` would pass a `typeof ctx.storage === "object"` check
+      // while offering nothing, which is precisely the assumption the detection must not make.
+      ...(storage === undefined ? {} : { storage }),
+      session: {
+        create: async () => ({ id: `ses_${projectID}` }),
+        prompt: async (input: Record<string, unknown>) => {
+          prompts.push(input)
+          return { id: `inbox_${prompts.length}` }
+        },
+      },
+      tool: {
+        transform: async (cb: (editor: { add?: (tool: unknown) => void }) => void) => {
+          cb({ add: (tool) => void tools.push(tool as Record<string, unknown>) })
+          return { dispose() {} }
+        },
+      },
+    }
+    // From the line setup itself, so this host's log is its own: two hosts in one test share the
+    // captured array, and a line the plugin emitted under a *different* project id is a different
+    // instance's report.
+    const first = consoleLines.length
+    const resolved = await plugin.setup(ctx as never)
+    outstanding.push(() => void (resolved as () => void)?.())
+    return {
+      tool: (name: string): Tool => {
+        const found = tools.find((entry) => entry.name === name)
+        if (found === undefined) throw new Error(`tool ${name} was not registered`)
+        return found as unknown as Tool
+      },
+      prompts,
+      offered,
+      log: () => consoleLines.slice(first),
+    }
+  }
+
+  /** Flush pending microtasks and 0/1ms timers on the injected clock, as a run is `void`-dispatched. */
+  async function settle(turns = 20): Promise<void> {
+    for (let n = 0; n < turns; n += 1) await vi.advanceTimersByTimeAsync(1)
+  }
+
+  /** Advance until `predicate` holds, or give up after `budgetMs` — never a guessed interval. */
+  async function advanceUntil(predicate: () => boolean, budgetMs: number, stepMs = MIN_TICK_MS): Promise<boolean> {
+    for (let elapsed = 0; elapsed <= budgetMs; elapsed += stepMs) {
+      if (predicate()) return true
+      await vi.advanceTimersByTimeAsync(stepMs)
+      await settle(2)
+    }
+    return predicate()
+  }
+
+  /** A job due every minute, so one tick boundary decides it. */
+  const dueJob = (id: string, prompt: string): Record<string, unknown> => ({ id, schedule: "* * * * *", timezone: "UTC", prompt })
+
+  /** A due one-off as `schedules_schedule` accepts it: inside the grace window. */
+  const dueSoon = (): Record<string, unknown> => ({ prompt: "the one-off prompt", dueAt: Date.now() - 1_000 })
+
+  // -------------------------------------------------------------------
+  // Box: the loss of cross-restart continuity is recorded — on the run
+  // record and once in the log — and `storageAvailable` is read to do it.
+  // -------------------------------------------------------------------
+
+  it(
+    "stamps every run record on a storageless host, and says once that continuity is lost",
+    async () => {
+      vi.useFakeTimers()
+      vi.setSystemTime(Date.now())
+      const h = await storageless({ jobs: [dueJob("j", "the job prompt")] })
+
+      // The first clause of the box, and the reason the stamp is ever written: jobs still run.
+      expect(await advanceUntil(() => h.prompts.length === 1, 2 * MINUTE_MS)).toBe(true)
+      await settle()
+
+      const runs = (await h.tool("history").execute({ id: "j" })).output.runs as Runs
+      expect(runs[0]).toMatchObject({ outcome: "ok", inMemoryOnly: true })
+      // Not a blanket flag on the answer: the ring around it is stored history, and a field that
+      // appeared on records the host *did* persist would be the same lie in a new place.
+      expect(runs.every((run) => run.inMemoryOnly === true)).toBe(true)
+      expect(h.offered).toEqual([])
+
+      // …and the log says so once, naming both the gap and what is lost. Asserted on content, not
+      // on a line's existence: a degradation notice that only says "storage unavailable" leaves
+      // the reader to guess whether anything survives a restart.
+      const line = h.log().find((entry) => /ctx\.storage/.test(entry))
+      expect(line).toBeDefined()
+      expect(line).toMatch(/ctx\.storage unavailable/)
+      expect(line).toMatch(/memory only/)
+      expect(line).toMatch(/lost when this session ends/)
+      // Once, not once per tick: a repeated identical failure that repeats once a tick is its own
+      // spec box, and a degradation notice that spams would bury the runs it is explaining.
+      // Matched on the continuity sentence rather than on `ctx.storage`, which the `scan`
+      // degradation also names and legitimately says once of its own.
+      expect(h.log().filter((entry) => /lost when this session ends/.test(entry))).toHaveLength(1)
+    },
+    20_000,
+  )
+
+  it("does not stamp the record, or claim a degraded host, when storage works", async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(Date.now())
+    // The other direction, so the stamp cannot be a constant: on a host that persists everything,
+    // neither the record nor the log may claim a loss of continuity.
+    const store = new Map<string, unknown>()
+    const tools: Array<Record<string, unknown>> = []
+    const prompts: Record<string, unknown>[] = []
+    writeFileSync(
+      join(dir, ".opencode", "schedules.json"),
+      JSON.stringify({ version: 1, jobs: [dueJob("j", "the job prompt")] }),
+    )
+    const first = consoleLines.length
+    const resolved = await plugin.setup({
+      location: { directory: dir, project: { id: nextProjectID() } },
+      storage: {
+        get: async (key: string) => store.get(key),
+        set: async (key: string, value: unknown) => void store.set(key, value),
+        remove: async (key: string) => void store.delete(key),
+      },
+      session: {
+        create: async () => ({ id: "ses_kept" }),
+        prompt: async (input: Record<string, unknown>) => {
+          prompts.push(input)
+          return { id: "inbox_kept" }
+        },
+      },
+      tool: {
+        transform: async (cb: (editor: { add?: (tool: unknown) => void }) => void) => {
+          cb({ add: (tool) => void tools.push(tool as Record<string, unknown>) })
+          return { dispose() {} }
+        },
+      },
+    } as never)
+    outstanding.push(() => void (resolved as () => void)?.())
+
+    expect(await advanceUntil(() => prompts.length === 1, 2 * MINUTE_MS)).toBe(true)
+    await settle()
+
+    const tool = (name: string): Tool => {
+      const found = tools.find((entry) => entry.name === name)
+      if (found === undefined) throw new Error(`tool ${name} was not registered`)
+      return found as unknown as Tool
+    }
+    const runs = (await tool("history").execute({ id: "j" })).output.runs as Runs
+    expect(runs[0]).toMatchObject({ outcome: "ok" })
+    expect("inMemoryOnly" in runs[0]!).toBe(false)
+    expect(consoleLines.slice(first).filter((entry) => /ctx\.storage/.test(entry))).toEqual([])
+  }, 20_000)
+
+  it(
+    "counts a key minted by an earlier process against the cap, not only this one's",
+    async () => {
+      vi.useFakeTimers()
+      vi.setSystemTime(Date.now())
+      // A host whose storage works, carrying a full index from before: this process's own list is
+      // empty at setup, so if the cap counted only what *this* session minted, the fifty keys
+      // already on disk would not count and nothing would ever be evicted — across a restart the
+      // bound would silently double. Mutating the union away leaves the rest of the suite green,
+      // so this is what pins it.
+      const index = Array.from({ length: MAX_EPHEMERAL_HISTORY_KEYS }, (_, n) => ({
+        key: `scheduled-tasks/history/oneoff/earlier${n}`,
+        at: n + 1,
+      }))
+      const store = new Map<string, unknown>([["scheduled-tasks/history/ephemeral", index]])
+      const tools: Array<Record<string, unknown>> = []
+      writeFileSync(join(dir, ".opencode", "schedules.json"), JSON.stringify({ version: 1, jobs: [] }))
+      const resolved = await plugin.setup({
+        location: { directory: dir, project: { id: nextProjectID() } },
+        storage: {
+          get: async (key: string) => store.get(key),
+          set: async (key: string, value: unknown) => void store.set(key, value),
+          remove: async (key: string) => void store.delete(key),
+        },
+        session: { create: async () => ({ id: "ses_union" }), prompt: async () => ({ id: "inbox_union" }) },
+        tool: {
+          transform: async (cb: (editor: { add?: (tool: unknown) => void }) => void) => {
+            cb({ add: (tool) => void tools.push(tool as Record<string, unknown>) })
+            return { dispose() {} }
+          },
+        },
+      } as never)
+      outstanding.push(() => void (resolved as () => void)?.())
+
+      await settle()
+      const schedule = tools.find((entry) => entry.name === "schedule") as unknown as Tool
+      await (schedule.execute({ prompt: "p", dueAt: Date.now() - 1_000 }) as Promise<unknown>)
+      await settle()
+
+      // One key over the cap, and the *oldest* — from the earlier session, not this one's.
+      expect(store.get("scheduled-tasks/history/ephemeral")).toHaveLength(MAX_EPHEMERAL_HISTORY_KEYS)
+      expect(store.has("scheduled-tasks/history/oneoff/earlier0")).toBe(false)
+    },
+    20_000,
+  )
+
+  it(
+    "treats a half-present storage surface as degraded, because neither operation implies the other",
+    async () => {
+      for (const half of [
+        { missing: "set", options: { getOnly: true } },
+        { missing: "get", options: { setOnly: true } },
+      ] as const) {
+        vi.useFakeTimers()
+        vi.setSystemTime(Date.now())
+        const h = await storageless({ jobs: [dueJob("j", "the job prompt")], ...half.options })
+
+        expect(await advanceUntil(() => h.prompts.length === 1, 2 * MINUTE_MS)).toBe(true)
+        await settle()
+
+        // Detected per operation: a record that cannot be read back is not retained, whichever
+        // half is missing, and the line names *which* one rather than blaming the whole surface.
+        const runs = (await h.tool("history").execute({ id: "j" })).output.runs as Runs
+        expect(runs[0]).toMatchObject({ inMemoryOnly: true })
+        const line = h.log().find((entry) => /ctx\.storage/.test(entry))
+        expect(line).toContain(`ctx.storage.${half.missing} unavailable`)
+      }
+    },
+    40_000,
+  )
+
+  // -------------------------------------------------------------------
+  // The ephemeral-history fallback, decided: in memory, and said so when
+  // even that cannot answer.
+  // -------------------------------------------------------------------
+
+  it(
+    "reads a one-off it just ran back through schedules_history, with no storage at all",
+    async () => {
+      vi.useFakeTimers()
+      vi.setSystemTime(Date.now())
+      const h = await storageless({ jobs: [] })
+
+      const id = ((await h.tool("schedule").execute(dueSoon())).output.id) as string
+      expect(id).toMatch(/^oneoff_/)
+      await settle()
+
+      // The run happened — asserted on the prompt, so it cannot pass on a log line.
+      expect(h.prompts).toHaveLength(1)
+
+      // …and reading it back is the claim that was false without storage: the id is in no live
+      // list any more, so only this process's own ring can answer for it.
+      const read = (await h.tool("history").execute({ id })).output
+      expect(read.error).toBeUndefined()
+      expect(read.kind).toBe("oneoff")
+      expect(read.runs).toMatchObject([{ outcome: "ok", inMemoryOnly: true }])
+    },
+    20_000,
+  )
+
+  it(
+    "names the retention boundary for a finished one-off it can no longer resolve",
+    async () => {
+      vi.useFakeTimers()
+      vi.setSystemTime(Date.now())
+      // The repro, honestly staged: a second instance over the same project, which is what "an
+      // earlier session" is on a host that persists nothing. Whatever the first instance ran is
+      // unreachable from here, so the two remaining explanations — never ran, and ran and died
+      // with the session — have to be told apart out loud rather than by a bare miss.
+      const first = await storageless({ jobs: [] })
+      const id = ((await first.tool("schedule").execute(dueSoon())).output.id) as string
+      await settle()
+      expect(first.prompts).toHaveLength(1)
+
+      const second = await storageless({ jobs: [] })
+      const miss = (await second.tool("history").execute({ id })).output
+      expect(String(miss.error)).toMatch(new RegExp(`no job with id "${id}"`))
+      expect(String(miss.historyUnavailable)).toMatch(/ctx\.storage\.get/)
+      expect(String(miss.historyUnavailable)).toMatch(/never after it/)
+    },
+    20_000,
+  )
+
+  it(
+    "bounds the in-memory rings the way the persisted ones are bounded",
+    async () => {
+      vi.useFakeTimers()
+      vi.setSystemTime(Date.now())
+      // Where nothing is persisted, the in-memory ring *is* the retained history — so a cap that
+      // only counted storage keys would bound nothing here, and a project that ran a thousand
+      // one-offs would keep a thousand rings for the life of the session. Reaching the cap needs
+      // that many one-offs, which is exactly the growth being bounded.
+      const h = await storageless({ jobs: [] })
+      const ids: string[] = []
+      for (let n = 0; n <= MAX_EPHEMERAL_HISTORY_KEYS; n += 1) {
+        ids.push(((await h.tool("schedule").execute(dueSoon())).output.id) as string)
+        await settle(2)
+      }
+
+      // The oldest is gone, with nothing left behind to read…
+      const evicted = (await h.tool("history").execute({ id: ids[0]! })).output
+      expect(String(evicted.error)).toMatch(/no job with id/)
+      // …and the cap dropped exactly one, not the rest with it: the newest is still there.
+      expect((await h.tool("history").execute({ id: ids[1]! })).output.runs).toHaveLength(1)
+      expect((await h.tool("history").execute({ id: ids.at(-1)! })).output.runs).toHaveLength(1)
+    },
+    60_000,
+  )
+})

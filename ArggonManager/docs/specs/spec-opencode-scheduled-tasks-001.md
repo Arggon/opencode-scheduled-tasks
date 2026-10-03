@@ -298,11 +298,19 @@ job set.**
 
 > **Ticked** — audit `task-audit-spec-001-acceptance-boxes`, 2026-10-02: `test/index.test.ts` → “re-initializes a corrupt or non-object entry” (`null`, `42`, “x”, `[1,2]` → a fresh record) plus “advances nextRun even when nothing was due, so the next tick does not rescan” for the recompute. **Unpinned sub-clause:** “other jobs are unaffected” — making `loadStates` return early on the first corrupt entry leaves 234/234 green.
 
-- [ ] When `ctx.storage` is absent on the host (feature-detected), the scheduler degrades to
+- [x] When `ctx.storage` is absent on the host (feature-detected), the scheduler degrades to
       in-memory state: jobs still run, and the loss of cross-restart continuity is recorded
       in the run record.
 
-> **False** — audit `task-audit-spec-001-acceptance-boxes`, 2026-10-02: The degradation is real and the first clause holds (probe: with `ctx.storage` absent, a one-off scheduled through `schedules_schedule` is dispatched — one `session.prompt`). **The second clause does not exist**: nothing records the loss of cross-restart continuity. `state.storageAvailable` is assigned once at setup (src/index.ts:4206) and read nowhere in the file; `HistoryEntry` has no such field and no log line mentions it. Worse on a storageless host: the completed one-off’s record is written to `history/oneoff/<id>` and then `schedules_history` cannot find it, because the lookup falls through to storage. So the box names a report the code does not make.
+> **Ticked** — fix `bug-storageless-degradation-unrecorded`, 2026-10-03. Both clauses are now made rather than amended, and the third (which the box does not name but the code needs) is decided explicitly: **ephemeral history stays reachable in memory** here, so `schedules_history` still answers.
+>
+> - **Jobs still run** — pinned by “stamps every run record on a storageless host, and says once that continuity is lost”: with `ctx.storage` absent the key, a `* * * * *` job is dispatched and recorded.
+> - **The loss is recorded in the run record** — `HistoryEntry.inMemoryOnly`, stamped in `recordRun` (the one funnel every kind of run goes through) whenever the host lacks `get` **or** `set`, and passed through by `schedules_history`. Presence-only: its absence means the record *was* stored.
+> - **And once in the log** — `logOnce("no-storage:<project>")` at setup, naming the surface that is missing and what is lost. Per project, like the lease lines, so a second project's log is not silent.
+>
+> **Read side, decided:** `resolveHistoryOwner` asks this process's rings *first* and storage second. Storage alone (the shape left by the namespacing fix) returned `no job with id` for a one-off whose record was written moments earlier in the same tick. Where even memory cannot answer — an id this process never minted — the error carries `historyUnavailable` naming the retention boundary rather than a bare miss. **Unpinned sub-clause:** “the loss of cross-restart continuity is recorded” is asserted on a `get`-only and a `set`-only host as well as on none, so the detection is per-operation; the *stamp* is not asserted to survive a storage round-trip, and deliberately cannot be (`loadHistory` rebuilds from storage, and a record that arrived from storage was written by a host that *had* storage).
+>
+> **Also bounded:** where nothing is persisted, the in-memory ring *is* the retained history, so `retainEphemeralHistoryKey` mirrors the index in memory, unions it with the persisted one, and evicts the ring as well as the storage key. Without that, “the last fifty” would have been true only on the hosts that did not need it.
 
 ### Observability — observability/debuggability
 
