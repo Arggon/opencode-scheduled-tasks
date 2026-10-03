@@ -96,3 +96,7 @@ Branch `chore/task-assert-occurrence-walk-jumps-strictly-advance` @ 95b50d5. Tes
 **Untouched:** the p0's one-line seeding and `wallToNaive`/`naiveToWall` frame, the negative-offset matrix, `MAX_BACKLOG_SCAN` (still unexported, still a literal), the event-loop yield, README. One pre-existing test was rewritten in place — it was titled "returns undefined rather than looping forever" but asserted `toBeDefined()`; it now asserts the real claim (which is why the count moved by the 4 new tests only).
 
 **Gates:** `npx tsc --noEmit` clean · `npx vitest run` 289 passed, finished · `npx tsx harness/smoke.ts` PASS · `arggon validate` ok · `arggon spec analyze` clean.
+
+### handoff 2026-10-03 @ses_efff00ec8fferfO6SYYRbYBRR2 (session: ses_efff00ec8fferfO6SYYRbYBRR2) — next: Review @ 95b50d5, then merge. Re-run the sed mutants if the walk loop is touched again.
+- branch: chore/task-assert-occurrence-walk-jumps-strictly-advance
+- open questions: Is the in-loop WalkStalled/step-bound pair in nextOccurrence acceptable as production change, or should it be review-gated as new invariant? Guard removal is undetectable by tests.
