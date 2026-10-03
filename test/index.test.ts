@@ -9214,3 +9214,976 @@ describe("the spec 001 clauses nothing was enforcing (task-pin-twelve-untested-s
     expect(reported).toMatchObject({ lastStatus: "ok", lastRun: new Date(lastRun).toISOString() })
   })
 })
+
+// ===========================================================================
+// The v1 contract, stated positively (task-assert-v1-identical-with-no-markdown-dir)
+// ===========================================================================
+
+/**
+ * **There is no v1 binary to diff against.** v1 was never kept as a build, so "a v1 job file behaves
+ * identically" cannot be a comparison — there is nothing on the other side of the comparison. This
+ * block therefore *constructs* the claim instead: it states the v1 contract positively, from the
+ * documents that define it, and asserts that the current plugin, given **a job file with only the
+ * fields v1 had** and **no markdown directory**, still meets every clause of it that a JSON-only
+ * project can reach. The two it cannot reach are named where they are not asserted, rather than
+ * papered over.
+ *
+ * Read it as *the v1 contract as specified*, never as a regression suite against a build we do not
+ * have. If someone later finds a v1 binary, the honest thing is to diff it against this block, not
+ * to treat this block as having already done so.
+ *
+ * **Where each clause comes from**, so "v1" is a sourced word rather than a feeling:
+ *
+ * - **The job file** — spec 001's synopsis, ten fields: `id`, `schedule`, `timezone`, `prompt`,
+ *   `agent`, `model`, `enabled`, `misfire`, `maxCatchUp`, `runTimeoutMs`. Every job written below is
+ *   drawn from that list and from no other, because a field v1 never had would make the whole block a
+ *   claim about something else. (`runTimeout` and `session` are v2's, so they appear nowhere here.)
+ * - **Admission** — spec 001 § Loading and validation, plus § Error states for the broken file.
+ * - **`nextRun`** — spec 001 § Time: each job evaluates in its own IANA zone, and the reported instant
+ *   is absolute. The **negative-offset** half is here because that is where a v1 behaviour silently
+ *   changed: on 2026-10-03 a `* * * * *` job in `America/New_York` was found firing every 241 minutes
+ *   in summer and 301 in winter, and every timezone test in this file before that day ran in UTC or
+ *   Europe/Madrid — both at or east of Greenwich, which is the whole range in which the frame error
+ *   cancels out. A v1-equivalence test that only ran in UTC would have missed it again, so both
+ *   seasons are asserted and the half-hour zone is asserted beside the whole-hour one.
+ * - **The cap** — spec 001 § Limits: at most `maxConcurrentRuns` (default 1) in flight globally; a due
+ *   occurrence with no free slot is *skipped, never queued*.
+ * - **Misfire** — spec 001 § Limits: `skip` collapses a backlog to one run; `backfill` replays at most
+ *   `maxCatchUp`, oldest first, and reports the dropped remainder as truncated in the run record. The
+ *   one-occurrence-per-tick shape and the durable plan came with
+ *   `bug-backfill-collapses-to-one-run-and-never-reports-truncation`, which found the box false and
+ *   corrected the code to the decision rather than the decision to the code (ADR 0002). So this test
+ *   asserts the corrected contract — in particular that **under `backfill` a due occurrence is owed,
+ *   not spent** — and says so, rather than asserting the old simplification that one tick folds a
+ *   backlog into a single dispatch.
+ * - **The malformed file** — spec 001 box 89, **as amended** by `task-pin-twelve-untested-spec-001-behaviours`
+ *   to the reachable invariant: *a broken file costs the project neither its jobs nor its silence*.
+ *   The box's original "retains the last-known-good job set" describes a branch with no caller, so it
+ *   is not what is asserted here.
+ * - **The run record** — spec 001 § Observability and § Failure, whose audit verdict names the v1
+ *   shape verbatim as `{dueAt, startedAt, outcome, model, sessionID}`.
+ * - **Key layout** — spec 001 § Persistence and § Upgrade: state and history land where v1 put them,
+ *   so an **upgrade in place** does not orphan a v1 user's existing history.
+ *
+ * Sits **beside** the additive half of the same claim, which it does not replace: "every static
+ * import in the plugin is a node builtin", "loads and runs a JSON-only project without resolving any
+ * package" and "a missing directory is the v1 state, not an error" pin that the *loading* of a v1
+ * project needs nothing outside this file. What follows pins what it then *does*.
+ *
+ * **Every clause here is mutation-checked** against a named change in `src/index.ts`, and the item
+ * records which mutation turned which assertion red. This block changed no source: the whole claim
+ * is that the behaviour is already right, so the test is what makes it stay right.
+ */
+describe("the v1 contract, stated positively (task-assert-v1-identical-with-no-markdown-dir)", () => {
+  // -------------------------------------------------------------------------
+  // The instants every assertion below is written against.
+  //
+  // Both seasons, deliberately: a zone west of Greenwich shrinks its offset magnitude into summer, so
+  // the 2026-10-03 defect reported a different step in each (241 and 301 minutes), and measuring one
+  // season would have understated it by an hour. `America/St_Johns` is UTC-2:30 in daylight and
+  // UTC-3:30 in standard — a whole-hour negative offset cannot see a `:30` defect at all, which is
+  // why the daily cases below come in threes: the same `0 3 * * *` job is due at three different
+  // instants depending only on which zone and season the file names.
+  // -------------------------------------------------------------------------
+
+  /** 12:00:30Z on a January day: New York is on EST (UTC-5), St. Johns on NST (UTC-3:30). */
+  const JANUARY = Date.parse("2026-01-10T12:00:30.000Z")
+  /** 12:00:30Z on an October day: New York is on EDT (UTC-4), St. Johns on NDT (UTC-2:30). */
+  const OCTOBER = Date.parse("2026-10-03T12:00:30.000Z")
+
+  /** An absolute instant, written the way `schedules_list` writes one. */
+  const at = (iso: string): number => Date.parse(iso)
+
+  // -------------------------------------------------------------------------
+  // Harness — a real `plugin.setup` over a JSON-only project.
+  // -------------------------------------------------------------------------
+
+  type Tool = {
+    execute: (
+      input: Record<string, unknown>,
+      context?: { sessionID?: unknown },
+    ) => Promise<{ output: Record<string, unknown> }>
+  }
+
+  type V1 = {
+    dir: string
+    store: Map<string, unknown>
+    prompts: Record<string, unknown>[]
+    tool: (name: string) => Tool
+    list: () => Promise<Record<string, unknown>>
+    jobs: () => Promise<Array<Record<string, unknown>>>
+    history: (id: string) => Promise<Array<Record<string, unknown>>>
+    /** Every line logged, or those after index `since` — so two harnesses in one test can be read apart. */
+    logged: (since?: number) => string[]
+    cleanup: () => void
+  }
+
+  const dirs: string[] = []
+  const cleanups: Array<() => void> = []
+  let restoreEnv: string | undefined
+  let consoleLines: string[]
+  let realConsoleError: typeof console.error
+
+  beforeEach(() => {
+    vi.useFakeTimers()
+    restoreEnv = process.env[DATA_DIR_ENV]
+    consoleLines = []
+    realConsoleError = console.error
+    console.error = (...args: unknown[]): void => void consoleLines.push(args.map(String).join(" "))
+  })
+
+  afterEach(() => {
+    for (const cleanup of cleanups.splice(0).reverse()) {
+      try {
+        cleanup()
+      } catch {
+        /* a failing teardown must not mask the assertion that ran before it */
+      }
+    }
+    console.error = realConsoleError
+    if (restoreEnv === undefined) delete process.env[DATA_DIR_ENV]
+    else process.env[DATA_DIR_ENV] = restoreEnv
+    for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true })
+    vi.useRealTimers()
+  })
+
+  /**
+   * A v1 project: one `.opencode/schedules.json`, **no** `.opencode/tasks/`, and a fake host.
+   *
+   * Its own temp directory per call, so two harnesses in one test cannot see each other's file, lease
+   * or ticks — which is what lets the table-driven tests below run in a loop.
+   */
+  async function v1(options: {
+    /** Names the project, and so the lease and the log file. Distinct per harness. */
+    project: string
+    jobs?: unknown[]
+    /** The file verbatim, for the one that is *meant* to be broken. */
+    file?: string
+    /** What `ctx.storage` already holds, as a v1 install would have left it. */
+    seed?: Record<string, unknown>
+    pluginOptions?: Record<string, unknown>
+    promptError?: string
+  }): Promise<V1> {
+    const dir = mkdtempSync(join(tmpdir(), "st-v1-"))
+    dirs.push(dir)
+    mkdirSync(join(dir, ".opencode"), { recursive: true })
+    // **The precondition of every test in this block, asserted rather than assumed.** Nothing here
+    // may pass because the markdown surface loaded, so the directory that would have let it is
+    // checked to be absent on every single harness.
+    expect(existsSync(join(dir, ".opencode", "tasks"))).toBe(false)
+    writeFileSync(
+      join(dir, ".opencode", "schedules.json"),
+      options.file ?? JSON.stringify({ version: 1, jobs: options.jobs ?? [] }),
+    )
+    process.env[DATA_DIR_ENV] = join(dir, "state")
+
+    const store = new Map<string, unknown>(Object.entries(options.seed ?? {}))
+    const tools: Array<Record<string, unknown>> = []
+    const prompts: Record<string, unknown>[] = []
+    const ctx: Record<string, unknown> = {
+      ...(options.pluginOptions === undefined ? {} : { options: options.pluginOptions }),
+      location: { directory: dir, project: { id: options.project } },
+      storage: {
+        get: async (key: string) => store.get(key),
+        set: async (key: string, value: unknown) => void store.set(key, value),
+        remove: async (key: string) => void store.delete(key),
+      },
+      session: {
+        create: async () => ({ id: `ses_${options.project}` }),
+        switchAgent: async () => {},
+        switchModel: async () => {},
+        prompt: async (input: Record<string, unknown>) => {
+          prompts.push(input)
+          if (options.promptError !== undefined) throw new Error(options.promptError)
+          return { id: `inbox_${prompts.length}` }
+        },
+      },
+      permission: { rules: async () => {} },
+      tool: {
+        transform: async (cb: (editor: { add?: (t: unknown) => void }) => void) => {
+          cb({ add: (t) => void tools.push(t as Record<string, unknown>) })
+          return { dispose: () => {} }
+        },
+      },
+    }
+    const resolved = await plugin.setup(ctx as never)
+    const cleanup = (): void => void (resolved as () => void)?.()
+    cleanups.push(cleanup)
+    const tool = (name: string): Tool => {
+      const found = tools.find((entry) => entry.name === name)
+      if (found === undefined) throw new Error(`tool ${name} was not registered`)
+      return found as unknown as Tool
+    }
+    return {
+      dir,
+      store,
+      prompts,
+      tool,
+      list: async () => (await tool("list").execute({})).output,
+      jobs: async () => (await tool("list").execute({})).output.jobs as Array<Record<string, unknown>>,
+      history: async (id: string) =>
+        (await tool("history").execute({ id })).output.runs as Array<Record<string, unknown>>,
+      logged: (since = 0) => consoleLines.slice(since),
+      cleanup,
+    }
+  }
+
+  /** Let microtasks and 0/1ms timers run without advancing the injected clock. */
+  async function flush(turns = 16): Promise<void> {
+    for (let n = 0; n < turns; n += 1) await vi.advanceTimersByTimeAsync(0)
+  }
+
+  /** A whole-minute `lastRun`, so the occurrences a seeded cursor owes are readable by hand. */
+  const cursor = (lastRunIso: string): Record<string, unknown> => ({
+    version: STATE_VERSION,
+    lastRun: at(lastRunIso),
+  })
+
+  /** The text of every prompt the scheduler admitted, in order. */
+  const texts = (h: V1): unknown[] => h.prompts.map((prompt) => prompt.text)
+
+  // -------------------------------------------------------------------------
+  // 1 — Admission.
+  // -------------------------------------------------------------------------
+
+  it("admits a plain v1 job file with no markdown directory, and applies the v1 defaults", async () => {
+    vi.setSystemTime(OCTOBER)
+    const h = await v1({
+      project: "v1-admit",
+      jobs: [
+        // The ten v1 fields and no others. `nightly` names four of them and leans on the rest.
+        { id: "nightly", schedule: "0 3 * * *", timezone: "Europe/Madrid", prompt: "Review the diff." },
+        {
+          id: "digest",
+          schedule: "@hourly",
+          prompt: "Post the digest.",
+          agent: "build",
+          model: "opencode/space-bunny-free",
+        },
+        // A v1 job with the work switched off is still *admitted*: it is listed, and it is not armed.
+        { id: "parked", schedule: "0 9 * * *", timezone: NEW_YORK, prompt: "Only when asked.", enabled: false },
+      ],
+      pluginOptions: { tickMs: MIN_TICK_MS },
+    })
+    await flush()
+
+    const listing = await h.list()
+    // A file that parses is a file that loads: nothing refused, nothing reported.
+    expect(listing.invalid).toEqual([])
+    expect(listing.error).toBeUndefined()
+    expect(listing.leaseHeld).toBe(true)
+
+    const jobs = (listing.jobs as Array<Record<string, unknown>>).map((job) => job.id)
+    expect(jobs).toEqual(["nightly", "digest", "parked"])
+
+    const [nightly, digest, parked] = (await h.jobs()) as Array<Record<string, unknown>>
+    expect(nightly).toMatchObject({
+      id: "nightly",
+      schedule: "0 3 * * *",
+      timezone: "Europe/Madrid",
+      enabled: true,
+      misfire: "skip",
+      runTimeoutMs: 900_000,
+      agent: null,
+      model: "session default",
+      // The cursor is armed by the first tick even though nothing has run, so `lastRun` is an instant
+      // and `lastStatus`/`lastError` are `null`: "no run yet" has to be distinguishable from "this
+      // surface does not report that", which is why the two are asserted separately.
+      lastRun: "2026-10-03T12:00:30.000Z",
+      lastStatus: null,
+      lastError: null,
+    })
+    // The macro is expanded for the arithmetic and reported as the user wrote it, so the file stays
+    // the reviewed artefact it was in v1. 14:00:30 in Madrid is 15:00 local at the next hour.
+    expect(digest).toMatchObject({
+      schedule: "@hourly",
+      agent: "build",
+      model: "opencode/space-bunny-free",
+      nextRun: "2026-10-03T13:00:00.000Z",
+    })
+    // Admitted, listed, and not armed: `enabled: false` is work with the timer switched off, so it
+    // has no cursor and therefore no `nextRun` at all.
+    expect(parked).toMatchObject({ enabled: false, nextRun: null })
+    expect(h.prompts).toEqual([])
+
+    // The defaults a v1 file does *not* state, checked at the gate itself rather than on a surface
+    // that happens not to report them. Every one is a literal, not the constant that defines it: a
+    // test reading `DEFAULT_MAX_CATCH_UP` would move with the change it is meant to catch.
+    const minimal = validateJob({ id: "plain", schedule: "@daily", prompt: "p" }, 0)
+    expect("job" in minimal ? minimal.job : minimal).toMatchObject({
+      id: "plain",
+      enabled: true,
+      misfire: "skip",
+      maxCatchUp: 5,
+      runTimeoutMs: 900_000,
+      // Derived from the host, not from the file — and from `Intl` directly rather than from the
+      // plugin, so the assertion cannot agree with the plugin by construction.
+      timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+    })
+
+    // The two v1 numeric knobs are honoured and bounded exactly as spec 001 documents them.
+    const tuned = validateJob(
+      { id: "tuned", schedule: "0 3 * * *", prompt: "p", enabled: true, misfire: "backfill", maxCatchUp: 9, runTimeoutMs: 1_000 },
+      0,
+    )
+    expect("job" in tuned ? tuned.job : tuned).toMatchObject({
+      enabled: true,
+      misfire: "backfill",
+      // `maxCatchUp` is clamped to its documented ceiling of 50, and `runTimeoutMs` to its floor of
+      // one minute: both are cost bounds, so a file cannot ask for less of them than the bound needs.
+      maxCatchUp: 9,
+      runTimeoutMs: MIN_RUN_TIMEOUT_MS,
+    })
+  })
+
+  // -------------------------------------------------------------------------
+  // 2 — `nextRun` in a zone west of UTC, in both seasons.
+  // -------------------------------------------------------------------------
+
+  it("reports the nextRun the v1 arithmetic produces, in negative-offset zones and in both seasons", async () => {
+    // The table is the claim. Each `want` is a literal instant derived by hand from the zone's offset
+    // on that date — never recomputed with `nextOccurrence`, which is the thing under test. The
+    // `local` column is the same answer read in the job's own clock, kept beside it so the diff of a
+    // failure names the zone that was wrong rather than only the instant.
+    const CASES = [
+      {
+        label: "minutely, New York, standard time (UTC-5)",
+        zone: NEW_YORK,
+        when: JANUARY,
+        schedule: "* * * * *",
+        want: "2026-01-10T12:01:00.000Z",
+        local: "2026-01-10T07:01",
+      },
+      {
+        label: "minutely, New York, daylight time (UTC-4)",
+        zone: NEW_YORK,
+        when: OCTOBER,
+        schedule: "* * * * *",
+        want: "2026-10-03T12:01:00.000Z",
+        local: "2026-10-03T08:01",
+      },
+      {
+        label: "daily at 03:00 local, New York, standard time",
+        zone: NEW_YORK,
+        when: JANUARY,
+        schedule: "0 3 * * *",
+        want: "2026-01-11T08:00:00.000Z",
+        local: "2026-01-11T03:00",
+      },
+      {
+        label: "daily at 03:00 local, New York, daylight time",
+        zone: NEW_YORK,
+        when: OCTOBER,
+        schedule: "0 3 * * *",
+        want: "2026-10-04T07:00:00.000Z",
+        local: "2026-10-04T03:00",
+      },
+      {
+        // The half-hour half. A whole-minute schedule in a `:30` zone still lands on the same UTC
+        // minute as every other whole-minute zone, so `* * * * *` above cannot see this offset at
+        // all — which is precisely why the daily rows are here.
+        label: "daily at 03:00 local, St. Johns, daylight time (UTC-2:30)",
+        zone: ST_JOHNS,
+        when: OCTOBER,
+        schedule: "0 3 * * *",
+        want: "2026-10-04T05:30:00.000Z",
+        local: "2026-10-04T03:00",
+      },
+      {
+        label: "daily at 03:00 local, St. Johns, standard time (UTC-3:30)",
+        zone: ST_JOHNS,
+        when: JANUARY,
+        schedule: "0 3 * * *",
+        want: "2026-01-11T06:30:00.000Z",
+        local: "2026-01-11T03:00",
+      },
+      {
+        // A restricted weekday, so the day branch of the walk is the one that has to be right: a
+        // cursor mis-framed by the offset lands on the wrong night, and only a schedule that
+        // rejects most days ever takes that branch.
+        label: "Mondays at 09:30 local, St. Johns (UTC-2:30), from a Saturday",
+        zone: ST_JOHNS,
+        when: at("2026-05-09T12:00:30.000Z"),
+        schedule: "30 9 * * 1",
+        want: "2026-05-11T12:00:00.000Z",
+        local: "2026-05-11T09:30",
+      },
+    ]
+
+    for (const [n, testCase] of CASES.entries()) {
+      vi.setSystemTime(testCase.when)
+      const h = await v1({
+        project: `v1-next-${n}`,
+        jobs: [{ id: "j", schedule: testCase.schedule, timezone: testCase.zone, prompt: "the j prompt" }],
+        pluginOptions: { tickMs: MIN_TICK_MS },
+      })
+      await flush()
+
+      const reported = (await h.jobs())[0]!
+      expect(reported.timezone, testCase.label).toBe(testCase.zone)
+      expect(reported.nextRun, testCase.label).toBe(testCase.want)
+      // The same instant read in the job's own clock. Secondary, and derived from `Intl`-backed
+      // reading of the literal above rather than from the plugin's answer.
+      expect(local(at(testCase.want), testCase.zone), testCase.label).toBe(testCase.local)
+      h.cleanup()
+    }
+  })
+
+  // -------------------------------------------------------------------------
+  // 3 — The cadence: what the 2026-10-03 p0 did to it.
+  // -------------------------------------------------------------------------
+
+  it("keeps a minutely v1 job minutely in New York, in both seasons", async () => {
+    for (const [season, when] of [
+      ["standard time (UTC-5)", JANUARY],
+      ["daylight time (UTC-4)", OCTOBER],
+    ] as const) {
+      vi.setSystemTime(when)
+      const h = await v1({
+        project: `v1-cadence-${season.startsWith("standard") ? "std" : "dst"}`,
+        jobs: [{ id: "j", schedule: "* * * * *", timezone: NEW_YORK, prompt: "the j prompt" }],
+        pluginOptions: { tickMs: MIN_TICK_MS },
+      })
+      await flush()
+
+      // Five consecutive readings of the surface a user actually reads, one per minute of the
+      // injected clock. The assertion is on the **steps**, because that is the symptom: the defect
+      // reported a `* * * * *` job in New York firing every 241 minutes in summer and 301 in winter,
+      // and no assertion on a single next run would have shown it. Every reported instant is on a
+      // minute boundary, so a correct cadence is exactly one minute per step.
+      const seen: string[] = []
+      for (let minute = 0; minute < 5; minute += 1) {
+        seen.push((await h.jobs())[0]!.nextRun as string)
+        await vi.advanceTimersByTimeAsync(MINUTE_MS)
+        await flush()
+      }
+      const steps = seen.slice(1).map((iso, i) => at(iso) - at(seen[i]!))
+      expect(steps, season).toEqual([MINUTE_MS, MINUTE_MS, MINUTE_MS, MINUTE_MS])
+      // …and the first reading is the hand-derived literal, so the table above and the cadence agree.
+      expect(seen[0], season).toBe(season.startsWith("standard") ? "2026-01-10T12:01:00.000Z" : "2026-10-03T12:01:00.000Z")
+      h.cleanup()
+    }
+  })
+
+  // -------------------------------------------------------------------------
+  // 4 — The arithmetic and the dispatch agree.
+  // -------------------------------------------------------------------------
+
+  it("dispatches the occurrence it reported, and nothing before it", async () => {
+    vi.setSystemTime(OCTOBER)
+    const h = await v1({
+      project: "v1-fire",
+      jobs: [{ id: "j", schedule: "* * * * *", timezone: NEW_YORK, prompt: "the j prompt" }],
+      pluginOptions: { tickMs: MIN_TICK_MS },
+    })
+    await flush()
+
+    const nextRun = (await h.jobs())[0]!.nextRun as string
+    expect(nextRun).toBe("2026-10-03T12:01:00.000Z")
+
+    // Nothing before the instant it promised: four ticks, all of them inside the same minute.
+    await vi.advanceTimersByTimeAsync(MIN_TICK_MS * 4)
+    await flush()
+    expect(h.prompts).toEqual([])
+
+    // …and the run at it carries that instant as the occurrence it satisfied, so the reported
+    // `nextRun` and the billable run are the same moment rather than two computations that agree.
+    // Two more ticks: the five-second boundary lands exactly on 12:01:00Z.
+    await vi.advanceTimersByTimeAsync(MIN_TICK_MS * 2)
+    await flush()
+    expect(texts(h)).toEqual(["the j prompt"])
+    const runs = await h.history("j")
+    expect(runs).toHaveLength(1)
+    expect(runs[0]!.dueAt).toBe(nextRun)
+  })
+
+  // -------------------------------------------------------------------------
+  // 5 — The cap.
+  // -------------------------------------------------------------------------
+
+  it("admits one run at a time by default, and spends the occurrence the cap turned away", async () => {
+    vi.setSystemTime(OCTOBER)
+    // Two jobs due on the same occurrence and one global budget. No `maxConcurrentRuns` option, so
+    // this is the documented default of 1 being read, not a number the test supplied.
+    const h = await v1({
+      project: "v1-cap",
+      jobs: [
+        { id: "first", schedule: "* * * * *", timezone: NEW_YORK, prompt: "the first prompt" },
+        { id: "second", schedule: "* * * * *", timezone: NEW_YORK, prompt: "the second prompt" },
+      ],
+      seed: {
+        "scheduled-tasks/first": cursor("2026-10-03T11:59:00.000Z"),
+        "scheduled-tasks/second": cursor("2026-10-03T11:59:00.000Z"),
+      },
+      pluginOptions: { tickMs: MIN_TICK_MS },
+    })
+    await flush()
+
+    // Exactly one run, and it is the first job the file lists — the budget is spent in file order.
+    expect(texts(h)).toEqual(["the first prompt"])
+
+    const second = (await h.jobs()).find((job) => job.id === "second")!
+    expect(second).toMatchObject({ lastStatus: "skipped" })
+    // The other job ran, so the cap is what turned this one away rather than anything about it.
+    expect((await h.jobs()).find((job) => job.id === "first")).toMatchObject({ lastStatus: "ok" })
+    expect(h.logged().filter((line) => line.includes("skipping second"))).toHaveLength(1)
+    expect(h.logged().find((line) => line.includes("skipping second"))).toContain("concurrency cap reached (1/1)")
+
+    // **Skipped, never queued**: four more ticks, all inside the same minute and therefore the same
+    // occurrence, replay nothing. A scheduler that queued the occurrence would spend a run here.
+    await vi.advanceTimersByTimeAsync(MIN_TICK_MS * 4)
+    await flush()
+    expect(texts(h)).toEqual(["the first prompt"])
+    expect((await h.jobs()).find((job) => job.id === "second")).toMatchObject({ lastStatus: "skipped" })
+    expect(await h.history("second")).toEqual([])
+  })
+
+  it("honours a raised cap, so the default of one is a default rather than a constant", async () => {
+    vi.setSystemTime(OCTOBER)
+    const sameTwo = [
+      { id: "first", schedule: "* * * * *", timezone: NEW_YORK, prompt: "the first prompt" },
+      { id: "second", schedule: "* * * * *", timezone: NEW_YORK, prompt: "the second prompt" },
+    ]
+    const seed = {
+      "scheduled-tasks/first": cursor("2026-10-03T11:59:00.000Z"),
+      "scheduled-tasks/second": cursor("2026-10-03T11:59:00.000Z"),
+    }
+
+    // One at a time, without the option.
+    const capped = await v1({ project: "v1-cap-one", jobs: sameTwo, seed, pluginOptions: { tickMs: MIN_TICK_MS } })
+    await flush()
+    expect(texts(capped)).toEqual(["the first prompt"])
+    capped.cleanup()
+
+    // Both, with it. Same jobs, same cursors, same minute — so the difference is the budget and
+    // nothing else, which is what stops the default from being mistaken for a hard-coded one.
+    const roomy = await v1({
+      project: "v1-cap-two",
+      jobs: sameTwo,
+      seed,
+      pluginOptions: { tickMs: MIN_TICK_MS, maxConcurrentRuns: 2 },
+    })
+    await flush()
+    expect(texts(roomy)).toEqual(["the first prompt", "the second prompt"])
+    expect((await roomy.jobs()).every((job) => job.lastStatus === "ok")).toBe(true)
+  })
+
+  // -------------------------------------------------------------------------
+  // 6 — Misfire: `skip` collapses the backlog.
+  // -------------------------------------------------------------------------
+
+  it("collapses a v1 backlog to one run under the default misfire policy, and reports the rest", async () => {
+    vi.setSystemTime(OCTOBER)
+    // Eight minutes of `* * * * *` owed: the window (11:52:00, 12:00:30] holds 11:53:00 … 12:00:00.
+    // No `misfire` in the file, so this is the v1 default of `skip` being applied.
+    const h = await v1({
+      project: "v1-skip",
+      jobs: [{ id: "collapsing", schedule: "* * * * *", timezone: NEW_YORK, prompt: "the collapsing prompt" }],
+      seed: { "scheduled-tasks/collapsing": cursor("2026-10-03T11:52:00.000Z") },
+      pluginOptions: { tickMs: MIN_TICK_MS },
+    })
+    await flush()
+
+    expect(texts(h)).toEqual(["the collapsing prompt"])
+    const runs = await h.history("collapsing")
+    expect(runs).toHaveLength(1)
+    // One decision, the oldest occurrence it stood for, and an honest account of the seven it did not.
+    expect(runs[0]).toMatchObject({
+      dueAt: "2026-10-03T11:53:00.000Z",
+      outcome: "ok",
+      dropped: 7,
+    })
+    // Collapsed, not merely deferred: the next run is the **new** occurrence, not a replay of the
+    // backlog. A scheduler that had queued the other seven would spend a run per minute here.
+    await vi.advanceTimersByTimeAsync(MINUTE_MS)
+    await flush()
+    const both = await h.history("collapsing")
+    expect(both.map((run) => run.dueAt)).toEqual([
+      "2026-10-03T12:01:00.000Z",
+      "2026-10-03T11:53:00.000Z",
+    ])
+    // …and the new run carries no remainder, because there was none: `dropped` is presence-only, so
+    // its absence means "this run was the whole backlog" rather than "not known".
+    expect(both[0]).not.toHaveProperty("dropped")
+  })
+
+  // -------------------------------------------------------------------------
+  // 7 — Misfire: `backfill` replays, and the remainder is reported.
+  // -------------------------------------------------------------------------
+
+  it("replays a backfill backlog oldest-first, one occurrence per tick, and reports the remainder", async () => {
+    vi.setSystemTime(OCTOBER)
+    // Six owed (11:55:00 … 12:00:00) with `maxCatchUp: 3`: three replayed, three reported as dropped.
+    const h = await v1({
+      project: "v1-backfill",
+      jobs: [
+        {
+          id: "replaying",
+          schedule: "* * * * *",
+          timezone: NEW_YORK,
+          prompt: "the replaying prompt",
+          misfire: "backfill",
+          maxCatchUp: 3,
+        },
+      ],
+      seed: { "scheduled-tasks/replaying": cursor("2026-10-03T11:54:00.000Z") },
+      pluginOptions: { tickMs: MIN_TICK_MS },
+    })
+    await flush()
+
+    // The first tick spends one occurrence — and the plan for the rest is **durable**, on the job's
+    // own state record under its v1 key, so a restart here would not lose work the user asked for.
+    expect(texts(h)).toEqual(["the replaying prompt"])
+    expect((await h.history("replaying"))[0]).toMatchObject({
+      dueAt: "2026-10-03T11:55:00.000Z",
+      dropped: 3,
+    })
+    expect(h.store.get("scheduled-tasks/replaying")).toMatchObject({
+      catchUp: {
+        pending: [at("2026-10-03T11:56:00.000Z"), at("2026-10-03T11:57:00.000Z")],
+        dropped: 3,
+      },
+    })
+
+    // Two more ticks, two more occurrences, oldest first.
+    await vi.advanceTimersByTimeAsync(MIN_TICK_MS * 2)
+    await flush()
+    expect(h.prompts).toHaveLength(3)
+    const runs = await h.history("replaying")
+    expect(runs.map((run) => run.dueAt)).toEqual([
+      "2026-10-03T11:57:00.000Z",
+      "2026-10-03T11:56:00.000Z",
+      "2026-10-03T11:55:00.000Z",
+    ])
+    // The remainder rides **every** record of the backlog, not only the first: a reader holding any
+    // one of them is owed the fact that it stood for a truncated backlog.
+    for (const run of runs) expect(run).toMatchObject({ dropped: 3, outcome: "ok" })
+
+    // And the record's key set, which is where this block draws the v1 line: the five fields the v1
+    // contract names, plus exactly one later addition and nothing else. See test 10 for the split.
+    for (const run of runs) {
+      expect(Object.keys(run).sort()).toEqual(["dropped", "dueAt", "model", "outcome", "sessionID", "startedAt"])
+    }
+
+    // A drained plan leaves nothing behind, so "this job is owed nothing" needs no field to say so.
+    await vi.advanceTimersByTimeAsync(MIN_TICK_MS)
+    await flush()
+    expect(h.prompts).toHaveLength(3)
+    expect((h.store.get("scheduled-tasks/replaying") as { catchUp?: unknown }).catchUp).toBeUndefined()
+  })
+
+  // -------------------------------------------------------------------------
+  // 8 — `backfill` owes what the cap turned away.
+  // -------------------------------------------------------------------------
+
+  it("keeps a deferred backfill occurrence owed rather than spent, and runs it when a slot frees", async () => {
+    vi.setSystemTime(OCTOBER)
+    // Two `backfill` jobs each owing **one** occurrence (12:00:00), one global slot. One each is
+    // deliberate: a job with a second occurrence still owed would spend the next tick's slot on it
+    // before the deferred one got its turn, and the race this test is about would not happen.
+    const h = await v1({
+      project: "v1-owed",
+      jobs: [
+        { id: "alpha", schedule: "* * * * *", timezone: NEW_YORK, prompt: "the alpha prompt", misfire: "backfill" },
+        { id: "beta", schedule: "* * * * *", timezone: NEW_YORK, prompt: "the beta prompt", misfire: "backfill" },
+      ],
+      seed: {
+        "scheduled-tasks/alpha": cursor("2026-10-03T11:59:00.000Z"),
+        "scheduled-tasks/beta": cursor("2026-10-03T11:59:00.000Z"),
+      },
+      pluginOptions: { tickMs: MIN_TICK_MS },
+    })
+    await flush()
+
+    // The slot went to the first job the file lists, exactly as the cap test above established.
+    expect(texts(h)).toEqual(["the alpha prompt"])
+
+    // **Owed, not spent.** The occurrence `beta` lost the slot for is still on its plan, in storage,
+    // under beta's own v1 state key; `beta` is not marked skipped; and no run record exists for it.
+    // A scheduler that *spent* it here would have quietly turned a `backfill` job into a `skip` one
+    // the first time it lost a race — which is the old simplification this box must not assert.
+    const owed = h.store.get("scheduled-tasks/beta") as { catchUp?: { pending: number[] }; lastStatus?: string }
+    expect(owed.catchUp?.pending).toEqual([at("2026-10-03T12:00:00.000Z")])
+    expect(owed.lastStatus).toBeUndefined()
+    expect(await h.history("beta")).toEqual([])
+
+    // The next tick spends the **plan** rather than the window: `beta` runs the occurrence it was
+    // owed, at the instant it was originally due — not a fresh one — and it succeeds.
+    await vi.advanceTimersByTimeAsync(MIN_TICK_MS)
+    await flush()
+    expect(texts(h)).toEqual(["the alpha prompt", "the beta prompt"])
+    expect((await h.history("beta"))[0]).toMatchObject({
+      dueAt: "2026-10-03T12:00:00.000Z",
+      outcome: "ok",
+    })
+    expect((await h.jobs()).find((job) => job.id === "beta")).toMatchObject({ lastStatus: "ok" })
+  })
+
+  // -------------------------------------------------------------------------
+  // 9 — The malformed file (spec 001 box 89, **as amended**).
+  // -------------------------------------------------------------------------
+
+  it("names a broken schedules.json once, and stays loaded and inert", async () => {
+    vi.setSystemTime(OCTOBER)
+    // Two shapes of broken file, because "broken" is two code paths and the answer has to be the
+    // same for both. The first cannot be read at all — the read throws, and the failure names the
+    // file. The second reads and is not a job file — `version: 1` and no `jobs` array — which is a
+    // refusal of the file rather than a failure to read it, and takes the other reporting path.
+    const CASES = [
+      {
+        label: "unreadable",
+        project: "v1-broken-unreadable",
+        file: '{ "version": 1, "jobs": [ { "id": "j", schedule: "0 3 * * *"',
+        error: /\.opencode\/schedules\.json: .+/,
+      },
+      {
+        label: "reads, but is not a job file",
+        project: "v1-broken-shape",
+        file: '{ "version": 1 }',
+        error: /job file has no `jobs` array/,
+      },
+    ]
+
+    for (const testCase of CASES) {
+      const mark = consoleLines.length
+      const h = await v1({ project: testCase.project, file: testCase.file })
+
+      // The reachable half of the amended invariant: **a broken file does not cost the project its
+      // silence.** `setup` resolved, every tool is registered and answering, and the failure is named
+      // on the surface — with what went wrong, which is what makes it fixable.
+      const listing = await h.list()
+      expect(listing.jobs, testCase.label).toEqual([])
+      expect(listing.invalid, testCase.label).toEqual([])
+      expect(listing.error, testCase.label).toMatch(testCase.error)
+
+      // Exactly one line names it. Not zero — a project that says nothing about a file it cannot read
+      // is the failure mode the amendment exists to prevent — and not one per tick, because the file
+      // is read once at setup.
+      expect(h.logged(mark).filter((line) => line.includes("no enabled jobs ("))).toHaveLength(1)
+      // The inert-project notice carries the reason, so the one line a reader finds is the useful one.
+      expect(h.logged(mark).some((line) => line.includes("no timer armed"))).toBe(true)
+
+      // Inert, and inert *deliberately*: no jobs means no writer lease and no polling, which is spec
+      // 001's "a job set with zero enabled jobs arms no timer". A broken file is a job set of zero.
+      expect(listing.leaseHeld, testCase.label).toBe(false)
+      expect(existsSync(leasePath(h.dir, testCase.project)), testCase.label).toBe(false)
+
+      // And it stays that way across ticks rather than becoming a hot loop of failures.
+      await vi.advanceTimersByTimeAsync(MIN_TICK_MS * 4)
+      await flush()
+      expect(h.logged(mark).filter((line) => line.includes("no enabled jobs ("))).toHaveLength(1)
+      expect((await h.list()).error, testCase.label).toMatch(testCase.error)
+      h.cleanup()
+    }
+  })
+
+  it("keeps a v1 project's jobs when one job in its file is broken", async () => {
+    vi.setSystemTime(OCTOBER)
+    // The other half of the same invariant, and the one that is reachable without a second surface:
+    // a file that is partly broken costs the project **neither its jobs nor its silence**. The good
+    // job runs; the broken one is refused *by name*, with the expression that was wrong, and the
+    // refusal does not become a silent omission.
+    //
+    // The cross-surface half — a broken `schedules.json` while markdown jobs are carrying the
+    // schedule — needs a markdown directory and is pinned by "still reports a corrupt schedules.json
+    // when markdown jobs are carrying the schedule", which this block deliberately does not duplicate.
+    const h = await v1({
+      project: "v1-partly-broken",
+      jobs: [
+        { id: "keeper", schedule: "* * * * *", timezone: NEW_YORK, prompt: "the keeper prompt" },
+        { id: "busted", schedule: "0 3 32 * *", timezone: NEW_YORK, prompt: "the busted prompt" },
+      ],
+      seed: { "scheduled-tasks/keeper": cursor("2026-10-03T11:59:00.000Z") },
+      pluginOptions: { tickMs: MIN_TICK_MS },
+    })
+    await flush()
+
+    // The jobs still in force, running.
+    expect(texts(h)).toEqual(["the keeper prompt"])
+    expect((await h.list()).jobs).toHaveLength(1)
+    // …and the refused one, named.
+    const invalid = (await h.list()).invalid as Array<Record<string, unknown>>
+    expect(invalid).toHaveLength(1)
+    expect(invalid[0]).toMatchObject({ id: "busted", schedule: "0 3 32 * *" })
+    expect(invalid[0]!.reason).toMatch(/busted/)
+    expect(invalid[0]!.reason).toMatch(/32/)
+  })
+
+  // -------------------------------------------------------------------------
+  // 10 — The run record.
+  // -------------------------------------------------------------------------
+
+  it("writes a run record with exactly the fields the v1 contract names", async () => {
+    vi.setSystemTime(OCTOBER)
+    const h = await v1({
+      project: "v1-record",
+      jobs: [
+        {
+          id: "recorded",
+          schedule: "* * * * *",
+          timezone: NEW_YORK,
+          prompt: "the recorded prompt",
+          model: "opencode/space-bunny-free",
+        },
+      ],
+      seed: { "scheduled-tasks/recorded": cursor("2026-10-03T11:59:00.000Z") },
+      pluginOptions: { tickMs: MIN_TICK_MS },
+    })
+    await flush()
+
+    // **The v1 set**, spelled out. spec 001's audit names it verbatim — one record
+    // `{dueAt, startedAt, outcome, model, sessionID}` — and § Failure adds `error` for a run that
+    // failed, which this one did not. Everything else on `HistoryEntry` was added afterwards and is
+    // optional, so the claim here is not "v2 added nothing": it is that **the v1 fields are all
+    // present, correctly valued, and that nothing is present which a v1 reader would choke on.**
+    const V1_FIELDS = ["dueAt", "model", "outcome", "sessionID", "startedAt"]
+    const LATER_ADDITIONS = ["asksAsDeny", "dropped", "droppedCapped", "inMemoryOnly"]
+
+    const runs = await h.history("recorded")
+    expect(runs).toHaveLength(1)
+    const [run] = runs as Array<Record<string, unknown>>
+    expect(Object.keys(run!).sort()).toEqual(V1_FIELDS)
+    // Presence is half of it; each of the five carries the value v1 put there.
+    expect(run).toMatchObject({
+      dueAt: "2026-10-03T12:00:00.000Z",
+      outcome: "ok",
+      model: "opencode/space-bunny-free",
+      sessionID: "ses_v1-record",
+    })
+    expect(new Date(run!.startedAt as string).getTime()).toBeGreaterThanOrEqual(at("2026-10-03T12:00:00.000Z"))
+    // Every later addition is absent here, because this run had nothing for any of them to say. They
+    // are presence-only by design, so an absent field is an answer and not a gap.
+    for (const field of LATER_ADDITIONS) expect(run, field).not.toHaveProperty(field)
+
+    // The same five keys in **storage**, before any surface converted them to ISO strings — so the
+    // claim is about what the plugin writes, not about what a reader renders.
+    const stored = h.store.get("scheduled-tasks/history/recorded") as Array<Record<string, unknown>>
+    expect(Object.keys(stored[0]!).sort()).toEqual(V1_FIELDS)
+    expect(stored[0]).toMatchObject({
+      dueAt: at("2026-10-03T12:00:00.000Z"),
+      outcome: "ok",
+      model: "opencode/space-bunny-free",
+      sessionID: "ses_v1-record",
+    })
+
+    // And where a later addition *does* have something to say, the v1 five are untouched and it is
+    // the only thing added — asserted on the backfill record, whose backlog had a remainder.
+    const truncated = await v1({
+      project: "v1-record-dropped",
+      jobs: [
+        {
+          id: "replaying",
+          schedule: "* * * * *",
+          timezone: NEW_YORK,
+          prompt: "the replaying prompt",
+          misfire: "backfill",
+          maxCatchUp: 2,
+        },
+      ],
+      seed: { "scheduled-tasks/replaying": cursor("2026-10-03T11:56:00.000Z") },
+      pluginOptions: { tickMs: MIN_TICK_MS },
+    })
+    await flush()
+    const [withRemainder] = await truncated.history("replaying")
+    expect(Object.keys(withRemainder!).sort()).toEqual([...V1_FIELDS, "dropped"].sort())
+    // Four owed (11:57:00 … 12:00:00), `maxCatchUp: 2`, so two replayed and two dropped.
+    expect(withRemainder).toMatchObject({ dropped: 2, outcome: "ok" })
+  })
+
+  it("records a failed v1 run with the message it threw, in the v1 fields", async () => {
+    vi.setSystemTime(OCTOBER)
+    const h = await v1({
+      project: "v1-record-failed",
+      jobs: [{ id: "flaky", schedule: "* * * * *", timezone: NEW_YORK, prompt: "the flaky prompt" }],
+      seed: { "scheduled-tasks/flaky": cursor("2026-10-03T11:59:00.000Z") },
+      pluginOptions: { tickMs: MIN_TICK_MS },
+      promptError: "provider refused the request",
+    })
+    await flush()
+
+    // `error` is the sixth v1 field, and it is what makes a failed run attributable: spec 001 §
+    // Failure requires the message on the record, not only a status.
+    const [run] = await h.history("flaky")
+    expect(Object.keys(run!).sort()).toEqual(["dueAt", "error", "model", "outcome", "sessionID", "startedAt"])
+    expect(run).toMatchObject({ outcome: "failed", error: "provider refused the request" })
+    expect((await h.jobs())[0]).toMatchObject({ lastStatus: "failed", lastError: "provider refused the request" })
+  })
+
+  // -------------------------------------------------------------------------
+  // 11 — Key layout: an upgrade in place does not orphan a v1 user's history.
+  // -------------------------------------------------------------------------
+
+  it("puts state and history under the keys v1 used, and nothing else", async () => {
+    vi.setSystemTime(OCTOBER)
+    const h = await v1({
+      project: "v1-keys",
+      jobs: [{ id: "nightly", schedule: "* * * * *", timezone: NEW_YORK, prompt: "the nightly prompt" }],
+      seed: { "scheduled-tasks/nightly": cursor("2026-10-03T11:59:00.000Z") },
+      pluginOptions: { tickMs: MIN_TICK_MS },
+    })
+    await flush()
+
+    // Two keys, spelled out. These are the names v1 wrote, and they are the whole claim: a state
+    // record and a run history, both under the plugin's prefix, both keyed by the job id — which is
+    // the id in the reviewed job file, so nothing here needs a mapping to find them again.
+    expect([...h.store.keys()].sort()).toEqual(["scheduled-tasks/history/nightly", "scheduled-tasks/nightly"])
+  })
+
+  it("reads a v1 install's own records back at the same keys, and appends to them", async () => {
+    vi.setSystemTime(OCTOBER)
+    // What a v1 install left behind, written by hand in the v1 shapes: a state record at
+    // `scheduled-tasks/<id>` and a history at `scheduled-tasks/history/<id>` whose record carries only
+    // the five v1 fields. This is the **upgrade in place**: the file is the same file, the plugin is
+    // the current one, and the store is the one the old version wrote.
+    //
+    // The cursor is one minute behind the injected clock, so the first tick owes nothing and only
+    // arms `nextRun` — which is the state this test needs to read the v1 record *before* this run
+    // adds one of its own.
+    const v1LastRun = at("2026-10-03T12:00:00.000Z")
+    const v1Record = {
+      dueAt: v1LastRun,
+      startedAt: v1LastRun,
+      outcome: "ok" as const,
+      model: "opencode/space-bunny-free",
+      sessionID: "ses_from_v1",
+    }
+    const store = {
+      "scheduled-tasks/nightly": { version: STATE_VERSION, lastRun: v1LastRun, lastStatus: "ok" },
+      "scheduled-tasks/history/nightly": [v1Record],
+    }
+
+    const h = await v1({
+      project: "v1-upgrade",
+      jobs: [{ id: "nightly", schedule: "* * * * *", timezone: NEW_YORK, prompt: "the nightly prompt" }],
+      seed: store,
+      pluginOptions: { tickMs: MIN_TICK_MS },
+    })
+    await flush()
+
+    // The v1 state record is read, not re-initialised: continuity is the whole point of the key.
+    expect((await h.jobs())[0]).toMatchObject({
+      lastStatus: "ok",
+      lastRun: "2026-10-03T12:00:00.000Z",
+    })
+    // The v1 history record survives `loadHistory` — which drops any record it cannot vouch for, so
+    // a reader finding it whole is evidence the shape was accepted and not silently discarded.
+    expect(await h.history("nightly")).toEqual([
+      {
+        dueAt: "2026-10-03T12:00:00.000Z",
+        startedAt: "2026-10-03T12:00:00.000Z",
+        outcome: "ok",
+        model: "opencode/space-bunny-free",
+        sessionID: "ses_from_v1",
+      },
+    ])
+
+    // A new run **appends to the v1 ring at the v1 key** rather than starting a fresh one. An orphan
+    // would look identical from the tool's point of view — one record, the new one — so the assertion
+    // is on the pair: both records, in one ring, under one key.
+    await vi.advanceTimersByTimeAsync(MINUTE_MS)
+    await flush()
+    const both = await h.history("nightly")
+    expect(both.map((run) => run.sessionID)).toEqual([`ses_v1-upgrade`, "ses_from_v1"])
+    expect(h.store.get("scheduled-tasks/history/nightly")).toHaveLength(2)
+  })
+})
