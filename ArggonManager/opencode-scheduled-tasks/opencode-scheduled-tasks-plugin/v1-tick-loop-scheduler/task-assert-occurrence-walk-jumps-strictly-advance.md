@@ -4,6 +4,7 @@ status: in_progress
 id: task-assert-occurrence-walk-jumps-strictly-advance
 title: Nothing asserts the occurrence walk advances — a bad jump hangs the suite instead of failing it
 assignee: arggon
+branch: chore/task-assert-occurrence-walk-jumps-strictly-advance
 parent: v1-tick-loop-scheduler
 labels: []
 priority: p1
