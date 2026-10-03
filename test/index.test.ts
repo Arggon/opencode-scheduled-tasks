@@ -7,8 +7,12 @@ import { spawnSync } from "node:child_process"
 import plugin, {
   CronError,
   DEFAULT_MAX_CATCH_UP,
+  DEFAULT_RUN_TIMEOUT_MS,
   MINUTE_MS,
+  MIN_RUN_TIMEOUT_MS,
+  MAX_RUN_TIMEOUT_MS,
   DATA_DIR_ENV,
+  JOB_FORMAT_REFERENCE,
   STATE_VERSION,
   acquireLease,
   dayMatches,
@@ -34,6 +38,7 @@ import plugin, {
   validateJob,
   validateLoop,
   validateOneOff,
+  validatePermissions,
   wallParts,
   MAX_FRONTMATTER_CHARS,
   MAX_HISTORY_LIMIT,
@@ -2520,6 +2525,142 @@ describe("schedules_format (T1)", () => {
       expect(ref.length).toBeLessThan(4000)
     } finally {
       ;(cleanup as () => void)?.()
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+})
+
+/**
+ * The reference is the *machine-readable* answer to "what is valid?", so a wrong value in it is
+ * worse than a wrong value in prose: it looks authoritative to anything that reads it.
+ *
+ * This block is the assertion that was missing. Nothing compared the reference against the parser,
+ * which is exactly why the two were free to disagree — the reference advertised `30s` for a field
+ * clamped to a one-minute floor, so an agent copying its own example got a run twice as long as
+ * the one it asked for. Every claim below is checked against the code that has to be true, not
+ * against a snapshot of the text.
+ */
+describe("schedules_format reference cannot drift from the parser", () => {
+  /** One field-table row, by field name. Absent row ⇒ the test fails, not skips. */
+  const fieldRow = (field: string): string => {
+    const row = JOB_FORMAT_REFERENCE.split("\n").find((line) => line.startsWith(`| \`${field}\` |`))
+    expect(row, `the reference has no row for \`${field}\``).toBeDefined()
+    return row!
+  }
+
+  /** Every backticked token in a row — the only code-shaped things the reference hands out. */
+  const tokens = (row: string): string[] => [...row.matchAll(/`([^`]+)`/g)].map((match) => match[1]!)
+
+  /** What the job file loader actually resolves `runTimeout` to, or `"refused"`. */
+  const resolvedTimeout = (runTimeout: unknown): number | "refused" => {
+    const result = validateJob({ id: "ref", schedule: "@daily", prompt: "p", runTimeout }, 0)
+    return "reason" in result ? "refused" : result.job.runTimeoutMs
+  }
+
+  it("advertises only runTimeout values the parser uses exactly as written", () => {
+    // `runTimeout` is clamped to a floor and a ceiling, so an example outside that window is a
+    // lie the moment it is copied: the reader gets a value different from the one shown.
+    const examples = tokens(fieldRow("runTimeout")).filter((token) => {
+      const parsed = parseDuration(token)
+      return parsed !== undefined && !("reason" in parsed)
+    })
+    // Guard the guard. A row that advertised nothing at all would pass the loop vacuously, which
+    // is the same defect wearing a different hat — a reference that says less than it should.
+    expect(examples.length).toBeGreaterThanOrEqual(4)
+    for (const example of examples) {
+      const parsed = parseDuration(example) as { ms: number }
+      expect(resolvedTimeout(example), `\`${example}\` is advertised but does not resolve as written`).toBe(
+        parsed.ms,
+      )
+    }
+  })
+
+  it("states the clamp as the parser applies it, rather than restating the bounds", () => {
+    const row = fieldRow("runTimeout")
+    // The window the reference prints is interpolated from these constants in src/index.ts, so it
+    // cannot drift. What this pins is that the constants it interpolates are still the ones the
+    // clamp enforces: a sub-floor value lands on the floor, a super-ceiling one on the ceiling.
+    expect(resolvedTimeout("30s")).toBe(MIN_RUN_TIMEOUT_MS)
+    expect(resolvedTimeout("45")).toBe(MIN_RUN_TIMEOUT_MS)
+    expect(resolvedTimeout("2d")).toBe(MAX_RUN_TIMEOUT_MS)
+    expect(row).toContain(`\`${MIN_RUN_TIMEOUT_MS / MINUTE_MS}m\``)
+    expect(row).toContain(`\`${MAX_RUN_TIMEOUT_MS / (60 * MINUTE_MS)}h\``)
+    expect(row).toContain(`\`${DEFAULT_RUN_TIMEOUT_MS / MINUTE_MS}m\``)
+    expect(row).toMatch(/clamp/i)
+    // Clamped, never refused: out of window is still a job, it just runs for the window.
+    expect(resolvedTimeout("250ms")).toBe(MIN_RUN_TIMEOUT_MS)
+    expect(resolvedTimeout("0s")).toBe("refused")
+  })
+
+  it("documents `session` with both modes, the default, and what each mode decides", () => {
+    const row = fieldRow("session")
+    const modes = [...new Set(tokens(row).filter((token) => token === "reuse" || token === "fresh"))]
+    // Both, because an agent told about only one of them assumes it is the only option — and that
+    // the default is whatever it was not told about.
+    expect(modes.sort()).toEqual(["fresh", "reuse"])
+    expect(row).toMatch(/default/i)
+    // Each mode says what it decides: `reuse` keeps context, `fresh` starts clean.
+    expect(row).toMatch(/reuse[\s\S]*session per job/i)
+    expect(row).toMatch(/fresh[\s\S]*new session per run/i)
+    // The modes the reference names are exactly the modes the parser accepts…
+    for (const mode of modes) {
+      const result = validateJob({ id: "ref", schedule: "@daily", prompt: "p", session: mode }, 0)
+      expect("reason" in result, `\`${mode}\` is advertised but the parser refuses it`).toBe(false)
+    }
+    // …and an unlisted one is refused by name rather than quietly defaulted to `reuse`.
+    expect(validateJob({ id: "ref", schedule: "@daily", prompt: "p", session: "keep" }, 0)).toHaveProperty(
+      "reason",
+    )
+  })
+
+  it("documents `permissions` with the schema the validator accepts and its inherited default", () => {
+    const row = fieldRow("permissions")
+    // The three effects, in the validator's own vocabulary.
+    expect(tokens(row).filter((token) => ["allow", "ask", "deny"].includes(token)).sort()).toEqual([
+      "allow",
+      "ask",
+      "deny",
+    ])
+    // Both rule shapes the reference names, and one value it must not accept.
+    expect(validatePermissions({ bash: "deny" })).toHaveProperty("permissions")
+    expect(validatePermissions({ bash: { "*": "deny", "git diff *": "allow" } })).toHaveProperty("permissions")
+    expect(validatePermissions({ edit: "maybe" })).toHaveProperty("reason")
+    // Absent means the session default is inherited unchanged — there is deliberately no implicit
+    // tightening — so the reference has to say so, or the field reads as required narrowing.
+    expect(row).toMatch(/absent/i)
+    expect(row).toMatch(/inherit/i)
+    // The consequence, not only the shape: nobody is there to answer an `ask` on an unattended run.
+    expect(JOB_FORMAT_REFERENCE).toMatch(/treat it as a deny/)
+  })
+
+  it("honours `session` and `permissions` on the markdown surface too, as the reference claims", async () => {
+    // The reference documents *both* surfaces, so a field it lists has to mean the same thing in
+    // both. Markdown goes through `validateJob` unchanged (ADR 0004's single validation path); this
+    // is that claim checked rather than assumed, and it also pins the two markdown-specific facts
+    // the table states — the stem is the id, the body after the frontmatter is the prompt.
+    const dir = mkdtempSync(join(tmpdir(), "st-ref-tasks-"))
+    const tasks = join(dir, ".opencode", "tasks")
+    mkdirSync(tasks, { recursive: true })
+    setYamlReader(
+      readerReturning({
+        schedule: "0 3 * * *",
+        session: "fresh",
+        permissions: { bash: { "*": "deny", "git diff *": "allow" } },
+      }),
+    )
+    try {
+      writeFileSync(join(tasks, "nightly.md"), taskFile('schedule: "0 3 * * *"', "Review the diff."))
+      const { jobs, invalid } = await loadMarkdownJobs(tasks)
+      expect(invalid).toEqual([])
+      expect(jobs).toHaveLength(1)
+      expect(jobs[0]).toMatchObject({
+        id: "nightly",
+        prompt: "Review the diff.",
+        session: "fresh",
+        permissions: { bash: { "*": "deny", "git diff *": "allow" } },
+      })
+    } finally {
+      setYamlReader(undefined)
       rmSync(dir, { recursive: true, force: true })
     }
   })
