@@ -1,6 +1,6 @@
 ---
 type: bug
-status: in_progress
+status: done
 id: bug-next-occurrence-walks-utc-wall-parts-in-any-zone-west-of-utc
 title: nextOccurrence advances by |offset|+1 minutes in any zone west of UTC — a minutely job in New York fires every 4 hours
 assignee: arggon
@@ -10,7 +10,6 @@ labels: []
 priority: p0
 created: "2026-10-03"
 updated: "2026-10-03"
-claimed_at: "2026-10-03T01:59:19.706Z"
 ---
 <!--
   Placement (v0): ArggonManager/opencode-scheduled-tasks/opencode-scheduled-tasks-plugin/v1-tick-loop-scheduler/bug-next-occurrence-walks-utc-wall-parts-in-any-zone-west-of-utc.md
