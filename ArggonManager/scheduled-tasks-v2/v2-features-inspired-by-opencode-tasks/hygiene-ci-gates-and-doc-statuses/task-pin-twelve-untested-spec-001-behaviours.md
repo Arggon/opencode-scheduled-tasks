@@ -4,6 +4,7 @@ status: in_progress
 id: task-pin-twelve-untested-spec-001-behaviours
 title: Twelve spec 001 behaviours are true but unpinned by any test
 assignee: arggon
+branch: fix/task-pin-twelve-untested-spec-001-behaviours
 parent: hygiene-ci-gates-and-doc-statuses
 labels: []
 priority: p2
