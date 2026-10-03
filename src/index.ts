@@ -2388,7 +2388,12 @@ function underLeaseBase(id: string, leaf: string): string {
   return join(root, escapeProjectId(id), leaf)
 }
 
-/** Lockfile path for one project. The id is sanitized, so it is never a path component. */
+/**
+ * Lockfile path for one project.
+ *
+ * The id contributes exactly one sanitized component — see `safeProjectId` for the allowlist and
+ * `underLeaseBase` for the resolved-path containment the composition is checked against.
+ */
 export function leasePath(directory: string, id: string): string {
   return underLeaseBase(id, "writer.lock")
 }
