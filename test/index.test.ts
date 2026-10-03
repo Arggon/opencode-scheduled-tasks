@@ -1,7 +1,15 @@
 import { describe, expect, it, beforeEach, afterEach, vi } from "vitest"
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync, existsSync } from "node:fs"
+import {
+  mkdtempSync,
+  rmSync,
+  mkdirSync,
+  writeFileSync,
+  readFileSync,
+  readdirSync,
+  existsSync,
+} from "node:fs"
 import { tmpdir } from "node:os"
-import { basename, dirname, join, sep } from "node:path"
+import { basename, dirname, join, resolve, sep } from "node:path"
 import { spawnSync } from "node:child_process"
 
 import plugin, {
@@ -22,8 +30,11 @@ import plugin, {
   loadJobs,
   loadMarkdownJobs,
   logPath,
+  ensureLogDir,
+  isInsideBase,
   mergeJobSources,
   setYamlReader,
+  safeProjectId,
   splitFrontmatter,
   missedOccurrences,
   nextOccurrence,
@@ -9107,10 +9118,17 @@ describe("the spec 001 clauses nothing was enforcing (task-pin-twelve-untested-s
     ]) {
       const lock = leasePath(dir, hostile)
       const file = logPath(dir, hostile)
-      expect(lock.startsWith(`${base}${sep}`)).toBe(true)
-      expect(file.startsWith(`${base}${sep}`)).toBe(true)
-      // The id contributes exactly one component, and the leaf is the fixed one.
-      expect(dirname(lock)).toBe(join(base, hostile.replace(/[^A-Za-z0-9._-]/g, "_")))
+      expect(resolve(lock).startsWith(`${base}${sep}`)).toBe(true)
+      expect(resolve(file).startsWith(`${base}${sep}`)).toBe(true)
+      // The id contributes exactly one component, and the leaf is the fixed one. This used to
+      // spell the expected component out as `hostile.replace(/[^A-Za-z0-9._-]/g, "_")` — a
+      // second copy of the sanitizer, compared against the first. That is a tautology about
+      // *which* spelling is produced and says nothing about containment, which is the property
+      // this test exists for: the pair passed for a sanitizer that walked out of the base.
+      // "One component directly below the base" is the same claim stated so it cannot pass by
+      // agreeing with itself (bug-project-id-dotdot-escapes-lease-base).
+      expect(dirname(dirname(lock))).toBe(resolve(base))
+      expect(dirname(dirname(file))).toBe(resolve(base))
       expect(dirname(file)).toBe(dirname(lock))
       expect(basename(lock)).toBe("writer.lock")
       expect(basename(file)).toBe("scheduler.log")
@@ -9212,6 +9230,174 @@ describe("the spec 001 clauses nothing was enforcing (task-pin-twelve-untested-s
     })
     const reported = ((await back.list()).jobs as Array<Record<string, unknown>>).find((job) => job.id === "ghost")!
     expect(reported).toMatchObject({ lastStatus: "ok", lastRun: new Date(lastRun).toISOString() })
+  })
+})
+
+// ===========================================================================
+// A project id cannot walk out of the lease base
+// (bug-project-id-dotdot-escapes-lease-base)
+// ===========================================================================
+//
+// The live defect: `leasePath` sanitized the project id with `[^A-Za-z0-9._-]`, a class that
+// **keeps `.`**, so the two ids that exist to express traversal survived intact — and
+// `join(base, "..", "writer.lock")` composed a writer lock one level *above* the lease base.
+// `logPath` carried its own copy of the same sanitizer and put `scheduler.log` there too.
+//
+// Severity is unchanged by the fix and is worth restating: this needs a hostile or corrupt
+// project id. `id` is `ctx.location.project.id` (or `ctx.location.directory` as a fallback),
+// which a normal host derives from the project itself, so this is not reachable by a third
+// party. It is worth fixing because the sanitizer's *intent* — confine the id — is already
+// established, and a half-finished defence reads as a complete one.
+//
+// The box-178 test above covers ids that arrive with a **separator**. `..` and `.` arrive with
+// no separator at all, which is why a separator-driven list cannot see them and why a sanitizer
+// has to be right about the *dot* specifically.
+//
+// **Containment is asserted on the resolved absolute path, never as `lock === join(base, …)`.**
+// `join` collapses `..` before a caller can look at it, so the joined form of a traversing path
+// already reads as a finished, normalised path — comparing one `join` against another compares
+// the defect against itself. Containment is a question about the base, so it can only be
+// answered after the path has been resolved against it.
+//
+// `.` is a *different* defect from `..` and the distinction is load-bearing: `.` does not
+// escape the base, it lands on the base's own root, where there is no per-project directory at
+// all. Containment **accepts** it. That is why the composer asserts one component below the
+// base as well as containment, and why these tests assert both.
+// ===========================================================================
+describe("a project id cannot walk out of the lease base (bug-project-id-dotdot-escapes-lease-base)", () => {
+  let dir: string
+  let restoreEnv: string | undefined
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "st-dotdot-"))
+    restoreEnv = process.env[DATA_DIR_ENV]
+    process.env[DATA_DIR_ENV] = join(dir, "state")
+  })
+
+  afterEach(() => {
+    if (restoreEnv === undefined) delete process.env[DATA_DIR_ENV]
+    else process.env[DATA_DIR_ENV] = restoreEnv
+    rmSync(dir, { recursive: true, force: true })
+  })
+
+  it("keeps a dot-only or dot-leading project id inside the lease directory", () => {
+    const base = resolve(leaseBaseDir())
+    // `.` and `..` first: the two ids the item names, and the two that were reachable as
+    // written. Then the neighbours, because a fix that special-cases two strings is a denylist
+    // and a denylist has neighbours: `...` (a legal, if odd, directory name), the leading-dot
+    // forms a host might legitimately mint, and the empty/whitespace ids that `asString` already
+    // rejects upstream but that these two functions are exported to take.
+    for (const dotty of [
+      "..",
+      ".",
+      "...",
+      ".._..",
+      ".hidden",
+      "..-..",
+      "../",
+      "a/../..",
+      "",
+      " ",
+      "-.",
+      "..%2f",
+    ]) {
+      const lock = leasePath(dir, dotty)
+      const file = logPath(dir, dotty)
+      // Containment, decided on the resolved absolute path.
+      expect(resolve(lock).startsWith(`${base}${sep}`), `leasePath escapes for ${JSON.stringify(dotty)}`).toBe(true)
+      expect(resolve(file).startsWith(`${base}${sep}`), `logPath escapes for ${JSON.stringify(dotty)}`).toBe(true)
+      // Strictly *below* the base, not on its root: `.` and `""` both pass the line above, and
+      // both are the defect this item is about — no per-project directory at all.
+      expect(dirname(dirname(lock))).toBe(base)
+      expect(dirname(dirname(file))).toBe(base)
+      // The leaf is still the fixed one, and the id still lands beside the lease rather than
+      // beside the log file.
+      expect(basename(lock)).toBe("writer.lock")
+      expect(basename(file)).toBe("scheduler.log")
+      expect(dirname(file)).toBe(dirname(lock))
+      // Neither path is the traversal itself, in either spelling.
+      expect(lock).not.toBe(join(base, "..", "writer.lock"))
+      expect(file).not.toBe(join(base, "..", "scheduler.log"))
+    }
+  })
+
+  it("creates nothing outside the lease base when the project id is `..`", () => {
+    // The end-to-end half. `ensureLogDir` runs in `setup` before any work is decided, so a
+    // traversing path was not merely a wrong string: it was a directory created outside the
+    // directory meant to contain it, by the one function that always runs.
+    const sandbox = mkdtempSync(join(tmpdir(), "st-dotdot-mkdir-"))
+    const outside = join(sandbox, "beside")
+    const base = join(outside, "scheduled-tasks")
+    const previous = process.env[DATA_DIR_ENV]
+    process.env[DATA_DIR_ENV] = base
+    try {
+      // `base` has never been created, so `mkdirSync(dirname(path), { recursive: true })` has to
+      // create it — and before the fix it created `beside` one level up and stopped there.
+      expect(existsSync(base)).toBe(false)
+      const target = logPath(dir, "..")
+      expect(ensureLogDir(target)).toBe(true)
+      expect(resolve(target).startsWith(`${base}${sep}`)).toBe(true)
+      expect(existsSync(dirname(target))).toBe(true)
+      // The base exists because the directory below it does; nothing exists *beside* it.
+      expect(existsSync(base)).toBe(true)
+      expect(readdirSync(outside)).toEqual(["scheduled-tasks"])
+    } finally {
+      if (previous === undefined) delete process.env[DATA_DIR_ENV]
+      else process.env[DATA_DIR_ENV] = previous
+      rmSync(sandbox, { recursive: true, force: true })
+    }
+  })
+
+  it("gives every project id one stable path, so the path-keyed once-guard still collapses", () => {
+    // `ensureLogDir` is called once per `setup` and its once-guard is keyed by the **path**, so
+    // the guard's behaviour depends on that path being a function of the id alone — no clock, no
+    // counter, nothing that could make a second call for the same project report a second time.
+    // This fix *moves* the path for a traversing id (from beside the base to inside it), so the
+    // key is re-asserted here rather than assumed, and the two halves of the guard's purpose are
+    // both pinned: the same id collapses, and a second project is not silenced by the first's key.
+    const base = resolve(leaseBaseDir())
+    for (const id of ["pinned", "..", ".", "a/b", "proj-1.2_3"]) {
+      expect(logPath(dir, id)).toBe(logPath(dir, id))
+      expect(leasePath(dir, id)).toBe(leasePath(dir, id))
+      expect(logPath(dir, id)).not.toBe(logPath(dir, `${id}x`))
+      expect(resolve(logPath(dir, id)).startsWith(`${base}${sep}`)).toBe(true)
+    }
+  })
+
+  it("sanitises a project id to one dotless component, and decides containment on the resolved path", () => {
+    // The two halves of the fix as claims about *values*, because both are what the paths above
+    // rest on. Mutating the class back to `[^A-Za-z0-9._-]` turns the first assertion red;
+    // dropping the composer's check turns the second one red.
+    const base = resolve(leaseBaseDir())
+    for (const id of ["..", ".", "...", "../../etc/passwd", "proj-1.2_3", "", " "]) {
+      const safe = safeProjectId(id)
+      // No dot at all, so there is no `..` and no `.` for `join` to resolve: the escape is
+      // unrepresentable rather than rejected. Non-empty and separator-free too, so the id
+      // contributes exactly one component.
+      expect(safe, `sanitised ${JSON.stringify(id)} still contains a dot`).not.toContain(".")
+      expect(safe).not.toBe("")
+      expect(basename(safe)).toBe(safe)
+      // A real id is untouched by any of this — the opaque tokens a host mints survive verbatim,
+      // so no user's lease directory moves and no stale lockfile is stranded.
+      expect(safeProjectId("187167828990cd20045a624fe3309f5107a9c30c")).toBe(
+        "187167828990cd20045a624fe3309f5107a9c30c",
+      )
+      // Containment, on the resolved path: `..` is outside, `.` is *inside* but on the base's own
+      // root, and neither is one component below the base — which is the pair of conditions the
+      // composer checks. The escaped form the fallback would compose is inside, and a path that
+      // merely shares the base as a prefix is not.
+      expect(isInsideBase(base, join(base, "..", "writer.lock"))).toBe(false)
+      expect(isInsideBase(base, join(base, ".", "writer.lock"))).toBe(true)
+      expect(dirname(dirname(join(base, ".", "writer.lock")))).not.toBe(base)
+      expect(dirname(dirname(join(base, "..", "writer.lock")))).not.toBe(base)
+      expect(isInsideBase(base, join(base, "_2e_2e_", "writer.lock"))).toBe(true)
+      expect(isInsideBase(`${base}-evil`, join(`${base}-evil`, "x", "writer.lock"))).toBe(true)
+      expect(isInsideBase(base, join(`${base}-evil`, "x", "writer.lock"))).toBe(false)
+      // And the composed path for this id is inside, one component down.
+      expect(isInsideBase(base, leasePath(dir, id))).toBe(true)
+      expect(isInsideBase(base, logPath(dir, id))).toBe(true)
+      expect(dirname(dirname(leasePath(dir, id)))).toBe(base)
+    }
   })
 })
 
