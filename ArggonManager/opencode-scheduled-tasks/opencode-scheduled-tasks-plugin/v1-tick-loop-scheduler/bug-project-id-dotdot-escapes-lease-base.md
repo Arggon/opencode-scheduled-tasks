@@ -4,6 +4,7 @@ status: in_progress
 id: bug-project-id-dotdot-escapes-lease-base
 title: "A project id of \"..\" composes outside the lease directory — the sanitizer keeps dots"
 assignee: arggon
+branch: fix/bug-project-id-dotdot-escapes-lease-base
 parent: v1-tick-loop-scheduler
 labels: []
 priority: p2
