@@ -100,7 +100,20 @@ tools.schedules.*   list · run · schedule · cancel · start_loop · stop_loop
 - [ ] Frontmatter is untrusted input: field sizes and collection cardinality are bounded, and
       no frontmatter value is interpolated into a prompt.
 - [ ] A markdown file whose stem duplicates a JSON job id produces one job and one reported
+      shadow, never two jobs or a crash.- [ ] A markdown file whose stem duplicates a JSON job id produces one job and one reported
       shadow, never two jobs or a crash.
+
+> **Added after `bug-job-format-reference-contradicts-spec-002`.** The box above is literally true — the
+> parser does accept `30s` — but read alone it implies a 30-second run, which is the same misreading the
+> `schedules_format` reference was fixed for, one level up. The spec was the only surface silent on the
+> window: the clamp is in the parser, in the reference (now derived from the same constants) and in the
+> README, and absent here.
+>
+> The window is **1 minute to 24 hours**, default **15 minutes**. A value outside it is **clamped, not
+> refused**, and a bare number means seconds. Pinned by `describe("schedules_format reference cannot
+> drift from the parser")` — the clamp endpoints are asserted against `MIN_RUN_TIMEOUT_MS` /
+> `MAX_RUN_TIMEOUT_MS`, and every duration advertised by the reference is asserted to survive
+> `validateJob` un-clamped.
 
 ### Durations
 

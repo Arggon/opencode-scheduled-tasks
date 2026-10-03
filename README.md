@@ -143,8 +143,10 @@ A schedule that can never match (`0 0 30 2 *` — 30 February) is rejected at lo
 named reason rather than becoming a job that silently never fires.
 
 `schedules_format` returns a **shorter** version of this for an agent about to author a job: both
-surfaces, the precedence rule, the fields that carry a cost, and the unattended-permission warning.
-Its field table does **not** list `permissions` or `session`, so read those two in the table above.
+surfaces, the precedence rule, the fields that carry a cost or permission consequence, and the
+unattended-permission warning. It lists `permissions` and `session` too, with their defaults — the
+`runTimeout` window there is derived from the same constants the parser clamps with, so the two cannot
+drift apart.
 
 ## Markdown job files
 
