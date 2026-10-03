@@ -55,7 +55,7 @@ import {
   writeSync,
 } from "node:fs"
 import { homedir } from "node:os"
-import { dirname, join } from "node:path"
+import { dirname, join, resolve, sep } from "node:path"
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -200,10 +200,16 @@ let activeLogPath: string | undefined
 /** Maximum bytes of one appended log line. */
 const LOG_LINE_MAX = 1000
 
-/** Per-project log file, beside the writer lease. */
+/**
+ * Per-project log file, beside the writer lease.
+ *
+ * Composed by the same `underLeaseBase` as `leasePath`, deliberately: this function used to
+ * carry its own copy of the sanitizer, and the copy was wrong in the same way — a project id of
+ * `..` put `scheduler.log` outside the lease base while the sanitised form still looked handled.
+ * One composer, one guarantee, for both files (bug-project-id-dotdot-escapes-lease-base).
+ */
 export function logPath(directory: string, id: string): string {
-  const safe = id.replace(/[^A-Za-z0-9._-]/g, "_")
-  return join(leaseBaseDir(), safe, "scheduler.log")
+  return underLeaseBase(id, "scheduler.log")
 }
 
 /**
@@ -2290,10 +2296,106 @@ export function leaseBaseDir(): string {
   return join(homedir(), ".local", "share", "opencode", "scheduled-tasks")
 }
 
-/** Lockfile path for one project. The id is sanitized, so it is never a path component. */
+/**
+ * A project id reduced to one path component that cannot mean anything but itself.
+ *
+ * An **allowlist**, not a denylist. The earlier class was `[A-Za-z0-9._-]`, which kept `.` — so
+ * the two ids that exist to express traversal, `..` and `.`, survived sanitisation completely
+ * intact, and `join(base, "..", "writer.lock")` composed a lockfile one level *above* the lease
+ * base while the sanitised form still read as though it had been handled. A denylist here would
+ * have had to enumerate `.`, `..`, and whatever else a later reader decided to worry about; an
+ * allowlist leaves no character in the alphabet that `join` can read as a separator or a parent
+ * reference, so `..` is not rejected, it is **unrepresentable**.
+ *
+ * The id does not need `.`. A real host mints an opaque 32-character hex token
+ * (`ctx.location.project.id` — the ids under `~/.local/share/opencode/scheduled-tasks/` on this
+ * host are exactly that), so this is the identity on every id a normal host produces and the
+ * readable `<id>/` directory a user navigates to is unchanged. Sanitisation is lossy, and was
+ * already lossy before this change: `a/b` and `a?b` have always shared a directory. That
+ * collision is fail-safe — the loser meets a live foreign lease, logs why and stays inert
+ * (ADR 0003) — rather than two writers on one project.
+ */
+export function safeProjectId(id: string): string {
+  const safe = id.replace(/[^A-Za-z0-9_-]/g, "_")
+  // An empty id has no component at all, and `join(base, "", leaf)` collapses onto the base's
+  // own root — the same place `.` lands — so it is given a component too. `asString` already
+  // rejects an empty id on the way in; this is the exported function being honest on its own.
+  return safe === "" ? "_" : safe
+}
+
+/**
+ * Whether `path` is `base` or sits inside it, decided on the **resolved** absolute path.
+ *
+ * Not on the joined string, and the distinction is the whole point. `join` normalises `..` away
+ * before anyone can look at it, so the joined form of a traversing path already reads as a
+ * finished, tidy path: `join(base, "..", "writer.lock")` *is* `<parent>/writer.lock`, which looks
+ * like an ordinary path and is not inside anything. Comparing one `join` to another therefore
+ * compares the defect against itself. Containment is a question about the base, so it can only
+ * be answered after the path has been resolved against it.
+ *
+ * The separator is part of the comparison, so a sibling that merely shares a prefix —
+ * `<base>-evil/x` — is outside. Lexical, not `realpath`: resolving symlinks would follow the
+ * data directory the local user pointed `DATA_DIR_ENV` at, and a base that does not exist yet
+ * cannot be resolved at all.
+ */
+export function isInsideBase(base: string, path: string): boolean {
+  const root = resolve(base)
+  const target = resolve(path)
+  return target === root || target.startsWith(root.endsWith(sep) ? root : `${root}${sep}`)
+}
+
+/**
+ * A component that cannot fail {@link isInsideBase}, whatever it is given.
+ *
+ * Every code unit outside the allowlist is escaped to `_<hex>_` rather than dropped, so `..`
+ * becomes `_2e_2e_` — which is a legal single component that means nothing to `join`, and is
+ * also readable back as the id that produced it.
+ */
+function escapeProjectId(id: string): string {
+  let escaped = ""
+  for (const character of id) {
+    escaped += /[A-Za-z0-9_-]/.test(character)
+      ? character
+      : `_${(character.codePointAt(0) ?? 0).toString(16)}_`
+  }
+  return escaped === "" ? "_" : escaped
+}
+
+/**
+ * Compose one file **exactly one component** below the lease base directory.
+ *
+ * The single composer for both per-project paths, because the two callers had the same defect
+ * twice: the writer lock and `scheduler.log` each carried their own copy of the sanitizer, and
+ * both copies were wrong in the same way. Sharing the composer is what stops a third copy
+ * appearing.
+ *
+ * The result is checked rather than assumed — `safeProjectId` already makes an escape
+ * unrepresentable, and this is the claim that it still holds if someone later widens it. Two
+ * conditions, not one: **containment** rejects an id that composes above the base (`..`), and
+ * **one component below the base** rejects an id that composes *onto* the base's own root
+ * (`.`, `""`), which containment accepts and which has no per-project directory at all.
+ *
+ * A composition that fails either is recomposed from the escaped id rather than returned:
+ * throwing here would break the session that was loading, since both callers run in `setup`
+ * before any work is decided, and a lockfile outside the lease base is worse than a louder one
+ * but is still not worth a crash. With the allowlist above, the fallback is unreachable; it
+ * exists so that widening the allowlist cannot quietly reopen this.
+ */
+function underLeaseBase(id: string, leaf: string): string {
+  const root = resolve(leaseBaseDir())
+  const composed = join(root, safeProjectId(id), leaf)
+  if (isInsideBase(root, composed) && dirname(dirname(composed)) === root) return composed
+  return join(root, escapeProjectId(id), leaf)
+}
+
+/**
+ * Lockfile path for one project.
+ *
+ * The id contributes exactly one sanitized component — see `safeProjectId` for the allowlist and
+ * `underLeaseBase` for the resolved-path containment the composition is checked against.
+ */
 export function leasePath(directory: string, id: string): string {
-  const safe = id.replace(/[^A-Za-z0-9._-]/g, "_")
-  return join(leaseBaseDir(), safe, "writer.lock")
+  return underLeaseBase(id, "writer.lock")
 }
 
 function readLease(path: string): { pid: number; heartbeat: number } | undefined {
