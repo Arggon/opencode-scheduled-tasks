@@ -7043,3 +7043,289 @@ describe("a storageless host is told so, and keeps its history readable (bug-sto
     60_000,
   )
 })
+
+// ---------------------------------------------------------------------------
+// bug-log-lines-before-first-lease-never-reach-the-file
+//
+// `acquireLease` used to be the only thing that created the log directory, and it only
+// runs when there is work to arm. Every line emitted before the first lease therefore
+// reached `stderr` and stopped there — and those are precisely the startup and
+// degradation diagnostics, the lines you read when nothing works and there is nothing
+// in the file to read. An idle project left no evidence it had ever been loaded.
+//
+// Every test here starts from a directory with **no** log directory and asserts the line
+// is *in the file*, not merely on stderr.
+// ---------------------------------------------------------------------------
+
+describe("the log directory exists before the first lease (bug-log-lines-before-first-lease-never-reach-the-file)", () => {
+  let dir: string
+  let restoreEnv: string | undefined
+  let consoleLines: string[]
+  let realConsoleError: typeof console.error
+  const outstanding: Array<() => void> = []
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "st-logdir-"))
+    mkdirSync(join(dir, ".opencode"), { recursive: true })
+    restoreEnv = process.env[DATA_DIR_ENV]
+    process.env[DATA_DIR_ENV] = join(dir, "state")
+    realConsoleError = console.error
+    consoleLines = []
+    console.error = (...args: unknown[]): void => void consoleLines.push(args.map(String).join(" "))
+  })
+
+  afterEach(() => {
+    for (const dispose of outstanding.splice(0).reverse()) {
+      try {
+        dispose()
+      } catch {
+        /* a failing teardown must not mask the assertion before it */
+      }
+    }
+    console.error = realConsoleError
+    if (restoreEnv === undefined) delete process.env[DATA_DIR_ENV]
+    else process.env[DATA_DIR_ENV] = restoreEnv
+    rmSync(dir, { recursive: true, force: true })
+    vi.useRealTimers()
+    vi.resetModules()
+  })
+
+  type Tool = {
+    execute: (input: Record<string, unknown>, context?: { sessionID?: unknown }) => Promise<{ output: Record<string, unknown> }>
+  }
+
+  type Loaded = {
+    tool: (name: string) => Tool
+    /** Lines this instance emitted, whatever else the file captured. */
+    log: () => string[]
+  }
+
+  /**
+   * A project over `state`, with `ctx.storage` **genuinely absent** unless `storage` is given.
+   *
+   * The absence is the point — `ctx.storage.scan is unavailable` and `ctx.storage unavailable`
+   * are both setup-time notices, which is exactly the class of line this item is about, and
+   * they are emitted *before* any lease could exist.
+   */
+  async function load(
+    projectID: string,
+    options: { jobs?: unknown[]; storage?: Record<string, unknown> } = {},
+  ): Promise<Loaded> {
+    if (options.jobs !== undefined) {
+      writeFileSync(join(dir, ".opencode", "schedules.json"), JSON.stringify({ version: 1, jobs: options.jobs }))
+    }
+    const tools: Array<Record<string, unknown>> = []
+    const prompts: Record<string, unknown>[] = []
+    const ctx: Record<string, unknown> = {
+      location: { directory: dir, project: { id: projectID } },
+      ...(options.storage === undefined ? {} : { storage: options.storage }),
+      session: {
+        create: async () => ({ id: "ses_logdir" }),
+        prompt: async (input: Record<string, unknown>) => {
+          prompts.push(input)
+          return { id: `inbox_${prompts.length}` }
+        },
+      },
+      tool: {
+        transform: async (cb: (editor: { add?: (t: unknown) => void }) => void) => {
+          cb({ add: (t) => void tools.push(t as Record<string, unknown>) })
+          return { dispose() {} }
+        },
+      },
+    }
+    // From the line setup itself, so one instance's report is never read as another's.
+    const first = consoleLines.length
+    const resolved = await plugin.setup(ctx as never)
+    outstanding.push(() => void (resolved as () => void)?.())
+    return {
+      tool: (name: string): Tool => {
+        const found = tools.find((entry) => entry.name === name)
+        if (found === undefined) throw new Error(`tool ${name} was not registered`)
+        return found as unknown as Tool
+      },
+      log: () => consoleLines.slice(first),
+    }
+  }
+
+  /** The per-project log, read the way a user reads it — and a check that it exists at all. */
+  const logFile = (id: string): string => {
+    const path = logPath(dir, id)
+    expect(existsSync(path)).toBe(true)
+    return readFileSync(path, "utf8")
+  }
+
+  it("writes the idle-project line into the file, from a directory that never held a lease", async () => {
+    // No jobs, no one-off, no loop: `hasWork` is false, so `acquireLease` never runs and never
+    // creates the log directory. That is the whole bug — the one line that explains *why* the
+    // plugin is inert is the one line that had nowhere to be written.
+    expect(existsSync(join(process.env[DATA_DIR_ENV]!, "idle-project"))).toBe(false)
+
+    await load("idle-project", { jobs: [] })
+
+    // In the file, not just on stderr. A project that never arms a timer now leaves evidence it
+    // was loaded at all, which is the question a globally-installed plugin has to answer.
+    expect(logFile("idle-project")).toContain("no enabled jobs")
+    // Both surfaces are named, because either can be the one holding parked jobs.
+    expect(logFile("idle-project")).toContain("no timer armed")
+  })
+
+  it("writes the ctx.storage.scan degradation into the file, not just on stderr", async () => {
+    // The audit's own repro: a fresh process, one enabled job, `ctx.storage.scan` absent. Both
+    // notices are setup-time, so both precede the lease that used to create the directory.
+    //
+    // A fresh module instance because `logOnce` dedupes in a module-level `logged` set, and an
+    // earlier test in this file has already spent the `no-storage-scan` key. Without the reset
+    // this test would pass on the *absence* of a line and prove nothing.
+    vi.resetModules()
+    const fresh = (await import("../src/index.ts")).default
+
+    await fresh.setup({
+      location: { directory: dir, project: { id: "degraded" } },
+      session: { create: async () => ({ id: "ses_degraded" }), prompt: async () => ({ id: "inbox_1" }) },
+      tool: { transform: async (cb: (editor: { add?: (t: unknown) => void }) => void) => void cb({ add: () => {} }) },
+    } as never)
+
+    // Both halves of the degradation: the missing `scan`, and the whole surface being absent.
+    const text = logFile("degraded")
+    expect(text).toContain("ctx.storage.scan is unavailable")
+    expect(text).toContain("ctx.storage unavailable")
+    // …and each line is prefixed and timestamped, as the file sink promises.
+    expect(text).toMatch(/^\d{4}-\d{2}-\d{2}T[\d:.]+Z scheduled-tasks: ctx\.storage\.scan is unavailable/m)
+  })
+
+  it("creates the log directory without taking the writer lease", async () => {
+    await load("no-lock", { jobs: [] })
+
+    // A directory is not lock state. Creating it claims nothing, so a project with no jobs
+    // leaves no `writer.lock` behind — a globally-installed plugin runs in every project it
+    // opens, and littering locks in projects that never scheduled anything would wedge them
+    // all behind arbitration they never asked for.
+    expect(existsSync(join(process.env[DATA_DIR_ENV]!, "no-lock", "scheduler.log"))).toBe(true)
+    expect(existsSync(leasePath(dir, "no-lock"))).toBe(false)
+
+    // And arbitration is untouched: the lease is still claimable, and a *second process* is
+    // still turned away. The directory is not the lockfile.
+    const path = leasePath(dir, "no-lock")
+    const held = acquireLease(path)
+    expect(held.held).toBe(true)
+    // Seeded as another live pid, which is what a second server looks like. A second acquire
+    // from *this* pid would deliberately take the lease back instead (the `opencode reload`
+    // path), so the foreign pid is what makes this an exclusivity check.
+    writeFileSync(path, JSON.stringify({ pid: process.pid + 1, heartbeat: Date.now() }))
+    const foreign = acquireLease(path)
+    expect(foreign.held).toBe(false)
+    expect(foreign.foreign).toBe(true)
+    held.release()
+  })
+
+  it("keeps the file sink for lines emitted after setup too", async () => {
+    // The regression half: moving the directory out of `acquireLease` must not cost the file
+    // sink it was originally there for. Here the lease is held *and* a run line lands.
+    const h = await load("both-sinks", {
+      jobs: [{ id: "j", schedule: "@daily", timezone: "UTC", prompt: "p" }],
+      storage: { get: async () => undefined, set: async () => {}, remove: async () => {} },
+    })
+
+    // Armed on setup, so this project *does* take a lease — the pre-fix path.
+    expect((await h.tool("list").execute({})).output.leaseHeld).toBe(true)
+    // A run's own line still lands in the file, after the lease exists.
+    await h.tool("run").execute({ id: "j" })
+    expect(logFile("both-sinks")).toContain("triggered j on demand")
+  })
+
+  it("says once, on stderr, when the log directory cannot be created, and never retries per line", async () => {
+    // A data directory that cannot exist: a regular file sits where the parent must be, so
+    // `mkdirSync(recursive)` fails with ENOTDIR for every project, forever.
+    const blocked = join(dir, "blocked")
+    writeFileSync(blocked, "not a directory")
+    process.env[DATA_DIR_ENV] = join(blocked, "state")
+
+    const h = await load("unwritable", { jobs: [{ id: "j", schedule: "@daily", prompt: "p" }] })
+
+    // Reported once, naming the directory and saying what happens to the rest of the session.
+    const complaints = h.log().filter((line) => /could not create the log directory/.test(line))
+    expect(complaints).toHaveLength(1)
+    expect(complaints[0]).toContain("unwritable")
+    expect(complaints[0]).toContain("stays on stderr")
+
+    // No recursion: with no file sink, `emit` must not attempt an append on every line and
+    // then report that append's own failure behind it. Pre-fix this is exactly the
+    // `could not append to …` the audit recorded.
+    expect(h.log().filter((line) => /could not append to/.test(line))).toEqual([])
+
+    // Degraded, not broken: the scheduler still loads and its tools still answer, and the
+    // failure did not propagate out of the plugin boundary.
+    expect((await h.tool("list").execute({})).output.jobs).toHaveLength(1)
+    // And it degraded without claiming arbitration either — a lease it cannot store is not a
+    // lease it can hold.
+    expect(existsSync(leasePath(dir, "unwritable"))).toBe(false)
+  })
+
+  it("reports each unwritable project once, rather than silencing all but the first", async () => {
+    // One host loads this plugin for every project it opens, and the complaint names a
+    // directory. A single global "already said it" key would mean the *first* broken data
+    // directory silences every other project's, which is the opposite of what the file sink
+    // is for. Both projects here are equally broken, so both have to be told.
+    const blocked = join(dir, "blocked")
+    writeFileSync(blocked, "not a directory")
+    process.env[DATA_DIR_ENV] = join(blocked, "state")
+
+    const first = await load("unwritable-one", { jobs: [] })
+    const firstCount = first.log().filter((line) => /could not create the log directory/.test(line))
+    expect(firstCount).toHaveLength(1)
+    expect(firstCount[0]).toContain("unwritable-one")
+
+    const second = await load("unwritable-two", { jobs: [] })
+    const secondCount = second.log().filter((line) => /could not create the log directory/.test(line))
+    expect(secondCount).toHaveLength(1)
+    expect(secondCount[0]).toContain("unwritable-two")
+
+    // And neither is repeated per line: a per-line `mkdirSync` would turn one bad directory
+    // into a syscall on every log write, which is the new failure mode this must not become.
+    // The inert-project notice is the line that follows, so there were lines to repeat for.
+    expect(second.log().length).toBeGreaterThan(1)
+    expect(secondCount).toHaveLength(1)
+  })
+
+  it("does not write a project with no usable log directory into the previous project's file", async () => {
+    // `activeLogPath` is one module-level variable and a host loads this plugin for every
+    // project it opens. The first project is idle, so its file holds exactly one line — the
+    // notice saying why *it* is inert. The second project's directory cannot be made; if the
+    // first project's path were still installed, this second notice would land in the first
+    // project's log, which is worse than losing it: it files one project's failure under
+    // another project's name.
+    await load("first", { jobs: [] })
+    // Captured while the data directory is still the first project's, so the later
+    // relocation does not move the ground under the assertion.
+    const firstPath = logPath(dir, "first")
+    const firstLog = readFileSync(firstPath, "utf8")
+    expect(firstLog.match(/no timer armed/g)).toHaveLength(1)
+
+    const blocked = join(dir, "blocked")
+    writeFileSync(blocked, "not a directory")
+    process.env[DATA_DIR_ENV] = join(blocked, "state")
+
+    const second = await load("second", { jobs: [] })
+
+    // The second project still says why it is inert…
+    expect(second.log().filter((line) => /no timer armed/.test(line))).toHaveLength(1)
+    // …and that line is nowhere but stderr. One occurrence in the first file, still its own.
+    expect(firstLog.match(/no timer armed/g)).toHaveLength(1)
+    expect(readFileSync(firstPath, "utf8")).toBe(firstLog)
+  })
+
+  it("makes the directory once per setup, and idempotently, so the lease's own mkdir is a no-op", async () => {
+    // The seam is exported because the *cost* claim needs a surface to check: `setup` calls it
+    // once, `emit` never does. Idempotence is what lets `acquireLease` keep its own
+    // `mkdirSync` — the two directories are the same directory, and neither is the lockfile.
+    const { ensureLogDir } = await import("../src/index.ts")
+    const target = join(dir, "state", "cost", "scheduler.log")
+
+    expect(existsSync(dirname(target))).toBe(false)
+    expect(ensureLogDir(target)).toBe(true)
+    expect(existsSync(dirname(target))).toBe(true)
+    expect(ensureLogDir(target)).toBe(true)
+    // A directory, and nothing else.
+    expect(existsSync(join(dirname(target), "writer.lock"))).toBe(false)
+  })
+})

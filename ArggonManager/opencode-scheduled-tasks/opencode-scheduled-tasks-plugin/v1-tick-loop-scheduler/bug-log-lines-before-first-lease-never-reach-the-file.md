@@ -51,14 +51,27 @@ since they are not about one. Fold that clarification into the box wording when 
 
 ## Acceptance
 
-- [ ] The log directory is created independently of `acquireLease`, so **any** line can reach
+- [x] The log directory is created independently of `acquireLease`, so **any** line can reach
       `scheduler.log` — including the inert-project notice and every degradation notice.
-- [ ] A test starts from a directory with no log dir and asserts a startup line is in the file, not
+      `ensureLogDir(logPath(directory, projectID))` runs in `setup` where `activeLogPath` is
+      assigned: after `ctx.location.directory` is read (so the project id the path needs is
+      known) and before `reloadJobs` / `loadStates` / the storage notice (so their lines have a
+      file to land in). `acquireLease` keeps its own `mkdirSync` and still arbitrates alone.
+- [x] A test starts from a directory with no log dir and asserts a startup line is in the file, not
       just on stderr. Cover the idle-project case, since that is the one that currently leaves no
       evidence at all.
-- [ ] Failure to create the directory is itself reported once, clearly, and does not recurse.
-- [ ] The "every line includes the job id" clause is amended to say job-scoped lines carry the id
+      "writes the idle-project line into the file, from a directory that never held a lease" and
+      "writes the ctx.storage.scan degradation into the file, not just on stderr". Both read the
+      file back; reverting the fix turns six of this item's tests red.
+- [x] Failure to create the directory is itself reported once, clearly, and does not recurse.
+      Reported on a bare `console.error` — not through `emit`, which would try to append into the
+      directory that just failed and report a second failure behind it — and the caller leaves
+      `activeLogPath` unset so no later line attempts an append. Once per **path**, not once per
+      process, because one host loads this plugin for every project it opens.
+- [x] The "every line includes the job id" clause is amended to say job-scoped lines carry the id
       and host-level notices do not.
+      Spec 001 box 151 now says so, and also states the one line that stays `stderr`-only — the
+      `ctx.location.directory is unavailable` notice, which has no `<project>` to log under.
 
 ## Notes
 
