@@ -4,6 +4,7 @@ status: in_progress
 id: bug-job-format-reference-contradicts-spec-002
 title: schedules_format advertises a runTimeout the parser rejects and omits permissions and session
 assignee: arggon
+branch: fix/bug-job-format-reference-contradicts-spec-002
 parent: config-surface-markdown-task-files-durations
 labels: []
 priority: p2
