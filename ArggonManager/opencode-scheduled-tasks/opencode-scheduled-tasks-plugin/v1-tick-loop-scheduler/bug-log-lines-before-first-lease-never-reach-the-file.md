@@ -4,6 +4,7 @@ status: in_progress
 id: bug-log-lines-before-first-lease-never-reach-the-file
 title: "The first diagnostic lines never reach scheduler.log, because only acquireLease creates the log directory"
 assignee: arggon
+branch: fix/bug-log-lines-before-first-lease-never-reach-the-file
 parent: v1-tick-loop-scheduler
 labels: []
 priority: p2
