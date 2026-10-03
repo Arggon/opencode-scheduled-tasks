@@ -8,7 +8,7 @@ labels: []
 priority: p2
 created: "2026-10-03"
 updated: "2026-10-03"
-depends_on: [task-pin-twelve-untested-spec-001-behaviours]
+depends_on: [bug-project-id-dotdot-escapes-lease-base]
 ---
 <!--
   Placement (v0): ArggonManager/opencode-scheduled-tasks/opencode-scheduled-tasks-plugin/v1-tick-loop-scheduler/task-reload-jobs-last-known-good-comment-lies.md
