@@ -166,3 +166,7 @@ The **existing** test at test/index.test.ts:6037 already blocks the data dir wit
 `acquireLease` degrade. It now also trips `ensureLogDir`, so it spends a log-directory failure. That is
 harmless (my once-guard is path-scoped) but it is why an early version of my test failed for a
 cross-test reason rather than a real one — worth knowing before someone makes that guard global again.
+
+### handoff 2026-10-03 @ses_f00da35beffeyGcWtSNGMGYWTD (session: ses_f00da35beffeyGcWtSNGMGYWTD) — next: Coordinator to code-review f679415 and merge; then flip the item to done. No follow-up work outstanding.
+- branch: fix/bug-log-lines-before-first-lease-never-reach-the-file
+- open questions: M2 (routing the mkdir failure through emit) is not mutation-caught because the activeLogPath pre-clear makes it unobservable; acceptable? Box 151 now names one stderr-only line (no project) — check t…
