@@ -78,3 +78,91 @@ since they are not about one. Fold that clarification into the box wording when 
 Filed by the coordinator from the spec 001 audit. p2 because it costs observability rather than
 correctness — but it is the kind of gap that makes the *next* outage take twice as long to diagnose,
 which is exactly what the file sink was added to prevent.
+
+### 2026-10-03 @ses_f00da35beffeyGcWtSNGMGYWTD
+## Fix — `f679415` on `fix/bug-log-lines-before-first-lease-never-reach-the-file`
+
+### Where the log directory is now created
+
+`ensureLogDir(logPath(directory, projectID))` in `setup`, at the old `activeLogPath = logPath(...)`
+line (src/index.ts:4620-4633). It runs **after** `ctx.location.directory` is read — so the project id
+the path depends on is already known, which was the ordering problem in the brief — and **before**
+`reloadJobs` / `loadStates` / `loadAllHistory` / the storage notice, so every one of those lines has a
+file to land in. `acquireLease` keeps its own `mkdirSync` and still does all the arbitrating.
+
+### Still stderr-only
+
+Exactly one line: `ctx.location.directory is unavailable; the scheduler is inert`. It is emitted *before*
+`ctx.location` yields a directory, so there is no `<project>` to log under. I did not paper over this —
+spec 001 box 151 now names it as the one exception rather than claiming a universal dual sink.
+
+### Failed log writes
+
+A failed `mkdirSync` is reported on a bare `console.error` from `ensureLogDir`, deliberately **not**
+through `emit`: `emit` would try to append into the directory that just failed to appear and report a
+second failure behind it — for whichever project the module was last loaded for. The caller leaves
+`activeLogPath` unset, so `emit` short-circuits and no later line attempts an append. Nothing in the
+failure path calls back into the log, so it cannot recurse. Once-guard keyed by **path**, not globally:
+one host loads this plugin per project and the line names a directory, so a second unwritable project
+reports its own instead of being silenced.
+
+### Log dir vs lease lockfile
+
+`ensureLogDir` only calls `mkdirSync(dirname(path), { recursive: true })`. It writes no file. An idle
+project gets `scheduler.log` and **no** `writer.lock` — pinned by "creates the log directory without
+taking the writer lease", which also re-asserts that `acquireLease` is still exclusive afterwards
+(seeded foreign pid, since a same-pid re-acquire deliberately takes the lease back). ADR 0003's single
+writer is untouched: `acquireLease` remains the only thing that arbitrates.
+
+### Box wording
+
+Spec 001 box 151 now reads: job-scoped lines (fires, skips, run failures, loop and one-off outcomes)
+carry the job/loop/task id; **host-level notices do not**, because they are not about one job — missing
+`ctx.storage` surface, missing `ctx.storage.scan`, missing YAML reader, unavailable writer lease, the
+loop-scan cap, and the inert-project notice. Box ticked with a note pinning each claim by test name.
+
+### Mutations (each run against the whole suite)
+
+| Mutation | Caught by |
+|---|---|
+| M1 revert to lease-only `mkdirSync` (the original defect) | **6 tests red** |
+| M4 `ensureLogDir` also writes `writer.lock` | 2 of mine + 6 existing |
+| M3 global once-guard instead of path-scoped | 2 red |
+| M6 swallow the mkdir failure silently | 2 red |
+| M5 drop the `activeLogPath = undefined` pre-clear | 1 red |
+| M2 route the mkdir failure through `emit()` | **not caught — see below** |
+
+M1/M3/M4/M6 all red when my describe runs alone, so none of them depends on test order.
+
+**M2 not caught, and why:** with the pre-clear in place, `emit` inside `ensureLogDir`'s catch sees
+`activeLogPath === undefined` and returns before attempting an append, so routing through `emit` is
+not behaviourally observable *given* that fix. The raw-`console.error` choice is therefore defensive
+rather than pinned. What is pinned is the property: "says once, on stderr, … never retries per line"
+asserts no `could not append to …` ever appears. M5 shows the two are load-bearing together — drop the
+pre-clear *and* route through `emit` and the complaint lands in the previous project's file.
+
+### Test count
+
+**259 -> 267.** All 259 pre-existing tests still pass untouched.
+
+### Gates
+
+```
+npx tsc --noEmit                      clean
+npx vitest run                        267 passed (267)
+npx tsx harness/smoke.ts              PASS
+arggon validate                       ok (0 warning(s), convention v5)
+arggon spec analyze                   clean (2 spec(s) scanned)
+```
+
+### Unticked boxes
+
+None in this item — all four acceptance boxes are made and ticked. Spec 001 still has 4 unticked boxes;
+box 151 is now ticked (it was the false one the audit recorded).
+
+### One thing worth the coordinator's eye
+
+The **existing** test at test/index.test.ts:6037 already blocks the data dir with a regular file to make
+`acquireLease` degrade. It now also trips `ensureLogDir`, so it spends a log-directory failure. That is
+harmless (my once-guard is path-scoped) but it is why an early version of my test failed for a
+cross-test reason rather than a real one — worth knowing before someone makes that guard global again.
