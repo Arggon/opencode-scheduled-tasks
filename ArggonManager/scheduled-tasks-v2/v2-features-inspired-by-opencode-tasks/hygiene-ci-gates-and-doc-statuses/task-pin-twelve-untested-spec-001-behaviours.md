@@ -8,7 +8,7 @@ labels: []
 priority: p2
 created: "2026-10-02"
 updated: "2026-10-03"
-depends_on: [bug-next-occurrence-walks-utc-wall-parts-in-any-zone-west-of-utc]
+depends_on: [task-assert-occurrence-walk-jumps-strictly-advance]
 ---
 <!--
   Placement (v0): ArggonManager/scheduled-tasks-v2/v2-features-inspired-by-opencode-tasks/hygiene-ci-gates-and-doc-statuses/task-pin-twelve-untested-spec-001-behaviours.md
