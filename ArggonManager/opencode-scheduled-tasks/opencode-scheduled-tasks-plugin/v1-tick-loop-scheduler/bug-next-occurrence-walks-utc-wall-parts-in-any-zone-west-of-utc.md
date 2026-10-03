@@ -193,3 +193,7 @@ Node 26 it shipped **without `getPossibleInstantsFor`**. Hand-rolled per ADR 000
 overlap -> earlier is `compatible` and unanimous; **gap -> skip is ours alone** — `compatible`
 shifts forward by the gap length, `node-cron` rewinds to just after the change, `cron-parser`
 compensates to the landing hour. Spec 001 boxes 131/133 commit us, so it stands, now documented.
+
+### handoff 2026-10-03 @ses_f0035738fffes53RQOsmuSALKx (session: ses_f0035738fffes53RQOsmuSALKx) — next: Coordinator review + merge. Optional follow-up: file a task for the one gap this item found but did not close.
+- branch: fix/bug-next-occurrence-walks-utc-wall-parts-in-any-zone-west-of-utc
+- open questions: Spec divergence to confirm: gap->skip is the outlier vs Temporal/node-cron/cron-parser; and whether the day-jump non-termination risk deserves its own bound test.
