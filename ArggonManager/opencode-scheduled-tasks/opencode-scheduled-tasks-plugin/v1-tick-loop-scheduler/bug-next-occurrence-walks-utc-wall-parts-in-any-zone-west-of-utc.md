@@ -4,6 +4,7 @@ status: in_progress
 id: bug-next-occurrence-walks-utc-wall-parts-in-any-zone-west-of-utc
 title: nextOccurrence advances by |offset|+1 minutes in any zone west of UTC — a minutely job in New York fires every 4 hours
 assignee: arggon
+branch: fix/bug-next-occurrence-walks-utc-wall-parts-in-any-zone-west-of-utc
 parent: v1-tick-loop-scheduler
 labels: []
 priority: p0
