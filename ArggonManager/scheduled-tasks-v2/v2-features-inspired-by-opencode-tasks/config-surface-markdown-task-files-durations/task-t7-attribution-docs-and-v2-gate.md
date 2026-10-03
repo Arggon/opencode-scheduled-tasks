@@ -4,6 +4,7 @@ status: in_progress
 id: task-t7-attribution-docs-and-v2-gate
 title: "Attribution, README docs, and the v2 gate"
 assignee: arggon
+branch: docs/task-t7-attribution-docs-and-v2-gate
 parent: config-surface-markdown-task-files-durations
 labels: []
 created: "2026-10-02"
