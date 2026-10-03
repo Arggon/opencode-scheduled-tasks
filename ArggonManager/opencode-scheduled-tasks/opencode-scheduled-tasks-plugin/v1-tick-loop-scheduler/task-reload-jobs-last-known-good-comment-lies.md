@@ -4,6 +4,7 @@ status: in_progress
 id: task-reload-jobs-last-known-good-comment-lies
 title: "reloadJobs' last-known-good branch has no caller and its comment promises mid-edit resilience that cannot happen"
 assignee: arggon
+branch: chore/task-reload-jobs-last-known-good-comment-lies
 parent: v1-tick-loop-scheduler
 labels: []
 priority: p2
