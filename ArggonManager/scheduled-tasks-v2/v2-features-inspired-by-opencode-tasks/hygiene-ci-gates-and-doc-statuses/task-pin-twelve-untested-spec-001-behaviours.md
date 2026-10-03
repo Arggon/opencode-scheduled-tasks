@@ -1,13 +1,15 @@
 ---
 type: task
-status: todo
+status: in_progress
 id: task-pin-twelve-untested-spec-001-behaviours
 title: Twelve spec 001 behaviours are true but unpinned by any test
+assignee: arggon
 parent: hygiene-ci-gates-and-doc-statuses
 labels: []
 priority: p2
 created: "2026-10-02"
 updated: "2026-10-03"
+claimed_at: "2026-10-03T05:11:51.872Z"
 depends_on: [task-assert-occurrence-walk-jumps-strictly-advance]
 ---
 <!--
