@@ -1,7 +1,7 @@
 {
   "name": "arggon-opencode2-scheduled-tasks",
   "version": "0.1.0",
-  "description": "Cron-style scheduled agent tasks for OpenCode V2: declarative job file, tick loop, persistent per-job sessions, cost-bounded misfire handling.",
+  "description": "Cron-style scheduled agent tasks for OpenCode V2: declarative job files, tick loop, persistent per-job sessions, cost-bounded misfire handling. Inspired by jdormit/opencode-tasks (MIT, Jeremy Dormitzer) - see the README Acknowledgements.",
   "license": "MIT",
   "author": "Arggon",
   "repository": {
