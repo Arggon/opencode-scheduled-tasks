@@ -1,13 +1,15 @@
 ---
 type: task
-status: todo
+status: in_progress
 id: task-assert-v1-identical-with-no-markdown-dir
 title: No test asserts a v1 job file behaves identically when no markdown directory exists
+assignee: arggon
 parent: hygiene-ci-gates-and-doc-statuses
 labels: []
 priority: p1
 created: "2026-10-03"
 updated: "2026-10-03"
+claimed_at: "2026-10-03T05:56:37.208Z"
 depends_on: [bug-job-format-reference-contradicts-spec-002]
 ---
 <!--
