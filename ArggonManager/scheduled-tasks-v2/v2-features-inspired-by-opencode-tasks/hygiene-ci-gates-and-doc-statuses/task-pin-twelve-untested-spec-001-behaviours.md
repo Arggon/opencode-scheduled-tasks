@@ -64,7 +64,7 @@ PASS, `arggon validate` / `spec validate` / `spec analyze` ok / clean.
 
 | Box | Pinned by | Mutation run | Red? |
 | --- | --- | --- | --- |
-| 89 | amended + "keeps last-known-good jobs and surfaces the error on malformed JSON" (+1 assertion) and the existing markdown-corrupt test | idle notice takes its no-error wording unconditionally; `readProblem = undefined` | yes, twice |
+| 89 | amended + "surfaces the error on malformed JSON, with no last-known-good set to fall back on" (+1 assertion) and the existing markdown-corrupt test | idle notice takes its no-error wording unconditionally; `readProblem = undefined` | yes, twice |
 | 96 | new "drops a tick that fires while the previous one is still running" | `if (ticking) return` → `if (false)` | yes |
 | 107 | new "records a failed scheduled run…" | gut `runJob`'s catch | yes |
 | 135 | existing list test (+2 assertions) and the new 135/158 test | `new Date(record.nextRun).toISOString()` → raw epoch | yes, twice |
@@ -111,7 +111,7 @@ them. Do not edit `src/index.ts` beyond adding tests.
 
 All twelve boxes are ticked with the test that turns red, and the mutation is named. Method: edit src/index.ts, run only the named test, restore, confirm green. src/index.ts is untouched in the commit (git diff src/ is empty).
 
-**Box 89** (amended) — existing test 'keeps last-known-good jobs and surfaces the error on malformed JSON', one assertion added, plus the existing 'still reports a corrupt schedules.json when markdown jobs are carrying the schedule'.
+**Box 89** (amended) — existing test 'surfaces the error on malformed JSON, with no last-known-good set to fall back on', one assertion added, plus the existing 'still reports a corrupt schedules.json when markdown jobs are carrying the schedule'.
 - RED: the inert-project notice takes its no-error wording unconditionally (the fileError-undefined ternary → true).
 - RED: the read-failure branch dropped (readProblem → undefined).
 

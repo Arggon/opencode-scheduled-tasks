@@ -64,15 +64,19 @@ comment would assume hot-reload resilience exists and might build on it.
       worker to the reachable invariant, so the spec no longer depends on it.
 - [x] Whatever is decided, the README's statement about needing `opencode reload` after editing a job
       file should be checked against it. That sentence is user-facing and currently true.
-- [ ] If reload is implemented instead: bound it, and remember the tick's writer lease and armed timer
-      are decided from `state.jobs` — a reload that adds or disables jobs has to re-decide arming, or a
-      project will sit idle with work it does not know about. That is the
-      `bug-ephemeral-work-never-arms-tick` shape again.
 
-      **Not ticked — deliberately: the condition is false.** Reload was **not** implemented (decision
-      below), so there is nothing to bound and nothing to re-decide arming for. Ticking it would tick a
-      claim about work that does not exist. Hot-reload deserves its own item with its own acceptance;
-      it is not claimed, filed or promised here.
+
+## Forward-looking constraint (was a conditional box; the condition is false)
+
+**If reload is ever implemented**, it must: bound it, and remember the tick's writer lease and armed timer
+are decided from `state.jobs` — a reload that adds or disables jobs has to re-decide arming, or a
+project will sit idle with work it does not know about. That is the
+`bug-ephemeral-work-never-arms-tick` shape again.
+
+**Not ticked — deliberately: the condition is false.** Reload was **not** implemented (decision
+below), so there is nothing to bound and nothing to re-decide arming for. Ticking it would tick a
+claim about work that does not exist. Hot-reload deserves its own item with its own acceptance;
+it is not claimed, filed or promised here.
 
 ## Decision: (a) no reload, and the branch is gone
 
@@ -128,7 +132,7 @@ Checked before removing it:
   it: 323 pass. The suite is 324 now (one added).
 - **The two tests that already pinned the malformed-file case pass unchanged**, in both directions:
   `names a broken schedules.json once, and stays loaded and inert` (spec 001 box 89 as amended) and
-  `keeps last-known-good jobs and surfaces the error on malformed JSON`, plus
+  `surfaces the error on malformed JSON, with no last-known-good set to fall back on`, plus
   `still reports a corrupt schedules.json when markdown jobs are carrying the schedule`. **No test
   expectation changed when the branch was removed** — the whole suite is green with and without it,
   except for the one test added to pin the delta.
@@ -182,7 +186,7 @@ purpose: the reason is what makes the line fixable.
 
 ### Not corrected, deliberately: a test name that promises the same thing
 
-`keeps last-known-good jobs and surfaces the error on malformed JSON` is the same promise in a test
+`surfaces the error on malformed JSON, with no last-known-good set to fall back on` is the same promise in a test
 title, and the same body it always had — its own comment says "Malformed on a cold read: nothing to
 retain, but the error is reported, not hidden." **Left as is on purpose**: that name is cited by name in
 spec 001's box-89 verdict (twice) and in the *done* item `task-pin-twelve-untested-spec-001-behaviours`

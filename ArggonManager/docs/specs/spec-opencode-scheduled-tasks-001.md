@@ -166,8 +166,8 @@ job set.**
 > Rather than tick a claim about dead code, the box is amended to the invariant that is real and
 > testable — **a broken file costs the project neither its jobs nor its silence**.
 >
-> - **The parse failure is named once, in the log** — pinned by "keeps last-known-good jobs and
->   surfaces the error on malformed JSON" (added assertion: exactly one line naming
+> - **The parse failure is named once, in the log** — pinned by "surfaces the error on malformed JSON, with no last-known-good set
+> to fall back on" (added assertion: exactly one line naming
 >   `schedules.json:` *and what went wrong*). Mutation: making the inert-project notice take its
 >   no-error wording unconditionally fails that test and no other.
 > - **…and reported alongside the jobs still in force** — pinned by "still reports a corrupt
@@ -183,7 +183,7 @@ job set.**
 >   reason standing in for the other"; mutation: restoring the branch fails that test and no other
 >   (322 of the pre-existing 323 stay green either way, so the removal changed no other expectation).
 >
-> The audit's prior verdict, discharged: audit `task-audit-spec-001-acceptance-boxes`, 2026-10-02: the reachable half is pinned, the named half is unreachable. “Surfaces the error alongside the jobs still in force” is pinned by “keeps last-known-good jobs and surfaces the error on malformed JSON” and “still reports a corrupt schedules.json when markdown jobs are carrying the schedule”. **“Retains the last-known-good job set” cannot be observed or tested today**: `reloadJobs` is called exactly once, from `setup` (src/index.ts:4231), and there is no file watcher, so nothing ever reloads a broken file over a good job set — the retention branch (src/index.ts:2662) has no caller with a populated `state.jobs`. Deleting that branch leaves 234/234 green. Needs either a reload path plus a test, or an amendment that says the file is read once at setup.
+> The audit's prior verdict, discharged: audit `task-audit-spec-001-acceptance-boxes`, 2026-10-02: the reachable half is pinned, the named half is unreachable. “Surfaces the error alongside the jobs still in force” is pinned by “surfaces the error on malformed JSON, with no last-known-good set to fall back on” and “still reports a corrupt schedules.json when markdown jobs are carrying the schedule”. **“Retains the last-known-good job set” cannot be observed or tested today**: `reloadJobs` is called exactly once, from `setup` (src/index.ts:4231), and there is no file watcher, so nothing ever reloads a broken file over a good job set — the retention branch (src/index.ts:2662) has no caller with a populated `state.jobs`. Deleting that branch leaves 234/234 green. Needs either a reload path plus a test, or an amendment that says the file is read once at setup.
 
 - [x] A job set with zero enabled jobs arms **no** timer; the plugin stays loaded and inert.
 

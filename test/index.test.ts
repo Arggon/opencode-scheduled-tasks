@@ -2228,7 +2228,7 @@ describe("plugin setup — context wiring and failure isolation", () => {
     expect(result.jobs).toEqual([])
   })
 
-  it("keeps last-known-good jobs and surfaces the error on malformed JSON", async () => {
+  it("surfaces the error on malformed JSON, with no last-known-good set to fall back on", async () => {
     writeJobs([{ id: "good", schedule: "@daily", prompt: "p" }])
     const { ctx, calls } = fakeCtx()
     const cleanup = await setupWithCleanup(ctx)
