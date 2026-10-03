@@ -564,7 +564,7 @@ job set.**
 > cannot distinguish from anything else.
 >
 > - **Sanitized, and confined** — `test/index.test.ts` → “keeps a hostile project id inside the
->   lease directory, whichever separator it brings (box 178)”: ids carrying `/`, `\`, `:`, a
+>   lease directory, whichever separator it brings (box 178)”: ids carrying `/`, ``, `:`, a
 >   leading slash, `..` traversal and spaces all produce a lockfile and a log file that stay under
 >   the lease base directory, in exactly one component, with the fixed leaf. Mutation: deleting the
 >   `.replace(/[^A-Za-z0-9._-]/g, "_")` in `leasePath` fails it, because `join` then follows the id
