@@ -1,6 +1,6 @@
 ---
 type: task
-status: in_progress
+status: done
 id: task-measure-first-tick-stall-after-long-sleep
 title: "A long sleep may stall the first tick for seconds at 100 jobs — measure, then decide"
 assignee: arggon
@@ -10,7 +10,6 @@ labels: []
 priority: p2
 created: "2026-10-02"
 updated: "2026-10-03"
-claimed_at: "2026-10-03T00:57:20.559Z"
 depends_on: [bug-log-lines-before-first-lease-never-reach-the-file]
 ---
 <!--
