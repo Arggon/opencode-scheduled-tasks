@@ -522,6 +522,15 @@ also be carrying an interactive conversation and whatever context the user has p
 Nothing about the loop's prompt was ever in version control. Treat a loop prompt as code,
 because on every tick it gets to act with a person's session.
 
+The plugin treats the project id as **host-provided, not attacker-controlled**: OpenCode derives
+it from the project itself, so a third party cannot choose it. It still sanitises that id to a
+single path component under its data directory, because a corrupt or hostile host value should
+not be able to place a lockfile or a log outside the directory meant to hold them — the same
+reason a half-written id is never trusted to be well-formed. The sanitiser is an **allowlist**
+(`[A-Za-z0-9_-]`), so `..` and `.` are unrepresentable rather than checked for; a real host
+mints an opaque hex token, so the allowlist is the identity on every id you will actually see,
+and a collision is already fail-safe (a foreign lease logs and goes inert).
+
 ## Non-goals
 
 Runtime creation or editing of **recurring** jobs (edit the file) · an unbounded occurrence
