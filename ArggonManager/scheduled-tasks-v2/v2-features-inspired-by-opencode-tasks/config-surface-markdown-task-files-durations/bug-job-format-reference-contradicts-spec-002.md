@@ -1,6 +1,6 @@
 ---
 type: bug
-status: in_progress
+status: done
 id: bug-job-format-reference-contradicts-spec-002
 title: schedules_format advertises a runTimeout the parser rejects and omits permissions and session
 assignee: arggon
@@ -10,7 +10,6 @@ labels: []
 priority: p2
 created: "2026-10-03"
 updated: "2026-10-03"
-claimed_at: "2026-10-03T05:40:58.156Z"
 depends_on: [task-t7-attribution-docs-and-v2-gate]
 ---
 <!--
