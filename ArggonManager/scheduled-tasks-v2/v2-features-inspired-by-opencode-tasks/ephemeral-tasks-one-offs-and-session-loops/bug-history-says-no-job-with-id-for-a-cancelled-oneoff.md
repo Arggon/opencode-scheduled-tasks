@@ -1,13 +1,15 @@
 ---
 type: bug
-status: todo
+status: in_progress
 id: bug-history-says-no-job-with-id-for-a-cancelled-oneoff
 title: "schedules_history answers \"no job with id\" for a cancelled one-off, which had a valid id"
+assignee: arggon
 parent: ephemeral-tasks-one-offs-and-session-loops
 labels: []
 priority: p3
 created: "2026-10-03"
 updated: "2026-10-03"
+claimed_at: "2026-10-03T11:23:10.136Z"
 depends_on: [task-assert-v1-identical-with-no-markdown-dir]
 ---
 <!--
