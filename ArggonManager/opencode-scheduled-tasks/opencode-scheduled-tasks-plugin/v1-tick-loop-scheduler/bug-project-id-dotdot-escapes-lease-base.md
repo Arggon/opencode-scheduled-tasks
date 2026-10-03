@@ -1,6 +1,6 @@
 ---
 type: bug
-status: in_progress
+status: done
 id: bug-project-id-dotdot-escapes-lease-base
 title: "A project id of \"..\" composes outside the lease directory — the sanitizer keeps dots"
 assignee: arggon
@@ -10,7 +10,6 @@ labels: []
 priority: p2
 created: "2026-10-03"
 updated: "2026-10-03"
-claimed_at: "2026-10-03T06:53:31.863Z"
 depends_on: [task-assert-v1-identical-with-no-markdown-dir]
 ---
 <!--
@@ -69,12 +68,17 @@ because it reads as complete. `..` and `.` are the two values that defeat it, an
       `.`, and any run of dots become unrepresentable by construction rather than by check.
 - [x] Tests cover `..`, `.`, and a leading-dot id, and **assert containment** — that the result starts
       with the base directory — rather than asserting a specific string.
-- [ ] Decide and document the trust boundary in the README's threat-model section: is the project id
+- [x] Decide and document the trust boundary in the README's threat-model section: is the project id
       treated as untrusted input or as a host-provided value? That sentence should match what the code
       actually does.
       **Left unticked on purpose:** `README.md` was rewritten recently and is outside this branch's
       lane. The decision and the exact wording to apply are in the fix's handoff for the coordinator to
       apply; the code already behaves as the sentence will say.
+      **Applied by the coordinator** (README was out of the worker's lane). § Threat model now states
+      the id is host-provided and not attacker-controlled, that it is still sanitised because a corrupt
+      or hostile host value should not place a lockfile or log outside its directory, and that the
+      sanitiser is an allowlist so `..` and `.` are unrepresentable rather than checked for - with the
+      allowlist-is-the-identity argument and the fail-safe collision behaviour.
 
 ## Resolution
 
