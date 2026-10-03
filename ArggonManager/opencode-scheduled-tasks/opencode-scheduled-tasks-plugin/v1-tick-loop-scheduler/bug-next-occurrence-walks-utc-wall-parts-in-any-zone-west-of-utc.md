@@ -115,3 +115,81 @@ kind of thing that makes the whole test count look like reassurance when it is n
 **Do not regress** `bug-tick-cost-grows-with-sleep-not-with-jobs`, which now yields to the event loop
 and bounds the *longest block*: its measurements and its `MAX_BACKLOG_SCAN` decisions were all taken
 under `timezone: "UTC"`, so re-measure after this fix lands.
+
+### 2026-10-03 @ses_f0035738fffes53RQOsmuSALKx
+Evidence for the acceptance audit — every claim below was measured, not inferred.
+
+**The fix is one line.** Ran `HEAD`'s test file (271 tests) against a `HEAD` source with only
+`let wall = wallAsNaive(wallParts(afterMs, timeZone)) + MINUTE_MS` changed: **271 passed**. So the
+behaviour is the cursor seed; the rest of the `src/index.ts` diff is rename + docs + two jump
+branches rewritten to call the named helper (arithmetically the same `Date.UTC`).
+
+**Typecheck error**: `test/index.test.ts:368` — the cases table destructured a field literally named
+`expect`, shadowing the callable binding in the same scope, so `expect(...)` became `Type 'String'
+has no call signatures`. Renamed the field to `want`. That was the only compile error.
+
+**A leftover mutant was still in the uncommitted tree**: the day-jump branch carried
+`+ zoneOffsetMs(afterMs, timeZone)  // MUTANT`. In New York that makes the jump land on the previous
+evening at 20:00, whose day does not match either, so `wall` returns to the identical value and
+`nextOccurrence` **never returns**. Removed.
+
+**Step table after the fix** (`* * * * *`, consecutive occurrences) — before was `|offset|+1`:
+UTC 1 · Madrid 1 · Kolkata 1 · Kiritimati 1 · **St_Johns 1** (was 211/151) · Buenos_Aires 1 (was 181)
+· **New_York 1** (was 301/241) · Chicago 1 (was 361/301) · Honolulu 1 (was 601).
+
+**24 h backlog, `missedOccurrences(…, limit 1)`** — the ADR 0002 violation verbatim:
+St_Johns **8 uncapped** -> 1000 capped · Buenos_Aires **6 uncapped** -> 1000 capped ·
+**New_York 4 uncapped** -> 1000 capped. UTC/Madrid/Kolkata unchanged. A 10-minute St_Johns window
+returned **1** instant before; it returns **10**, one minute apart.
+
+**New tests fail against the old code with the exact symptom**, not an incidental error —
+`expected 14_460_000 to be 60_000` (241 minutes), `[241,241,241,241]` in the step table,
+`dropped: 4, droppedCapped: false`, `nextRun` 241 min out. **11 tests red.** Three do not
+discriminate and are reported as such in the item file: the matrix guard (asserts the test axis, not
+behaviour) and the two single-transition DST policy tests (they pass on the old walk; a sweep of 2960
+(schedule, zone, instant) triples found 14.7 % differ, but none of them at these two fixtures).
+
+**DST dates are American, verified from tzdata**: NY springs forward 2026-03-08T07:00Z and falls back
+2026-11-01T06:00Z; St_Johns 05:30Z / 04:30Z. Madrid's are 2026-03-29 and 2026-10-25 — three weeks
+later, so a Madrid date really does not exercise New York's. Fixtures now assert their own
+gap/overlap/ordinary classification (`possibleInstants`), so a tzdata move fails loudly.
+
+**The old walk lost a whole day at a transition** — found by sweeping, not assumed. NY
+`30 3 * * *` after 2026-03-08T04:00Z: old 2026-03-09T07:30Z, correct 2026-03-08T07:30Z. NY
+`30 1 * * *` after 2026-11-01T01:30Z: old 2026-11-02T06:30Z, correct 2026-11-01T05:30Z (both passes
+of the repeated hour skipped). Every expected instant cross-checked against a brute-force oracle
+sharing no code with `nextOccurrence`.
+
+**Re-measured event loop** (UTC, 24 h backlog, real `tick` via `setup`):
+one capped walk 6012 -> **7014** lookups (~25 -> **~31 ms**); one search 6 -> **7** lookups;
+100-job tick 601 800 -> **702 100** lookups (~2.47 -> **~2.97 s**); **longest stretch with no callback
+~48 ms** (next four 40/38/36/34), vs 30 ms before. Yield **not** regressed: still one job's walk plus
+loop overhead, never the 2.45 s the turn was added for. `MAX_BACKLOG_SCAN` stays 1000, unexported.
+A minutely New York job used to owe ~6 occurrences/hour instead of 60, so the backlog it could
+accumulate was itself wrong; that is now 60.
+
+**One existing expectation changed**: `LOOKUPS_PER_SEARCH` 12 -> 14. A matching search costs seven
+lookups not six, so an ordinary `resolveDue` measures exactly 14 and `<= 12` is a real failure —
+verified directly against `HEAD`'s test file. Same relationship (2x per-search), and 14 is *exact*
+where 12 was loose, so the constant got stricter. **Nothing deleted**: all 271 pre-existing `it()`
+names still present, and both Madrid DST test bodies are **byte-identical** to HEAD.
+
+**Six mutations run**: HEAD -> 11 red; cursor from UTC getters (renames kept) -> 11 red; read
+`afterMs` in `"UTC"` -> 11 red; day-jump re-offset -> **hangs**; `instant > afterMs` dropped -> 1 red
+(that guard was pinned by **nothing** before, which the new docblock's claim made worth closing);
+equivalent rewrite of `naiveToWall`'s weekday read -> 285 green (equivalent mutant, correctly).
+
+**Untestable black-box, stated**: the matrix guard cannot fail on a broken walk — it asserts the test
+axis, not `nextOccurrence`. Said so in the report rather than claimed as a passing behaviour test.
+
+**Gates**: `tsc --noEmit` clean · `vitest run` **285 passed** (271 + 14) · `harness/smoke.ts` PASS ·
+`arggon validate` ok (0 warnings, v5) · `arggon spec analyze` clean. No box left unticked.
+
+**context7 findings** are in the item file and cited in the source. Headline: the frame has a standard
+name (RFC 9557 *plain* date-time, `Temporal.PlainDateTime`) and `Temporal` reproduces this walk
+exactly — including the index of the fall-back's 61-minute step — but **CI pins Node 22**, where
+`typeof Temporal === "undefined`, reachable only behind `--harmony-temporal`; even unflagged on
+Node 26 it shipped **without `getPossibleInstantsFor`**. Hand-rolled per ADR 0004. On the DST policy:
+overlap -> earlier is `compatible` and unanimous; **gap -> skip is ours alone** — `compatible`
+shifts forward by the gap length, `node-cron` rewinds to just after the change, `cron-parser`
+compensates to the landing hour. Spec 001 boxes 131/133 commit us, so it stands, now documented.
