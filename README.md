@@ -228,7 +228,9 @@ module the plugin resolves.
 - **`schedules_schedule`** — schedule a one-off prompt for a time (`dueAt` epoch ms, or `dueIn`
   like `"2h"`). Runtime-only and ephemeral. See [One-off tasks](#one-off-tasks).
 - **`schedules_cancel`** — cancel a pending one-off by id. An id that is unknown or has already run
-  is a typed error naming it, pointing at `schedules_history`, not an empty success.
+  is a typed error naming it, pointing at `schedules_history`, not an empty success. An id this
+  plugin already cancelled gets its own message — *was already cancelled and never ran* — because
+  "it may have already run" is false for a task that was never dispatched.
 - **`schedules_history`** — recent runs for a **job, a one-off or a session loop**, newest first:
   due and start instants, outcome, resolved model, session, and any error. See
   [Run history](#run-history).
@@ -414,7 +416,9 @@ accumulating dead one-off history.
   refused rather than silently executed.
 - Each one-off gets a fresh session and the **same permission discipline** as a scheduled job
   (including the `ask`-as-deny report), so it is not a loophole around the rules above.
-- A completed one-off survives only in `schedules_history`, then is discarded.
+- A completed one-off survives only in `schedules_history`, then is discarded. A **cancelled** one
+  leaves a bounded tombstone in the same place instead, so the id keeps answering for as long as the
+  cap holds.
 - At most 50 pending per project; reaching the cap is reported, not silently enforced. A stored
   record read back is additionally held to a hard ceiling of 200.
 - Within a tick, one-offs are admitted **before** session loops for a contested slot.
@@ -433,8 +437,12 @@ accumulating dead one-off history.
 - A record may also carry **`asksAsDeny`** (which `ask` rules this run turned into denies),
   **`dropped` / `droppedCapped`** (what the occurrence's backlog owed and did not run), and
   **`inMemoryOnly`**.
-- An unknown id is a typed error naming it and listing the job and pending-one-off ids it does
-  know — never an empty list, because "no runs yet" and "no such job" are different answers.
+- An unknown id is a typed error naming it and listing the **live** ids it does know — jobs, pending
+  one-offs and running loops — never an empty list, because "no runs yet" and "no such job" are
+  different answers.
+- A task that was **cancelled, stopped or expired before it ever ran** is not an unknown id: it comes
+  back with `status` (`cancelled`, `stopped` or `expired`), the instant it was retired in `at`, and an
+  empty run list. A valid id is never reported as one that does not exist.
 
 **What survives a restart depends on the host.** `ctx.storage` is feature-detected: if a host does
 not offer both `get` and `set`, run state, pending one-offs and every run record live in that
