@@ -164,8 +164,7 @@ job set.**
 > (src/index.ts:4956), against a `state.jobs` that is `[]` at that moment, so the
 > "retain the last-known-good set" early return (src/index.ts:3180) can only ever retain nothing.
 > Rather than tick a claim about dead code, the box is amended to the invariant that is real and
-> testable — **a broken file costs the project neither its jobs nor its silence** — and the
-> retention branch is left in place as the defensive guard it is documented to be.
+> testable — **a broken file costs the project neither its jobs nor its silence**.
 >
 > - **The parse failure is named once, in the log** — pinned by "keeps last-known-good jobs and
 >   surfaces the error on malformed JSON" (added assertion: exactly one line naming
@@ -175,6 +174,14 @@ job set.**
 >   schedules.json when markdown jobs are carrying the schedule": a project whose markdown jobs
 >   are carrying the schedule still lists them *and* the error. Mutation: dropping the read-failure
 >   branch fails that test.
+> - **Neither surface's reason is dropped** — added by `task-reload-jobs-last-known-good-comment-lies`,
+>   2026-10-03, which **removed** the retention branch rather than leaving it as a guard. It had no
+>   caller to protect (this box's own verdict), and its one observable effect was the opposite of a
+>   guard: when neither surface loaded it assigned `state.fileError = failure`, so a `.opencode/tasks`
+>   that could not be read was reported as a missing `schedules.json` and the directory that actually
+>   failed was never named. Pinned by "names both surfaces when neither one loads, rather than one
+>   reason standing in for the other"; mutation: restoring the branch fails that test and no other
+>   (322 of the pre-existing 323 stay green either way, so the removal changed no other expectation).
 >
 > The audit's prior verdict, discharged: audit `task-audit-spec-001-acceptance-boxes`, 2026-10-02: the reachable half is pinned, the named half is unreachable. “Surfaces the error alongside the jobs still in force” is pinned by “keeps last-known-good jobs and surfaces the error on malformed JSON” and “still reports a corrupt schedules.json when markdown jobs are carrying the schedule”. **“Retains the last-known-good job set” cannot be observed or tested today**: `reloadJobs` is called exactly once, from `setup` (src/index.ts:4231), and there is no file watcher, so nothing ever reloads a broken file over a good job set — the retention branch (src/index.ts:2662) has no caller with a populated `state.jobs`. Deleting that branch leaves 234/234 green. Needs either a reload path plus a test, or an amendment that says the file is read once at setup.
 
