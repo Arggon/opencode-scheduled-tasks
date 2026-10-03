@@ -170,3 +170,49 @@ author's own earlier package, parked at 0.1.1 and neither redirected nor depreca
 `npx tsc --noEmit` · `npm run check` (289/289) · `npx tsx harness/smoke.ts` (PASS, and it confirms
 all 8 tools register as `list, start_loop, stop_loop, schedule, cancel, history, format, run`) ·
 `arggon validate` ok · `arggon spec validate` ok · `arggon spec analyze` clean.
+
+### 2026-10-03 @ses_f037cc89cffeOo07JPEJShqzJw
+**Box closed by a live dogfood pass** against the deployed build (byte-identical to `src/index.ts`, 5112lines, `opencode reload` clean), run from a live OpenCode v2.0.22 session.
+
+All eight documented tools, called as the README documents them:
+
+```
+schedules_format()      -> 2709 chars; names .opencode/schedules.json AND .opencode/tasks, and the precedence rule
+schedules_list()        -> jobs, invalid, oneOffs, loops, leaseHeld, leaseForeign, tickMs, oneOffCap, loopCap
+schedules_schedule()    -> { id: "oneoff_7hssw2gemurytaq8", dueAt: "2026-10-04T05:42:20.816Z", pending: 1 }
+                           and the id appears in schedules_list.oneOffs
+schedules_cancel()      -> { cancelled: true, pending: 0 }
+schedules_history()     -> { kind: "job", session: "reuse", runs: [{ dueAt, startedAt, outcome: "ok",
+                             model: "opencode/space-bunny-free", sessionID: "ses_effb674…" }] }
+schedules_start_loop()  -> { id: "loop_txp98dxgmuryu6n4", sessionID: "ses_f037cc8…",
+                             nextRunAt: "2026-10-03T11:43:02.168Z",   // absolute ISO, as documented
+                             expiresAt: "2026-10-06T05:43:02.168Z" }  // default 3d TTL
+                           and it appears in schedules_list.loops
+schedules_stop_loop()   -> { loops: [], cap: 10 };  schedules_list.loops is then 0
+schedules_run()         -> { id: "dogfood-smoke", sessionID: "ses_effb674…",
+                             admitted: "msg_100498b69001Ed4Q016tRwjd3e" }
+```
+
+Two things this confirms beyond "the commands respond":
+
+- **`startedAt` equals `dueAt` for an on-demand run** (`05:43:02.229Z` both) — the dispatch instant,
+  not the completion, which is what the `runTimeout` work changed.
+- **`run` dispatches a job whose `enabled` is `false`.** `dogfood-smoke` is parked and still ran on
+  demand. That is the documented distinction between `schedules_run` and the schedule, and it is now
+  observed rather than assumed.
+
+One parameter-naming check worth recording: the README documents `every`, and the tool requires
+`every`. I called it `interval` first and the tool rejected it — **the README was right and I was
+wrong**, so there is no doc defect to file here.
+
+### One inaccuracy found, filed rather than fixed here
+
+`schedules_history` on a **cancelled** one-off returns:
+
+```
+{ error: 'no job with id "oneoff_7hssw2gemurytaq8"', ids: ["dogfood-smoke"] }
+```
+
+The id was valid; it was cancelled and never ran. "no job with id" implies the caller got the id wrong.
+`resolveHistoryOwner` already distinguishes *pending* from *dispatching* from *finished* — but a
+cancelled one-off is a fourth state with no answer, and it falls into the "unknown id" bucket. Filed.
