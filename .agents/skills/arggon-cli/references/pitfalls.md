@@ -20,15 +20,21 @@ agents in this codebase — read before mutating the tracker or merging.
   y/N confirmation. Agents coordinate instead of stealing.
 - `update --status blocked` requires `--blocked-reason`; `blocked_reason` is
   forbidden otherwise.
-- **Done gate** (task-done-gate-acceptance-waiver, ADR 0015): `update --status
-done` on a task/bug whose body still has unchecked acceptance boxes is
-  REFUSED — tick every box first (the honest path), or pass
-  `--waive "<reason>"` (non-empty; records a dated `### Waiver` section in the
-  item body, then flips). The waiver is HUMAN-only: the `arggon_update`
-  MCP/native tool has no waive parameter, the kernel refuses `agent` callers,
-  and the flag refuses to fire when there is nothing to waive (no done flip, a
-  container, a complete checklist). Containers are not gated — their contract
-  is the acceptance-aware cascade below.
+- **Done gate** (task-done-gate-acceptance-waiver, ADR 0015; scoped by ADR 0025):
+  `update --status done` on a task/bug is REFUSED when its LIVE `## Acceptance`
+  section still has an unticked criterion, and also when that section publishes
+  NO criterion at all (absent, empty, or still the `<!-- … -->` template
+  placeholder) — an item that published no live contract does not get a free pass.
+  Dated `## Notes` comment blocks are history, not the contract: an unticked box
+  in one never blocks the flip, and the honest path is to write (or transcribe)
+  the criteria in the live section. A bare `- [ ]` with no text after it is a
+  scaffold placeholder, not a criterion, so it is never an unmet box. Otherwise
+  tick every box, or pass `--waive "<reason>"` (non-empty; records a dated
+  `### Waiver` section in the item body, then flips). The waiver is HUMAN-only:
+  the `arggon_update` MCP/native tool has no waive parameter, the kernel refuses
+  `agent` callers, and the flag refuses to fire when there is nothing to waive
+  (no done flip, a container, a satisfied live checklist). Containers are not
+  gated — their contract is the acceptance-aware cascade below.
 - **Cascade:** a terminal status (done/cancelled) auto-completes ancestor
   containers whose whole subtree is terminal — up to the initiative. Opt out with
   `--no-cascade`; flipped ids come back as `autoCompleted`. It is
@@ -116,3 +122,21 @@ done` on a task/bug whose body still has unchecked acceptance boxes is
 - **Leave it cleaner:** release expired claims (`update <id> --status todo`), prune
   merged worktrees (`arggon cleanup --prune`), flag stale playbooks, and keep the
   tree validating before every commit.
+
+## Who decides — the human-only flags are named, not exceptions
+
+Everywhere else in the loop you and the human are peers: any of you may claim,
+work, review, comment and merge under the same kernel rules and the same JSON
+contracts (`ArggonManager/docs/adr/0021-agents-primary-workers-human-product-owner.md`
+§1).
+The **four irreversible overrides above — steal, waive, force, reopen — are the
+product owner's**, structurally: a TTY confirmation, an armed config flag, or no
+agent parameter at all. Treat them as the published authority surface they are:
+needing one means asking a human, never routing around the gate.
+
+The rest of that surface, the roles (delivery lead / practice & standards / maker
+/ verifier, each named by what it decides) and the promotion-policy tiers live in
+`ArggonManager/docs/engineering.md` §Roles and authority. Two boundaries worth
+remembering: the delivery lead sequences work and **recommends** `priority` — the
+product owner sets the field — and a product acceptance is recorded as an
+`accept:` comment on a container, **never a gate**.

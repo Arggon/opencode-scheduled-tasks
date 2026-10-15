@@ -23,7 +23,7 @@ calls. It was proven on the first real adopter upgrade (ArggonStores-am,
 Generated docs (AGENTS.md, ArggonManager/docs/convention.md, ArggonManager/docs/engineering.md, …), the
 bundled skills under `.agents/skills/`, and tracked templates. **Never** your
 own curated content: docs you completed and acked (`arggon adopt --ack`) are
-yours — updates arrive as *proposals you judge*, not overwrites.
+yours — updates arrive as _proposals you judge_, not overwrites.
 
 ## The flow
 

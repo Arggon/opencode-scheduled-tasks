@@ -6,7 +6,7 @@
       "name": "arggon",
       "source": "./arggon",
       "version": "0.1.0",
-      "description": "ArggonManager native seam: arggon MCP tools, /arggon commands, agents and hook gates (ADR 0014). Requires the arggon CLI on PATH.",
+      "description": "ArggonManager native seam: arggon MCP tools, /arggon commands, agents, the goal-mode contract template, the opt-in automation templates (spec-drift scan, stale-claim sweep) and hook gates (ADR 0014). Requires the arggon CLI on PATH.",
       "displayName": "Arggon",
       "category": "developer-tools"
     }

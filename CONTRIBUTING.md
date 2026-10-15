@@ -30,7 +30,7 @@ One branch per work item, generated from the item id:
 ### PR checklist
 
 - [ ] Linked work item from `ArggonManager/` (or a clear docs-only / chore reason)
-- [ ] Tests pass locally (`npm test` or the project equivalent)
+- [ ] The verification this project declares passes locally (software worked example: `npm test` or the project's equivalent)
 - [ ] Docs updated in the same PR when behavior changed
 - [ ] PR references the work item id
 

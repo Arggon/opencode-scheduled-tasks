@@ -1,0 +1,170 @@
+{
+  "schemaVersion": 1,
+  "matrixId": "methodology-capability-matrix",
+  "title": "Methodology invariant x agent capability matrix",
+  "decision": "ArggonManager/docs/adr/0020-methodology-first-productization.md",
+  "spec": "ArggonManager/docs/specs/spec-methodology-adapters-017.md",
+  "planTask": "T3 (task-capability-matrix)",
+  "derivation": "Every row is derived from the seam this project actually ships for that agent, never transcribed from ADR 0020's prose. The stale-seam collision is a transcription problem, not the record's: the ADR's prose models the adapter-bundle state and once understated the `.mcp.json` floor every client gets (its own amendments mark those corrected points), so a row copied from that prose collides with the seam the tree actually ships. Evidence per row: `opencode/plugins/arggon/index.ts` + generated `.opencode/agents|commands` + `opencode.jsonc`; `templates/docs/zcode/arggon/` (plugin manifest, hooks/gate.mjs, commands, agents); and for Claude Code the two surfaces a standard `arggon init` tree already gives it - the generated `CLAUDE.md` -> `@AGENTS.md` pointer and the generated `.mcp.json`, which registers `arggon mcp` \"for other clients (e.g. Claude Code)\" (docs/agents.md) and hands that client the same 15 tools and envelopes as every other seam.",
+  "mode": "report-only",
+  "modeNote": "Data consumed by `arggon doctor`. No rule logic lives here: the rows DECLARE which native mechanism each agent uses for each methodology invariant, and `gap: true` means this agent's client seam does not deliver that invariant, so only the shared floor applies. The kernel (@arggondev/lib) behind the arggon CLI stays the enforcement of record on every row, and a gap row is advisory in every surface - never blocking in CI or in a transition.",
+  "fieldNotes": {
+    "invariants[].statement": "Verbatim clause from the carriers' `- **Invariants:**` header block (agents.md / engineering.md / convention.md).",
+    "rows[].mechanism": "The native client feature used, agent-namespaced (`opencode:` / `zcode:` / `claude:`). The `claude:` prefix covers the two surfaces an init'd tree gives a Claude Code client without a bundle: `claude:mcp` (the generated `.mcp.json` -> `arggon mcp`) and `claude:CLAUDE.md`.",
+    "rows[].package": "The client whose seam carries the mechanism (`opencode`, `zcode`, `claude-code`); `none` on a gap row, where no client mechanism delivers the invariant.",
+    "rows[].gap": "true when THIS AGENT'S CLIENT SEAM does not deliver the invariant natively - only the shared floor applies. A surface that reaches every client can never be the missing thing, however it is registered: the `arggon mcp` server (the ZCode plugin manifest and the generated `.mcp.json` are two registrations of one server - registration is per-client, reach is not), the generated `AGENTS.md`/`CLAUDE.md` playbook, the `arggon-cli` skill, and the generated pre-commit `arggon validate` gate. What a gap row names is therefore always client-native and agent-scoped: a client permission DSL, a client hook gate, a session context hook, or a bundled agent/command set. A gap row carries `package: none` and a `docs + CLI floor:` mechanism; `package: zcode` (etc.) marks a mechanism that client's own bundle carries - a client registration of a universal surface is never a gap, and a package-carried mechanism is never the shared floor.",
+    "rows[].note": "Required non-empty for every gap row (schema-gated) and kept within the doctor's human-value cap so a rendered `gap:` line is never silently truncated; null otherwise."
+  },
+  "invariants": [
+    {
+      "id": "same-rules",
+      "statement": "work-loop parity: any human and any agent may claim, work, review, comment and merge under the same kernel rules and the same JSON contracts"
+    },
+    { "id": "state-in-git", "statement": "state lives in git" },
+    { "id": "discipline-enforceable", "statement": "discipline is enforceable" },
+    { "id": "docs-travel-with-code", "statement": "docs travel with code" },
+    {
+      "id": "claim-integrity",
+      "statement": "never-steal / never-reopen, with authority asymmetric and named — the irreversible overrides stay product-owner powers, structurally human-only."
+    }
+  ],
+  "agents": [
+    {
+      "id": "opencode",
+      "package": "opencode",
+      "adapter": "vendored plugin bundle `.opencode/plugins/arggon/index.ts` + generated `.opencode/agents`, `.opencode/commands`, `opencode.jsonc`"
+    },
+    {
+      "id": "zcode",
+      "package": "zcode",
+      "adapter": "generated plugin bundle `templates/docs/zcode/arggon/` (`arggon mcp` in the plugin manifest, commands, agents, hooks) installed through the local marketplace"
+    },
+    {
+      "id": "claude",
+      "package": "claude-code",
+      "adapter": "no bundle yet (spec S6 follow-on story); an init'd tree already gives this client the generated `CLAUDE.md` -> `@AGENTS.md` pointer and the generated `.mcp.json` -> `arggon mcp` registration"
+    }
+  ],
+  "rows": [
+    {
+      "invariant": "same-rules",
+      "agent": "opencode",
+      "mechanism": "opencode:tool.transform registers the native `arggon` tools (Code Mode `tools.arggon.*`), each calling the same kernel operation the CLI's --json path runs and returning the documented envelope",
+      "package": "opencode",
+      "gap": false,
+      "note": null
+    },
+    {
+      "invariant": "state-in-git",
+      "agent": "opencode",
+      "mechanism": "opencode:worktree domain (`ctx.worktree.create/list/refresh/remove`) through tools.arggon.start/branch/cleanup; every tracker mutation auto-commits only the files it wrote, and the generated pre-commit gate runs `arggon validate`",
+      "package": "opencode",
+      "gap": false,
+      "note": null
+    },
+    {
+      "invariant": "discipline-enforceable",
+      "agent": "opencode",
+      "mechanism": "opencode:permissions - generated deny rules in opencode.jsonc (force-push, `commit --no-verify`) plus per-agent `permissions` deny rules in the agent frontmatter (the reviewer cannot edit or nest, the worker cannot nest, every mutating arggon_* tool denied); kernel refusals arrive as typed tool errors",
+      "package": "opencode",
+      "gap": false,
+      "note": null
+    },
+    {
+      "invariant": "docs-travel-with-code",
+      "agent": "opencode",
+      "mechanism": "opencode:session.hook(\"context\") re-injects the bounded (1 KiB) active work-item block built from `arggon show --meta --json`, and the generated .opencode/commands/arggon-* carry the same playbook as the docs",
+      "package": "opencode",
+      "gap": false,
+      "note": null
+    },
+    {
+      "invariant": "claim-integrity",
+      "agent": "opencode",
+      "mechanism": "opencode:tool.transform - the kernel operation refuses a stolen claim and every reopen on all paths (native tools, CLI, MCP); the generated worker/reviewer agent contracts state the rule and tools.arggon.cleanup releases a dropped claim",
+      "package": "opencode",
+      "gap": false,
+      "note": null
+    },
+    {
+      "invariant": "same-rules",
+      "agent": "zcode",
+      "mechanism": "zcode:mcp - the plugin bundle registers `arggon mcp`, whose tools return the identical envelopes from the same kernel operations as the CLI (schema parity test-gated)",
+      "package": "zcode",
+      "gap": false,
+      "note": null
+    },
+    {
+      "invariant": "state-in-git",
+      "agent": "zcode",
+      "mechanism": "zcode:mcp - arggon_start (claim + worktree), arggon_branch and arggon_cleanup drive the same kernel commit/worktree path; the plugin never writes a tracker file itself",
+      "package": "zcode",
+      "gap": false,
+      "note": null
+    },
+    {
+      "invariant": "discipline-enforceable",
+      "agent": "zcode",
+      "mechanism": "zcode:plugin.hooks.PreToolUse (hooks/gate.mjs) denies force-push and `commit --no-verify` for every session and holds the reviewer backstop window; fail-open by design, so the kernel stays the enforcement of record",
+      "package": "zcode",
+      "gap": false,
+      "note": null
+    },
+    {
+      "invariant": "docs-travel-with-code",
+      "agent": "zcode",
+      "mechanism": "zcode:plugin bundle - the generated commands/, agents/ (`arggon-maker`, `arggon-standards-reviewer`; the delivery lead is the main session) and the `arggon-cli` skill are refreshed by `arggon init` with provenance and never overwriting adopter edits",
+      "package": "zcode",
+      "gap": false,
+      "note": null
+    },
+    {
+      "invariant": "claim-integrity",
+      "agent": "zcode",
+      "mechanism": "zcode:mcp - the kernel refuses a stolen claim and every reopen, and the reviewer backstop denies the mutating mcp__arggon__* tools (arggon_comment stays open as the verdict channel)",
+      "package": "zcode",
+      "gap": false,
+      "note": null
+    },
+    {
+      "invariant": "same-rules",
+      "agent": "claude",
+      "mechanism": "claude:mcp - the generated `.mcp.json` registers `arggon mcp` for this client, so it runs the same 15 tools, envelopes and kernel operations as every other seam; CLAUDE.md -> @AGENTS.md states the rules",
+      "package": "claude-code",
+      "gap": false,
+      "note": null
+    },
+    {
+      "invariant": "state-in-git",
+      "agent": "claude",
+      "mechanism": "claude:mcp - the same registered `arggon mcp` server carries arggon_create/update/comment/start/branch/cleanup, each committing only the files it wrote, and the generated pre-commit `arggon validate` gate runs on every commit",
+      "package": "claude-code",
+      "gap": false,
+      "note": null
+    },
+    {
+      "invariant": "discipline-enforceable",
+      "agent": "claude",
+      "mechanism": "docs + CLI floor: the generated pre-commit hook and CI run `arggon validate` and the kernel refuses what it owns; nothing is enforced inside the client",
+      "package": "none",
+      "gap": true,
+      "note": "no claude:plugin.hooks.PreToolUse gate and no permission DSL: the OpenCode deny rules and the ZCode PreToolUse gate have no Claude Code equivalent, so the kernel, pre-commit and CI carry it alone."
+    },
+    {
+      "invariant": "docs-travel-with-code",
+      "agent": "claude",
+      "mechanism": "docs + CLI floor: CLAUDE.md -> @AGENTS.md loads the generated playbook and the agent pulls item context itself with `arggon show`; nothing injects it",
+      "package": "none",
+      "gap": true,
+      "note": "no session context hook injects the active work item (the OpenCode session.hook('context') block), so the agent must fetch it with `arggon show`; the playbook still travels via CLAUDE.md."
+    },
+    {
+      "invariant": "claim-integrity",
+      "agent": "claude",
+      "mechanism": "claude:mcp - on those same `arggon mcp` tools the kernel refuses a stolen claim and every reopen, and the loaded playbook states the rule; no client-side backstop exists, so the kernel is the only enforcement here",
+      "package": "claude-code",
+      "gap": false,
+      "note": null
+    }
+  ]
+}

@@ -1,7 +1,7 @@
 ---
 # arggon:generated template="opencode/commands/arggon-adopt.md"
 description: Adopt ArggonManager in this repo as a tracked, agent-executable migration
-agent: arggon-coordinator
+agent: arggon-delivery-lead
 ---
 
 Adopt ArggonManager in this repository ($ARGUMENTS; default: the current repo),

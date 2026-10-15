@@ -1,7 +1,7 @@
 {
   "name": "arggon",
   "version": "0.1.0",
-  "description": "ArggonManager native seam: the arggon MCP tools (tracker + worktree lifecycle), /arggon commands, coordinator/worker/reviewer agents, and the hook gates (global git gates; reviewer dispatch backstop). Requires the arggon CLI on PATH (npm i -g arggon-manager) — the MCP server is `arggon mcp`.",
+  "description": "ArggonManager native seam: the arggon MCP tools (tracker + worktree lifecycle), /arggon commands, maker/standards-reviewer subagents (the delivery lead is the main session — see README), the goal-mode contract template (one goal per claimed item, derived from its acceptance checklist by `arggon goal <id>`), the opt-in automation templates (daily spec-drift scan, weekly stale-claim sweep — read-only scans that file findings via `arggon create`; nothing is scheduled until you wire them in), and the hook gates (global git gates; reviewer dispatch backstop). Requires the arggon CLI on PATH (npm i -g arggon-manager) — the MCP server is `arggon mcp`.",
   "author": { "name": "Arggon" },
   "license": "MIT",
   "commands": "commands",

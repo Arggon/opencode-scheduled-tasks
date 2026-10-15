@@ -46,6 +46,16 @@ PRIORITY_FAILED`.
   into the field once and never auto-commits.
 - `doctor` is report-only (exit 0 always): installation + docs + tracker health.
   Use `--budget` for the context-budget surfaces (report-only).
+- `goal <id>` is a pure read with refusals: `--json` emits
+  `{ item, path, goal: { objective, verification, boundaries, refusals, truncated,
+hasGoal, gateUnchecked, checklist, worktree, template, identity,
+contract } }`. `goal.gateUnchecked` is the DONE GATE's own verdict
+  (`acceptanceUnchecked(acceptanceBody(item)).length > 0`) — one kernel grammar
+  answers both, so the goal never claims work the gate does not see, nor the
+  reverse. `error.code` is `GOAL_IDENTITY_UNKNOWN` / `GOAL_ITEM_CLOSED` /
+  `GOAL_UNCLAIMED` / `GOAL_FOREIGN_CLAIM` / `GOAL_WORKTREE_MISMATCH` /
+  `GOAL_WORKTREE_MISSING` / `GOAL_TEMPLATE_UNAVAILABLE` / `GOAL_FAILED` with exit
+  1. There is no override flag — read the refusal.
 
 ## Verification
 
@@ -73,9 +83,16 @@ the session keeps running after a tool error.
 
 `arggon mcp` is the optional stdio MCP server — it is **not** part of the
 OpenCode V2 default path (the native tools replace it); agents that want it
-register it through their MCP client (`.mcp.json`), never by typing it. For
-clients with no code-mode tool API (ZCode, ADR 0014) it IS the native tool
-surface. **Fifteen tools**: the core nine `arggon_list`, `arggon_create`,
+register it through their MCP client, never by typing it. For clients with no
+code-mode tool API (ADR 0014) it IS the native tool surface, and registration
+is per-client seam data — adding a client is one more registration in its
+seam, never a new surface. **ZCode** registers it in the plugin bundle's
+`mcpServers` manifest (`templates/docs/zcode/arggon/`, installed through the
+local marketplace); **Claude Code** registers it through the init-generated
+`.mcp.json` (the `claude` seam, beside the generated `CLAUDE.md` ->
+`@AGENTS.md` pointer) — the `zcode:mcp` / `claude:mcp` mechanisms the
+capability matrix (`adapters/capability-matrix.json`) declares. **Fifteen
+tools**: the core nine `arggon_list`, `arggon_create`,
 `arggon_update`, `arggon_comment`, `arggon_handoff`, `arggon_show`,
 `arggon_next`, `arggon_report`, `arggon_validate`, plus `arggon_priority`,
 `arggon_sync`, `arggon_import_issues` (kernel operations, in-process) and the
@@ -87,7 +104,11 @@ Results are the documented `--json` envelopes serialized as text content; kernel
 failures surface as tool errors with the CLI's message text, and a spawned
 child that dies without an envelope surfaces a tool error with a clipped
 stderr tail — the session keeps running either way. An MCP caller cannot
-reopen `done`/`cancelled` items and cannot steal a claim (there is no `force`
-parameter anywhere on the surface) — the CLI and MCP share one rules module.
+reopen `done`/`cancelled` items and cannot steal a claim — no `force` parameter
+touches a claim (`update --force` stays human-only, with no native/MCP
+parameter). The one `force` on the surface is `arggon_cleanup`'s audited prune
+opt-in: terminal+merged worktrees whose only removal blockers are untracked,
+refused without `prune` (`force requires prune`), and it never discards tracked
+modifications — the CLI and MCP share one rules module.
 Tool schemas mirror the CLI options both ways; the standing invariant is
 `mcp-parity.test.ts` (exceptions documented there, `--json` always excepted).

@@ -13,8 +13,11 @@
  *
  * Reviewer backstop: ZCode hook input carries `session_id` + `tool_input` but
  * no agent identity, and ZCode has no per-agent permission DSL — so the gate
- * marks the session when a subagent dispatch names the plugin's reviewer
- * (`arggon-reviewer`, optionally plugin-qualified) and, while the dispatch is
+ * marks the session when a subagent dispatch names the plugin's standards
+ * reviewer (`arggon-standards-reviewer`, optionally plugin-qualified — pinned
+ * to the shipped id by cli/src/init-zcode.test.ts, which reads the id out of
+ * `templates/docs/zcode/arggon/agents/` and asserts this matcher matches it)
+ * and, while the dispatch is
  * in flight (PreToolUse(Agent) → PostToolUse(Agent)), denies for that session:
  * Write/Edit, mutating `arggon` shell invocations, git history commands, and
  * the mutating `mcp__arggon__*` tools. The reviewer keeps the read tools and
@@ -32,6 +35,32 @@
  * session-scoped key and the 2h TTL. If the client skips PostToolUse(Agent)
  * for an errored dispatch, Stop (or the TTL) clears the marker; whether that
  * skip happens at all is on the live-client checklist.
+ *
+ * Deny-pattern scope (bug-gate-deny-pattern-matches-quoted-text-blocking-
+ * benign-writes), decided: the shell gates match the command's WORDS, not its
+ * quoted arguments. Text inside single or double quotes is documentation —
+ * the payload of an `arggon comment` documenting a probe, a commit message
+ * citing a denied form — and a deny pattern occurring only inside such a span
+ * denies nothing (the old whole-string scan denied exactly those benign
+ * writes, and this repo's methodology tells agents to document gate
+ * behavior). Quoted text the shell will still EXECUTE is never exempted: a
+ * span that is the command payload of a sh-family shell — wherever the
+ * shell sits, wrapper prefixes included (`sudo sh -c "…"`,
+ * `ls | xargs sh -c '…'`), the payload flag in combined short form included
+ * (`bash -lc "…"`, `sh -ec '…'` — any final flag word containing `c`) — or
+ * the argument of `eval`, a span carrying a command
+ * substitution (`$( … )` or backticks — the substituted text runs), and the
+ * tail of an unterminated quote all stay in the scan. The shell test accepts
+ * fail-closed OVER-denial of inert look-alikes (`echo sh -c "…"` is denied).
+ * Recorded residual, accepted for this gate's accidental-use threat model:
+ * variable indirection is NOT caught — `X='<denied form>'; $X` keeps the
+ * assignment value exempt (inert text at scan time) while the unquoted
+ * expansion executes later; this gate is not a shell parser, and the old
+ * whole-string regex was equally evadable (e.g. a split flag like `--for"ce"`).
+ * Real invocations are unquoted at their head, so the deny matrix (force
+ * push, --no-verify, refspec-plus) is unchanged. Concretely: the gates run
+ * against `scanText` below, which blanks inert quoted spans
+ * (length-preserving) and keeps everything else verbatim.
  *
  * Output contract: exit 0 = allow (silent), exit 2 = deny (stderr is the
  * reason the client shows), anything else = hook error.
@@ -76,7 +105,10 @@ const REVIEWER_SHELL_GATES = [
 
 /** Global gates: every session, every mode of work (W4 seam defaults). */
 const GLOBAL_SHELL_GATES = [
-  { re: /\bgit\b[^;&|]*\spush\b(?=[^;&|]*\s(?:--force\b|-f[a-z]*|\+\S))/, why: "force push (git push --force / -f<letters>, incl. -fu / refspec-plus +ref)" },
+  {
+    re: /\bgit\b[^;&|]*\spush\b(?=[^;&|]*\s(?:--force\b|-f[a-z]*|\+\S))/,
+    why: "force push (git push --force / -f<letters>, incl. -fu / refspec-plus +ref)",
+  },
   { re: /\bgit\b[^;&|]*\scommit\b[^;&|]*--no-verify\b/, why: "git commit --no-verify" },
 ];
 
@@ -134,26 +166,91 @@ function writeMarker(input, count) {
     rmSync(statePath(input), { force: true });
     return;
   }
-  writeFileSync(
-    statePath(input),
-    JSON.stringify({ count, ts: Date.now() }),
-    "utf8",
-  );
+  writeFileSync(statePath(input), JSON.stringify({ count, ts: Date.now() }), "utf8");
 }
 
 function reviewerActive(input) {
   return readMarker(input) > 0;
 }
 
-/** True for the plugin's reviewer agent id, plain or plugin-qualified. */
+/** True for the plugin's standards-reviewer agent id, plain or plugin-qualified. */
 function isReviewerDispatch(input) {
   const type = input?.tool_input?.subagent_type;
-  return typeof type === "string" && /(^|:)arggon-reviewer$/.test(type);
+  return typeof type === "string" && /(^|:)arggon-standards-reviewer$/.test(type);
 }
 
 function bashCommand(input) {
   const command = input?.tool_input?.command;
   return typeof command === "string" ? command : "";
+}
+
+/**
+ * [start, end) spans of shell-quoted text in `command`: single- and
+ * double-quoted regions, honoring backslash escapes outside quotes and inside
+ * double quotes (none inside single quotes, per POSIX). An unterminated quote
+ * yields NO span for its tail, so that text stays in the scan (fail-closed).
+ */
+function quotedSpans(command) {
+  const spans = [];
+  let quote = null;
+  let start = -1;
+  for (let i = 0; i < command.length; i++) {
+    const ch = command[i];
+    if (quote !== null) {
+      if (ch === quote) {
+        spans.push([start, i + 1]);
+        quote = null;
+      } else if (quote === '"' && ch === "\\") {
+        i++;
+      }
+    } else if (ch === "\\") {
+      i++;
+    } else if (ch === "'" || ch === '"') {
+      quote = ch;
+      start = i;
+    }
+  }
+  return spans;
+}
+
+/**
+ * True when the quoted span [start, end) will still be EXECUTED rather than
+ * printed or stored: it is the command payload of a sh-family shell —
+ * wherever that shell sits in the command, wrapper prefixes included
+ * (`sh -c "…"`, `sudo sh -c "…"`, `ls | xargs sh -c '…'`), the payload flag
+ * in combined short form included (`bash -lc "…"`, `sh -ec '…'`: the final
+ * flag word only needs to CONTAIN `c` — requiring exactly `-c` let `-lc` /
+ * `-ec` payloads blank as inert and run, a deny→allow regression the R2
+ * standards review probed) — or the argument of `eval`, or it carries a
+ * command substitution (`$( … )` / backticks — the substituted text runs).
+ * A gate match inside such a span is a real invocation and must still deny
+ * (the reviewer backstop relies on `sh -c "arggon update …"` staying
+ * denied, wrappers and all). The shell test is deliberately UNANCHORED in
+ * the head, so inert look-alikes are over-denied fail-closed (`echo sh -c
+ * "…"`); and this is deliberately NOT a shell parser: a quoted assignment
+ * value that a later unquoted `$var` expansion runs (`X='…'; $X`) is inert
+ * at scan time and stays exempt — a recorded residual, see "Deny-pattern
+ * scope" in the header.
+ */
+function quotedSpanExecutes(command, start, end) {
+  if (/\$\(|`/.test(command.slice(start, end))) return true;
+  const head = command.slice(0, start);
+  return /\S*sh\s+(?:-\S+\s+)*-\S*c\S*\s*$/.test(head) || /\beval\s+$/.test(head);
+}
+
+/**
+ * The command with inert quoted spans blanked (same length, spaces in place,
+ * so nothing shifts): the text the shell gates scan. Quoted spans that still
+ * execute and unterminated quote tails are kept verbatim — see
+ * "Deny-pattern scope" in the header.
+ */
+function scanText(command) {
+  let out = command;
+  for (const [start, end] of quotedSpans(command).reverse()) {
+    if (quotedSpanExecutes(command, start, end)) continue;
+    out = out.slice(0, start) + " ".repeat(end - start) + out.slice(end);
+  }
+  return out;
 }
 
 function pre(input) {
@@ -165,16 +262,20 @@ function pre(input) {
     allow();
   }
   if (tool === "Bash") {
-    const command = bashCommand(input);
+    // Scan the command's words, not its quoted arguments (see "Deny-pattern
+    // scope" in the header): inert quoted text is blanked before matching.
+    const scanned = scanText(bashCommand(input));
     for (const gate of GLOBAL_SHELL_GATES) {
-      if (gate.re.test(command)) deny(`${gate.why} is denied by the arggon plugin gate`);
+      if (gate.re.test(scanned)) deny(`${gate.why} is denied by the arggon plugin gate`);
     }
     if (reviewerActive(input)) {
-      if (MUTATING_ARGGON_WORDS.test(command)) {
-        deny("a reviewer dispatch is in flight — tracker mutations are denied (post the verdict with arggon_comment)");
+      if (MUTATING_ARGGON_WORDS.test(scanned)) {
+        deny(
+          "a reviewer dispatch is in flight — tracker mutations are denied (post the verdict with arggon_comment)",
+        );
       }
       for (const gate of REVIEWER_SHELL_GATES) {
-        if (gate.re.test(command)) deny(`reviewer dispatch in flight — ${gate.why} is denied`);
+        if (gate.re.test(scanned)) deny(`reviewer dispatch in flight — ${gate.why} is denied`);
       }
     }
     allow();
@@ -187,7 +288,9 @@ function pre(input) {
   }
   if (MUTATING_MCP_TOOLS.has(tool)) {
     if (reviewerActive(input)) {
-      deny(`a reviewer dispatch is in flight — ${tool} is denied (read with arggon_show, post the verdict with arggon_comment)`);
+      deny(
+        `a reviewer dispatch is in flight — ${tool} is denied (read with arggon_show, post the verdict with arggon_comment)`,
+      );
     }
     allow();
   }
