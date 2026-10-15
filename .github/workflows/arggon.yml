@@ -33,7 +33,7 @@ env:
   # or forked remotes alike. The pin moves only in the release runbook's
   # post-release follow-up (step 6), so the drift gate compares against a
   # fixed seam instead of a moving one.
-  ARGGON_VERSION: "0.4.0"
+  ARGGON_VERSION: "0.5.0"
 
 concurrency:
   # Both jobs here are hermetic (no model, no MCP, no network, no machine
