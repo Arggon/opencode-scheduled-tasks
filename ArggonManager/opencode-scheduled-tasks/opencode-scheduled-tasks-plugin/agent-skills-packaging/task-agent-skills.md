@@ -4,6 +4,7 @@ status: in_progress
 id: task-agent-skills
 title: Convert the repo into Agent Skills under skills/
 assignee: Arggon
+branch: feat/task-agent-skills
 parent: agent-skills-packaging
 labels: []
 created: "2026-10-15"
