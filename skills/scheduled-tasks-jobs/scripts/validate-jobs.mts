@@ -1,7 +1,8 @@
 // Validate a project's scheduled jobs with the plugin's own loaders, offline.
 // Usage (from a clone of https://github.com/Arggon/opencode-scheduled-tasks, after `npm install`):
-//   npx tsx skills/scheduled-tasks-jobs/scripts/validate-jobs.ts <project-dir> [path/to/index.ts]
+//   npx tsx skills/scheduled-tasks-jobs/scripts/validate-jobs.mts <project-dir> [path/to/index.ts]
 // Reads <project-dir>/.opencode/schedules.json and <project-dir>/.opencode/tasks/*.md.
+// .mts so it runs as ESM (top-level await) even when copied outside this repo.
 // No network access, no writes. Exit code 1 if any job or file is refused.
 import { readFileSync, existsSync } from "node:fs"
 import { join, resolve } from "node:path"
@@ -9,7 +10,7 @@ import { pathToFileURL } from "node:url"
 
 const [projectArg, pluginArg] = process.argv.slice(2)
 if (!projectArg) {
-  console.error("usage: validate-jobs.ts <project-dir> [path/to/plugin/index.ts]")
+  console.error("usage: validate-jobs.mts <project-dir> [path/to/plugin/index.ts]")
   process.exit(2)
 }
 const project = resolve(projectArg)

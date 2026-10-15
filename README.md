@@ -576,7 +576,7 @@ own loaders against a project:
 
 ```sh
 npm install
-npx tsx skills/scheduled-tasks-jobs/scripts/validate-jobs.ts /path/to/project
+npx tsx skills/scheduled-tasks-jobs/scripts/validate-jobs.mts /path/to/project
 ```
 
 To use the skills, copy a skill directory into your agent's skills folder (for OpenCode, for example,

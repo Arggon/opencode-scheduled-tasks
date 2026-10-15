@@ -22,8 +22,9 @@ reference from the running plugin; full field table: [references/job-reference.m
 2. Write the job. Required: `id` (`^[a-z0-9][a-z0-9._-]*$`), `schedule`, `prompt`. **Always set
    `model`** — otherwise the session default (often paid) is used. Set `timezone` (IANA).
 3. Set permissions for unattended work (below).
-4. Validate: `npx tsx skills/scheduled-tasks-jobs/scripts/validate-jobs.ts <project-dir>` from a
-   clone of the repo (see [scripts/validate-jobs.ts](scripts/validate-jobs.ts)). It runs the
+4. Validate: `npx tsx skills/scheduled-tasks-jobs/scripts/validate-jobs.mts <project-dir>` from a
+   clone of the repo, or `npx tsx scripts/validate-jobs.mts <project-dir> <path/to/plugin/index.ts>`
+   from a copy of this skill (see [scripts/validate-jobs.mts](scripts/validate-jobs.mts)). It runs the
    plugin's own loaders and prints each job's next run, or the refusal reason.
 5. `opencode reload`, then `schedules_list` to confirm `nextRun`; `schedules_run` to try it now.
 
