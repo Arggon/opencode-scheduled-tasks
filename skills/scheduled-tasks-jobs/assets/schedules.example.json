@@ -1,0 +1,26 @@
+{
+  "version": 1,
+  "jobs": [
+    {
+      "id": "nightly-audit",
+      "schedule": "0 3 * * *",
+      "timezone": "America/Argentina/Cordoba",
+      "model": "opencode/space-bunny-free",
+      "prompt": "Review the diff since the last tag for security issues.",
+      "misfire": "skip",
+      "runTimeout": "30m",
+      "permissions": { "bash": { "*": "deny", "git diff *": "allow" }, "edit": "deny" }
+    },
+    {
+      "id": "weekday-standup-notes",
+      "schedule": "30 8 * * mon-fri",
+      "timezone": "Europe/Madrid",
+      "model": "opencode/space-bunny-free",
+      "session": "fresh",
+      "prompt": "Summarise yesterday's commits on main in five bullet points.",
+      "misfire": "backfill",
+      "maxCatchUp": 2,
+      "enabled": false
+    }
+  ]
+}
