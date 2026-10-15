@@ -2,7 +2,7 @@
 ---
 name: arggon-cli
 description: Work in an ArggonManager repo — run the find → claim → work → PR loop and follow the engineering methodology (specs, ADRs, explorations, playbooks) with the native arggon tools (OpenCode V2) or the arggon CLI.
-version: 0.4.0
+version: 0.5.0
 author: Arggon (Arggon), Hermes Agent
 license: MIT
 platforms: [linux, macos, windows]
@@ -22,16 +22,17 @@ is for PRs only. This umbrella covers **when** to use the skill, install/update,
 and the work loop. The operational detail lives in the references beside this
 file — read the one that matches the task **before** acting:
 
-| Reference                     | Read it for                                                                                                  |
-| ----------------------------- | ------------------------------------------------------------------------------------------------------------ |
-| `references/json-contract.md` | **JSON contract**: `--json` envelopes, error codes, filters, output surfaces, native tools, MCP              |
-| `references/methodology.md`   | **Methodology**: what the work needs — spec, plan, ADR, exploration, playbook, runbook — and the quality bar |
+| Reference                     | Read it for                                                                                                                                      |
+| ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `references/json-contract.md` | **JSON contract**: `--json` envelopes, error codes, filters, output surfaces, native tools, MCP                                                  |
+| `references/methodology.md`   | **Methodology**: what the work needs — spec, plan, ADR, exploration, playbook, runbook — and the quality bar                                     |
 | `references/exploration.md`   | **Greenfield exploration**: the six-phase protocol — classify, stance, ground, frontier rounds, edge-case hunt, artifacts + hard gate (ADR 0017) |
-| `references/orchestration.md` | **Orchestration**: coordinator/subagent waves, review bar, smoke gate, worktrees                             |
-| `references/pitfalls.md`      | **Pitfalls**: claim, cascade, tracker-merge and commit-staging traps                                         |
+| `references/orchestration.md` | **Orchestration**: the four agent roles (named by what they decide), coordinator/subagent waves, review bar, smoke gate, worktrees               |
+| `references/pitfalls.md`      | **Pitfalls**: claim, cascade, tracker-merge and commit-staging traps                                                                             |
 
-The full workflow rules are `ArggonManager/docs/agents.md`; the review bar is
-`ArggonManager/docs/engineering.md`.
+The full workflow rules are `ArggonManager/docs/agents.md`; the review bar, the
+role table and the named (asymmetric) authority are
+`ArggonManager/docs/engineering.md` §Roles and authority / §Review bar.
 
 ## Native surface (OpenCode V2)
 
@@ -55,7 +56,11 @@ CI:
   never reopen `done`/`cancelled`: the kernel refuses both whatever the
   permissions say.
 - **Plugin**: vendored single-file at `.opencode/plugins/arggon/index.ts` (no
-  `node_modules` needed); `arggon init` refreshes it with provenance.
+  `node_modules` needed); `arggon init` refreshes it with provenance. It ships
+  with the **opencode adapter seam** — materialized by default, omitted by
+  `arggon init --no-agents` (or by `--agents` without `opencode`). In a tree
+  without that seam none of the native surfaces above exist: use the CLI, which
+  is always complete; `arggon doctor --agents` reports which seams are there.
 - The CLI (`npm run arggon -- …`) stays for `init`/`validate`/`doctor` and
   model-less CI; there is no MCP stanza in the generated config by default.
 
@@ -113,7 +118,7 @@ command/flag/description change; cli/src/skill-generated-commands.test.ts fails
 on drift). Curated nuances live in `references/`.
 
 ```bash
-<!-- arggon:generated-commands start: list,next,branch,start,update,comment,show,handoff,create,validate -->
+<!-- arggon:generated-commands start: list,next,branch,start,update,comment,show,goal,handoff,create,validate -->
 arggon list  # List work items under the tracker root with optional filters
 arggon next  # Suggest the next claimable leaf item (task/bug leaves; ready items rank first, by downstream weight — unblocks count; lexicographic id on ties; --include-stories opts stories back in)
 arggon branch <id>  # Check out the working branch for an item (generated from branch_patterns)
@@ -121,6 +126,7 @@ arggon start <id>  # Claim an item, check out its branch, commit, push, and opti
 arggon update <id>  # Update frontmatter fields of a work item
 arggon comment <id> [text]  # Append a timestamped, author-attributed comment section to an item's body
 arggon show <id>  # Read one item with bounded output (ADR 0006): frontmatter + last comments; full body is an explicit opt-in
+arggon goal <id>  # Render the goal-mode contract for one claimed item (objective + verification + boundaries) from its acceptance checklist
 arggon handoff <id>  # Append a structured, bounded handoff section (branch, next step, open questions) to an item's body
 arggon create <type> <title>  # Create a work item under the tracker root (label at creation with --labels <csv>)
 arggon validate  # Validate tracker frontmatter and tree integrity
@@ -158,7 +164,7 @@ Non-trivial items are orchestrated per `references/orchestration.md`.
 ## 3. Views and tooling
 
 ```bash
-<!-- arggon:generated-commands start: board,report,doctor,sync,import-issues,instructions,cleanup,priority migrate,migrate -->
+<!-- arggon:generated-commands start: board,report,doctor,sync,import-issues,instructions,cleanup,priority migrate,migrate,friction -->
 arggon board  # Write a static read-only HTML board from the tracker (git files stay the source of truth)
 arggon report  # Aggregate leaf statuses per container, grouped by epic (display only)
 arggon doctor  # Report installation state: convention version, generated-doc provenance, tracker counts (pure read); with --budget, also the ADR 0006 context-budget surfaces incl. the live MCP tool-schema size (report-only)
@@ -168,6 +174,7 @@ arggon instructions  # Print the agent wiring (install, pre-commit, CI) extracte
 arggon cleanup  # List worktrees of done/cancelled items whose branches are merged (--prune removes them)
 arggon priority migrate  # Move legacy pN labels into the priority field on all items (highest label wins, all pN labels removed, non-priority labels kept; idempotent; never auto-commits — review and commit once)
 arggon migrate  # Move a legacy tasks/ tracker (and its product docs) to the ArggonManager/ layout (ADR 0012, convention v5; idempotent, never auto-commits)
+arggon friction [observation]  # Record friction in ArggonManager itself into the local append-only friction log (never the tracker, never the network), or render its deduped report with --report [--tier a|b], or remove the whole log with --clear
 <!-- arggon:generated-commands end -->
 ```
 

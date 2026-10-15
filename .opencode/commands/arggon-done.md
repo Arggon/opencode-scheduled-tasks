@@ -1,7 +1,7 @@
 ---
 # arggon:generated template="opencode/commands/arggon-done.md"
 description: Close a finished item after verifying its gates
-agent: arggon-coordinator
+agent: arggon-delivery-lead
 ---
 
 Close $ARGUMENTS following the done criteria:
@@ -9,8 +9,8 @@ Close $ARGUMENTS following the done criteria:
 1. Read the item with `tools.arggon.show({ id, body: true })` and verify every
    acceptance checkbox is honest and complete (tick the boxes in the file when
    the work is done).
-2. Confirm the PR is merged (or the completing change is on the default branch)
-   and the project gates pass; run `tools.arggon.validate({})` and require
+2. Confirm the change is merged (on the default branch)
+   and the gates this project declares pass; run `tools.arggon.validate({})` and require
    `ok: true`.
 3. Flip the item with `tools.arggon.update({ id, status: "done" })` — pass
    `{ no_cascade: true }` when an administrative item must not auto-complete
@@ -19,5 +19,5 @@ Close $ARGUMENTS following the done criteria:
    removes the worktree through the OpenCode worktree domain, deletes the
    merged branch and clears the item's `worktree_path` record. Run it without
    `prune` first to inspect the candidates; skipped entries name their reason.
-5. If you are a worker subagent: stop at step 2 and report to the coordinator.
-   Completion is the coordinator's call after merge.
+5. If you are a maker subagent: stop at step 2 and report to the delivery lead.
+   Completion is the delivery lead's call after merge.

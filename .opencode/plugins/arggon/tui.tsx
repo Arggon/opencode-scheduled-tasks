@@ -16,23 +16,46 @@
  *   per-item status, the session's active item and the kernel `next`
  *   suggestion, with a navigable selection cursor (`j`/`k`, `PgUp`/`PgDn`,
  *   `g`/`G`), `Enter` toggling a bounded inline detail block (body +
- *   acceptance rows, read through the kernel's `runShow`), `n`/`a` jumping to
- *   the kernel `next` suggestion and the session's active item, `r` reloading
- *   (the selection survives when the item still exists), `f` full-screen and
- *   `esc` closing the detail block first and the panel second. Opened by the
- *   `arggon.board.open` command (slash `/arggon-board`, palette, `ctrl+g`).
+ *   acceptance rows, read through the kernel's `runShow`, plus the parent edge
+ *   and the id-sorted children resolved through the inlined kernel's recorded
+ *   `parent` edges — no parallel hierarchy), `p` jumping to the parent's
+ *   detail and `1`..`9` jumping to the numbered child's detail, `n`/`a`
+ *   jumping to the kernel `next` suggestion and the session's active item,
+ *   `r` reloading (the selection survives when the item still exists), `f`
+ *   full-screen and `esc` closing the detail block first and the panel second.
+ *   Opened by the `arggon.board.open` command (slash `/arggon-board`, palette,
+ *   `ctrl+g`).
  * - `sidebar.content` contribution: one status line (active item, or the ready
  *   count) so the item status is visible without opening the panel.
  * - `app` slot: hosts the global keymap layer (the documented home for plugin
  *   commands — `context.keymap.layer` requires a rendered provider).
  *
+ * Freshness (T4, plan-methodology-adapters-017 §T4): while the panel is open it
+ * follows the host's OpenCode event stream (`context.data.on`, the surface the
+ * built-in TUI plugins use on 2.0.26 — `context.event` does not exist there) and
+ * re-reads the tracker on the events that mean argon work landed
+ * ({@link BOARD_REFRESH_EVENTS}), so a shell `arggon …` run or a native
+ * `tools.arggon.*` call repaints the open panel without a keypress. Every
+ * refresh is caused by an event: there is NO timer and no polling fallback —
+ * a host without the surface keeps the manual `r` reload and nothing else.
+ *
  * Display only: every read goes through `board.ts` → the kernel; nothing here
  * writes to the tracker.
+ *
+ * Activation model (task-native-panel-hierarchy-links): the panel renders
+ * plain OpenTUI `<text>` rows with no click/link surface, so hierarchy links
+ * are keyboard-activated through the panel keymap layer — the same mechanism
+ * as the existing `n`/`a` jumps, not pointer clicks. The detail block names
+ * the keys inline (`[p]`, `[1]`..`[9]`); this is the agreed activation for
+ * this surface, not display-only.
  */
-import { Show, createSignal } from "solid-js";
+import { Show, createSignal, onCleanup } from "solid-js";
 import {
   ARGON_BOARD_PANEL,
+  BOARD_HIERARCHY_CHILD_KEYS,
+  boardChildrenOf,
   boardItemDetail,
+  boardParentId,
   boardSnapshot,
   boardTreeLines,
   emptyBoardSelection,
@@ -88,8 +111,39 @@ export type ArgonTuiContext = {
         info?(location?: unknown): { branch?: { current?: unknown } } | undefined | null;
       };
     };
+    /**
+     * The host's event stream (T4): `context.data.on(type, handler)` subscribes
+     * to one OpenCode event and returns the unsubscribe. Observed on 2.0.26
+     * (`{ on, listen, session, project, shell, location }`; there is no
+     * `context.event` — probe 2026-10-13, docs/playbooks/opencode.md § TUI).
+     * Optional and feature-detected: a host without it keeps the manual `r`
+     * reload, never a timer.
+     */
+    on?(type: string, handler: (event: unknown) => void): unknown;
   };
 };
+
+/**
+ * The bound event-stream surface the panel follows (`context.data.on`, with the
+ * host object as its receiver). `undefined` means the host has none — the
+ * panel then stays a manual-`r` surface.
+ */
+export type ArgonTuiEventSurface = {
+  on(type: string, handler: (event: unknown) => void): unknown;
+};
+
+/**
+ * The OpenCode event types that mean "argon work landed in the tracker", so an
+ * OPEN PANEL must re-read it (T4). Deliberately the two work-landed signals
+ * instead of a broad catch-all: a tracker mutation during a session comes from
+ * a command run through the session's shell endpoint (`session.shell.ended` —
+ * the TUI prompt's shell mode or the API) or from whatever an agent step did —
+ * shell tool calls and the native `tools.arggon.*` calls alike
+ * (`session.step.ended`). Both observed on 2.0.26 (`context.data.on`); nothing
+ * here polls, so a mutation made by another terminal stays invisible until the
+ * next event or `r`, which is the documented contract.
+ */
+export const BOARD_REFRESH_EVENTS = ["session.shell.ended", "session.step.ended"] as const;
 
 export type ArgonTuiOptions = {
   /** Project directory to read the tracker from (defaults to the location). */
@@ -144,6 +198,17 @@ export type BoardController = {
   jumpNext(): void;
   /** Jump to the session's active item (toasts when none resolves). */
   jumpActive(): void;
+  /**
+   * Open the selected item's parent detail (toasts `no parent` when the item
+   * has no parent edge, `parent not found` when the edge points nowhere).
+   */
+  jumpParent(): void;
+  /**
+   * Open the selected item's `index`-th child detail (0-based, id-sorted like
+   * the tree; toasts `no child N` when out of range). Digits `1`..`9` map to
+   * indexes 0..8.
+   */
+  jumpChild(index: number): void;
   /** Toggle the inline detail block for the selected item. */
   toggleDetail(): void;
   /** Re-read the tracker, keeping the selection when the item still exists. */
@@ -185,6 +250,53 @@ export function createBoardController(options: BoardControllerOptions): BoardCon
   const jumpNext = (): void => jump(snapshot().nextId, "next suggestion");
   const jumpActive = (): void => jump(snapshot().activeId, "active item");
 
+  const readDetail = (id: string): BoardItemDetail =>
+    options.detailRows === undefined
+      ? boardItemDetail(options.cwd, id, { items: snapshot().items })
+      : boardItemDetail(options.cwd, id, { rows: options.detailRows, items: snapshot().items });
+
+  const openItem = (id: string, label: string): void => {
+    const target = selectBoardItem(snapshot(), id);
+    if (target === null) {
+      options.toast?.(`arggon board: no ${label}`);
+      return;
+    }
+    setSelection(target);
+    setDetail(readDetail(id));
+  };
+
+  const jumpParent = (): void => {
+    const selected = selection().id;
+    if (selected === null) {
+      options.toast?.("arggon board: no parent");
+      return;
+    }
+    const parentId = boardParentId(snapshot().items, selected);
+    if (parentId === null) {
+      options.toast?.("arggon board: no parent");
+      return;
+    }
+    const target = selectBoardItem(snapshot(), parentId);
+    if (target === null) {
+      options.toast?.("arggon board: parent not found");
+      return;
+    }
+    setSelection(target);
+    setDetail(readDetail(parentId));
+  };
+
+  const jumpChild = (index: number): void => {
+    const selected = selection().id;
+    const children =
+      selected === null ? [] : boardChildrenOf(snapshot().items, selected);
+    const child = children[index];
+    if (child === undefined) {
+      options.toast?.(`arggon board: no child ${index + 1}`);
+      return;
+    }
+    openItem(child.id, `child ${index + 1}`);
+  };
+
   const toggleDetail = (): void => {
     const selected = selection().id;
     if (selected === null) return;
@@ -192,11 +304,7 @@ export function createBoardController(options: BoardControllerOptions): BoardCon
       setDetail(null);
       return;
     }
-    setDetail(
-      options.detailRows === undefined
-        ? boardItemDetail(options.cwd, selected)
-        : boardItemDetail(options.cwd, selected, { rows: options.detailRows }),
-    );
+    setDetail(readDetail(selected));
   };
 
   const reload = (): void => {
@@ -226,16 +334,92 @@ export function createBoardController(options: BoardControllerOptions): BoardCon
     jump,
     jumpNext,
     jumpActive,
+    jumpParent,
+    jumpChild,
     toggleDetail,
     reload,
     escape,
   };
 }
 
+/** The bound event surface of a host context, or `undefined` when it has none. */
+export function boardRefreshSurface(context: ArgonTuiContext): ArgonTuiEventSurface | undefined {
+  try {
+    const data = context.data;
+    if (data === undefined || data === null || typeof data.on !== "function") return undefined;
+    const on = data.on;
+    return {
+      on: (type: string, handler: (event: unknown) => void) => on.call(data, type, handler),
+    };
+  } catch (error) {
+    logTui("refresh-surface", "event stream unavailable", error);
+    return undefined;
+  }
+}
+
+/**
+ * Subscribe `reload` to every event in {@link BOARD_REFRESH_EVENTS} and return
+ * the disposer that unsubscribes them all. Failure-isolated like every other
+ * surface: a host whose `on` throws for one type still gets the others, an
+ * unsubscribe that throws never propagates, and a missing surface is a no-op
+ * disposer. The handler swallows a throwing `reload` — a host event must never
+ * see a plugin exception.
+ */
+export function subscribeBoardRefresh(
+  surface: ArgonTuiEventSurface | undefined,
+  reload: () => void,
+): () => void {
+  if (surface === undefined) return () => {};
+  const disposers: Array<() => void> = [];
+  for (const type of BOARD_REFRESH_EVENTS) {
+    try {
+      const off = surface.on(type, () => {
+        try {
+          reload();
+        } catch (error) {
+          logTui("refresh", "board reload failed", error);
+        }
+      });
+      if (typeof off === "function") disposers.push(off as () => void);
+    } catch (error) {
+      logTui(`refresh-${type}`, "event subscription failed", error);
+    }
+  }
+  return () => {
+    for (const dispose of disposers.splice(0)) {
+      try {
+        dispose();
+      } catch (error) {
+        logTui("refresh-dispose", "event unsubscribe failed", error);
+      }
+    }
+  };
+}
+
+/**
+ * The panel's refresh wiring: follow the context's event stream and reload the
+ * board controller on every allow-listed event. The component hands the
+ * returned disposer to the Solid lifecycle (`onCleanup`); the logs say once per
+ * process which mode the host is in, so the vendored entry's evidence names the
+ * event-driven path (or the absence of a surface) instead of leaving it
+ * implicit.
+ */
+export function connectBoardRefresh(board: BoardController, context: ArgonTuiContext): () => void {
+  const surface = boardRefreshSurface(context);
+  logTui(
+    "refresh",
+    surface === undefined
+      ? "no event stream on this host — manual r reload only (no polling)"
+      : `refresh on ${BOARD_REFRESH_EVENTS.join(", ")} — event-driven (no polling)`,
+  );
+  return subscribeBoardRefresh(surface, () => board.reload());
+}
+
 /**
  * Register the board/status surface on a TUI context. Returns a disposer that
  * unregisters every slot contribution (the `setup` cleanup contract). Pure
- * wiring: the components read the tracker through `boardSnapshot` on mount.
+ * wiring: the components read the tracker through `boardSnapshot` on mount and
+ * reload it on the host's events.
  */
 export function registerArgonTui(
   context: ArgonTuiContext,
@@ -300,10 +484,11 @@ export function registerArgonTui(
   };
 
   /**
-   * Panel body: cursor navigation, `enter` detail, `n`/`a` jumps, `r` reload,
-   * `f` full-screen, `esc` detail-first. The binds are the documented OpenCode
-   * key names (docs/playbooks/opencode.md § TUI); a plain letter bound in a
-   * panel layer is active only while the panel owns input.
+   * Panel body: cursor navigation, `enter` detail, `p`/`1`..`9` hierarchy
+   * jumps, `n`/`a` jumps, `r` reload, `f` full-screen, `esc` detail-first.
+   * The binds are the documented OpenCode key names
+   * (docs/playbooks/opencode.md § TUI); a plain letter bound in a panel layer
+   * is active only while the panel owns input.
    */
   const BoardPanel = (props: { panel: ArgonTuiPanel }) => {
     const width = (): number => (typeof props.panel?.width === "number" ? props.panel.width : 0);
@@ -314,6 +499,10 @@ export function registerArgonTui(
       close: () => props.panel?.close?.(),
       toast,
     });
+    // T4: the open panel follows the host's event stream (no timer — the
+    // disposer is the only cleanup), so a session that mutates the tracker
+    // repaints it without a keypress.
+    onCleanup(connectBoardRefresh(board, context));
     try {
       context.keymap?.layer?.(() => ({
         commands: [
@@ -328,6 +517,12 @@ export function registerArgonTui(
           { id: "arggon.board.last", bind: "shift+g", run: () => board.move("last") },
           { id: "arggon.board.last.end", bind: "end", run: () => board.move("last") },
           { id: "arggon.board.detail", bind: "return", run: () => board.toggleDetail() },
+          { id: "arggon.board.parent", bind: "p", run: () => board.jumpParent() },
+          ...Array.from({ length: BOARD_HIERARCHY_CHILD_KEYS }, (_, index) => ({
+            id: `arggon.board.child.${index + 1}`,
+            bind: `${index + 1}`,
+            run: () => board.jumpChild(index),
+          })),
           { id: "arggon.board.next", bind: "n", run: () => board.jumpNext() },
           { id: "arggon.board.active", bind: "a", run: () => board.jumpActive() },
           {

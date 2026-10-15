@@ -18,5 +18,5 @@ Close $ARGUMENTS following the done criteria:
    the worktree through the CLI's cleanup flow, deletes the merged branch and
    clears the item's `worktree_path` record. Run it without `prune` first to
    inspect the candidates; skipped entries name their reason.
-5. If you are a worker subagent: stop at step 2 and report to the coordinator.
-   Completion is the coordinator's call after merge.
+5. If you are a maker subagent: stop at step 2 and report to the delivery lead.
+   Completion is the delivery lead's call after merge.
