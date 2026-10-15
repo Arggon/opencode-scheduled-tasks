@@ -4,6 +4,7 @@ status: in_progress
 id: bug-validate-jobs-esm-outside-repo
 title: validate-jobs.ts fails with top-level await when the skill is copied outside the repo
 assignee: Arggon
+branch: fix/bug-validate-jobs-esm-outside-repo
 parent: agent-skills-packaging
 labels: []
 created: "2026-10-15"
