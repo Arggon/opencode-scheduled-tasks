@@ -32,3 +32,5 @@ updated: "2026-10-15"
 ## Notes
 
 Evidence (local, 2026-10-15): the old `.ts` copied outside reproduces the top-level-await error. The `.mts` validates the example jobs both inside the repo (exit 0) and copied to a temp folder with the plugin file passed explicitly (exit 0).
+
+Merged in PR #8 (merge commit 5d123fb). CI on #8: plugin check pass, tasks-validate pass.
