@@ -1,6 +1,6 @@
 ---
 type: bug
-status: in_progress
+status: done
 id: bug-validate-jobs-esm-outside-repo
 title: validate-jobs.ts fails with top-level await when the skill is copied outside the repo
 assignee: Arggon
