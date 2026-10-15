@@ -5,7 +5,7 @@ id: agent-skills-packaging
 title: Agent Skills packaging
 assignee: Arggon
 parent: opencode-scheduled-tasks-plugin
-labels: []
+labels: [ready-for-acceptance]
 created: "2026-10-15"
 updated: "2026-10-15"
 ---
