@@ -18,10 +18,12 @@ updated: "2026-10-15"
 
 ## Context
 
-<!-- Why this story exists. -->
+Gonzalo asked for the plugin to ship as skills that follow the open Agent Skills standard (agentskills.io/specification), so an agent can install, author and operate the scheduler without guessing.
 
 ## Acceptance
 
-<!-- The real acceptance criteria; tick each box when met. -->
+- [ ] `skills/` holds spec-valid skills (name = directory, lowercase-hyphen, description under 1024 chars).
+- [ ] Every claim in the skills is backed by `src/index.ts` or the README.
+- [ ] README has a Skills section; tests and CI stay green.
 
 ## Notes

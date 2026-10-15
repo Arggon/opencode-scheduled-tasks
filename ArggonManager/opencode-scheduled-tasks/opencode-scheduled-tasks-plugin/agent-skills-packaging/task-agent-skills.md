@@ -21,10 +21,15 @@ updated: "2026-10-15"
 
 ## Context
 
-<!-- Why this task exists. -->
+Implements the story: split the plugin documentation into three skills (setup, jobs, runtime) with references, example assets and an offline validator script.
 
 ## Acceptance
 
-<!-- The real acceptance criteria; tick each box when met. -->
+- [ ] `skills/scheduled-tasks-setup`, `skills/scheduled-tasks-jobs`, `skills/scheduled-tasks-runtime` exist with valid frontmatter.
+- [ ] `scripts/validate-jobs.ts` runs the plugin's own `loadJobs`/`loadMarkdownJobs`/`mergeJobSources`/`nextOccurrence`, makes no network calls and writes nothing.
+- [ ] Both example job files under `assets/` validate with it; impossible or malformed jobs are refused.
+- [ ] README Skills section added; `npm run check` green locally and in CI.
 
 ## Notes
+
+Evidence (local, 2026-10-15): validator accepted `assets/schedules.example.json` + `assets/nightly-audit.md` (markdown shadow reported as designed) and refused `0 0 30 2 *`, a bad id and `runTimeout: "0s"` with exit 1.
