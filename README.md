@@ -559,6 +559,30 @@ scheduling and reuse the same session continuity:
 its recurring jobs survive a closed editor. We chose in-process, so the two halves are separable
 by hand. See [Acknowledgements](#acknowledgements).)
 
+## Skills
+
+The repository ships three [Agent Skills](https://agentskills.io/specification) under
+[`skills/`](skills/), so an agent can install, author and operate the scheduler without guessing.
+Each is a directory with a `SKILL.md` (frontmatter `name` + `description`):
+
+| Skill | Use it to |
+| --- | --- |
+| [`scheduled-tasks-setup`](skills/scheduled-tasks-setup/SKILL.md) | install the plugin, verify it loaded, set engine options, troubleshoot |
+| [`scheduled-tasks-jobs`](skills/scheduled-tasks-jobs/SKILL.md) | write and validate recurring jobs: fields, cron, timezones, misfire and cost bounds, permissions |
+| [`scheduled-tasks-runtime`](skills/scheduled-tasks-runtime/SKILL.md) | use the tools: list, run now, history, one-offs, session loops |
+
+`scheduled-tasks-jobs` includes example job files and an offline validator that runs the plugin's
+own loaders against a project:
+
+```sh
+npm install
+npx tsx skills/scheduled-tasks-jobs/scripts/validate-jobs.ts /path/to/project
+```
+
+To use the skills, copy a skill directory into your agent's skills folder (for OpenCode, for example,
+`.opencode/skills/<name>/` or `~/.config/opencode/skills/<name>/`). They describe an OpenCode V2 plugin, so
+they're only useful with OpenCode V2. The skills make no network calls.
+
 ## Development
 
 ```sh
