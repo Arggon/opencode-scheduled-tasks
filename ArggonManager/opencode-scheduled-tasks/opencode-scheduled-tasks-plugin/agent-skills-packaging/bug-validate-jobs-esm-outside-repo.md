@@ -21,10 +21,14 @@ updated: "2026-10-15"
 
 ## Context
 
-<!-- What went wrong / how to reproduce. -->
+`skills/scheduled-tasks-jobs/scripts/validate-jobs.ts` uses top-level await. Inside the repo `package.json` has `"type": "module"`, so tsx loads it as ESM. Copied into a skills folder elsewhere (the way skills are installed), tsx treats `.ts` as CJS and fails: `Top-level await is currently not supported with the "cjs" output format`.
 
 ## Acceptance
 
-<!-- The real acceptance criteria; tick each box when met. -->
+- [x] Script renamed to `validate-jobs.mts` and every reference updated (skill SKILL.md, README).
+- [x] Runs inside the repo and when the skill folder is copied outside it.
+- [x] `npm run check` passes in CI.
 
 ## Notes
+
+Evidence (local, 2026-10-15): the old `.ts` copied outside reproduces the top-level-await error. The `.mts` validates the example jobs both inside the repo (exit 0) and copied to a temp folder with the plugin file passed explicitly (exit 0).
